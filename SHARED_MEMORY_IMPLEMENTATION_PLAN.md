@@ -215,8 +215,14 @@ enum FrameType : byte
   - Metadata round-trip
   - Large messages
   - Multiple connections
-- ✅ Greeter.SharedMemory example structure created
+- ✅ Greeter.SharedMemory example fully implemented
+  - Client/Program.cs using ShmHandler
+  - Server/Program.cs using ShmConnectionListener
+  - Server/Services/GreeterService.cs
+  - README.md with usage documentation
+  - Solution file (Greeter.SharedMemory.slnx)
 - ✅ 69 tests passing total
+- ✅ Example builds successfully
 
 ### Known Limitations (to address in Phase 4+)
 - Segment currently copies memory-mapped data to local buffer (breaks true sharing)
