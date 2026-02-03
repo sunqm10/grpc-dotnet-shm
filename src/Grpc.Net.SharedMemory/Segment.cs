@@ -26,7 +26,7 @@ namespace Grpc.Net.SharedMemory;
 /// <summary>
 /// Segment header structure (128 bytes) that identifies and configures a shared memory segment.
 /// This layout matches grpc-go-shmem for interoperability.
-/// 
+///
 /// Layout (grpc-go-shmem compatible):
 /// - Offset 0x00: magic (8 bytes) - "GRPCSHM\0"
 /// - Offset 0x08: version (uint32) - protocol version
@@ -213,7 +213,7 @@ public sealed class Segment : IDisposable
 
         // Use file-backed shared memory like grpc-go-shmem: %TEMP%\grpc_shm_{name}
         var filePath = GenerateSegmentPath(name);
-        
+
         // Create the backing file if it doesn't exist, or fail if it does (like Go's O_EXCL)
         if (File.Exists(filePath))
         {
@@ -291,7 +291,7 @@ public sealed class Segment : IDisposable
 
         // Use file-backed shared memory like grpc-go-shmem: %TEMP%\grpc_shm_{name}
         var filePath = GenerateSegmentPath(name);
-        
+
         if (!File.Exists(filePath))
         {
             throw new FileNotFoundException($"Segment '{name}' not found at {filePath}", filePath);
@@ -299,7 +299,7 @@ public sealed class Segment : IDisposable
 
         // Open the backing file
         var backingFile = new FileStream(filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
-        
+
         // Validate minimum size
         if (backingFile.Length < ShmConstants.SegmentHeaderSize)
         {
@@ -338,8 +338,8 @@ public sealed class Segment : IDisposable
         }
 
         // Use TotalSize from header if available, otherwise calculate
-        var totalSize = header.TotalSize > 0 
-            ? header.TotalSize 
+        var totalSize = header.TotalSize > 0
+            ? header.TotalSize
             : header.RingBOffset + (ulong)ShmConstants.RingHeaderSize + header.RingBCapacity;
         var accessor = mappedFile.CreateViewAccessor(0, (long)totalSize, MemoryMappedFileAccess.ReadWrite);
 
@@ -388,7 +388,7 @@ public sealed class Segment : IDisposable
     {
         var span = buffer.AsSpan(0, ShmConstants.SegmentHeaderSize);
         span.Clear(); // Zero all bytes first
-        
+
         // Write grpc-go-shmem compatible header (128 bytes)
         BinaryPrimitives.WriteUInt64LittleEndian(span[0x00..0x08], header.MagicValue);
         BinaryPrimitives.WriteUInt32LittleEndian(span[0x08..0x0C], header.Version);

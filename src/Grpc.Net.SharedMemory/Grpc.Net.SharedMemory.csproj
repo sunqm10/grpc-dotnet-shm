@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <LangVersion>latest</LangVersion>
-    
+
     <PackageId>Grpc.Net.SharedMemory</PackageId>
     <Description>Shared memory transport for gRPC .NET</Description>
     <Authors>gRPC Authors</Authors>

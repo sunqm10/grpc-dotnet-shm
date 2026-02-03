@@ -31,7 +31,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     private readonly Channel<(FrameType Type, byte[] Payload)> _inboundFrames;
     private readonly CancellationTokenSource _disposeCts;
     private readonly SemaphoreSlim _sendLock;
-    
+
     private HeadersV1? _requestHeaders;
     private HeadersV1? _responseHeaders;
     private TrailersV1? _trailers;
@@ -112,8 +112,8 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             HeaderType = 0, // client-initial
             Method = method,
             Authority = authority,
-            DeadlineUnixNano = deadline.HasValue 
-                ? (ulong)new DateTimeOffset(deadline.Value).ToUnixTimeMilliseconds() * 1_000_000 
+            DeadlineUnixNano = deadline.HasValue
+                ? (ulong)new DateTimeOffset(deadline.Value).ToUnixTimeMilliseconds() * 1_000_000
                 : 0,
             Metadata = ConvertMetadata(metadata)
         };
@@ -308,7 +308,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                     var increment = (uint)frame.Value.Payload.Length;
                     if (increment > 0)
                     {
-                        _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0, 
+                        _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0,
                             BitConverter.GetBytes(increment));
                     }
                     yield return frame.Value.Payload;
@@ -381,8 +381,8 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         if (metadata == null || metadata.Count == 0)
             return Array.Empty<MetadataKV>();
 
-        return metadata.Select(e => e.IsBinary 
-            ? new MetadataKV(e.Key, e.ValueBytes) 
+        return metadata.Select(e => e.IsBinary
+            ? new MetadataKV(e.Key, e.ValueBytes)
             : new MetadataKV(e.Key, e.Value)).ToArray();
     }
 

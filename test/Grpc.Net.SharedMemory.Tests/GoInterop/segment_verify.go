@@ -23,21 +23,21 @@ const (
 )
 
 type SegmentHeader struct {
-	Magic        [8]byte
-	Version      uint32
-	Flags        uint32
-	TotalSize    uint64
-	RingAOffset  uint64
+	Magic         [8]byte
+	Version       uint32
+	Flags         uint32
+	TotalSize     uint64
+	RingAOffset   uint64
 	RingACapacity uint64
-	RingBOffset  uint64
+	RingBOffset   uint64
 	RingBCapacity uint64
-	ServerPID    uint32
-	ClientPID    uint32
-	ServerReady  uint32
-	ClientReady  uint32
-	Closed       uint32
-	Pad          uint32
-	MaxStreams   uint32
+	ServerPID     uint32
+	ClientPID     uint32
+	ServerReady   uint32
+	ClientReady   uint32
+	Closed        uint32
+	Pad           uint32
+	MaxStreams    uint32
 }
 
 type RingHeader struct {
@@ -127,8 +127,8 @@ func createSegment(path string, capacity uint64) error {
 	binary.LittleEndian.PutUint64(data[0x28:], ringBOffset)
 	binary.LittleEndian.PutUint64(data[0x30:], capacity)
 	binary.LittleEndian.PutUint32(data[0x38:], uint32(os.Getpid())) // serverPID
-	binary.LittleEndian.PutUint32(data[0x40:], 1) // serverReady
-	binary.LittleEndian.PutUint32(data[0x50:], 100) // maxStreams
+	binary.LittleEndian.PutUint32(data[0x40:], 1)                   // serverReady
+	binary.LittleEndian.PutUint32(data[0x50:], 100)                 // maxStreams
 
 	// Write Ring A header (capacity at offset 0)
 	binary.LittleEndian.PutUint64(data[ringAOffset:], capacity)

@@ -40,7 +40,7 @@ public class GreeterService
     {
         // Deserialize the request
         var request = HelloRequest.Parser.ParseFrom(requestData);
-        
+
         Console.WriteLine($"Received greeting request from: {request.Name}");
 
         // Process the request (simple greeting logic)

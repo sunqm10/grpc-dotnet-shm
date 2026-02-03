@@ -50,7 +50,7 @@ try
     Console.WriteLine($"Sending request to SayHello(\"{name}\")...");
 
     var reply = await client.SayHelloAsync(new HelloRequest { Name = name });
-    
+
     Console.WriteLine();
     Console.WriteLine($"Response received: {reply.Message}");
 }

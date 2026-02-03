@@ -93,7 +93,7 @@ internal sealed partial class WindowsRingSync : IRingSync
             // Wait with cancellation support
             var waitHandles = new WaitHandle[] { handle, cancellationToken.WaitHandle };
             var result = WaitHandle.WaitAny(waitHandles, timeoutMs);
-            
+
             // result == 0 means the event was signaled
             // result == 1 means cancellation was requested
             // result == WaitHandle.WaitTimeout means timeout

@@ -91,7 +91,7 @@ public sealed class ShmStream : Stream
     {
         ThrowIfDisposed();
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
-        
+
         // Run read on thread pool to avoid blocking
         return await Task.Run(() => _readRing.Read(buffer.AsSpan(offset, count), linkedCts.Token), linkedCts.Token);
     }
@@ -101,7 +101,7 @@ public sealed class ShmStream : Stream
     {
         ThrowIfDisposed();
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
-        
+
         // Run read on thread pool to avoid blocking
         return await Task.Run(() => _readRing.Read(buffer.Span, linkedCts.Token), linkedCts.Token);
     }
@@ -125,7 +125,7 @@ public sealed class ShmStream : Stream
     {
         ThrowIfDisposed();
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
-        
+
         // Run write on thread pool to avoid blocking
         await Task.Run(() => _writeRing.Write(buffer.AsSpan(offset, count), linkedCts.Token), linkedCts.Token);
     }
@@ -135,7 +135,7 @@ public sealed class ShmStream : Stream
     {
         ThrowIfDisposed();
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
-        
+
         // Run write on thread pool to avoid blocking
         await Task.Run(() => _writeRing.Write(buffer.Span, linkedCts.Token), linkedCts.Token);
     }

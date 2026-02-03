@@ -71,10 +71,10 @@ public readonly struct ReadReservation
 
 /// <summary>
 /// Single-Producer Single-Consumer (SPSC) ring buffer operating over shared memory
-/// with event-driven blocking. This implementation provides high-performance 
+/// with event-driven blocking. This implementation provides high-performance
 /// cross-process communication with zero-copy operations and minimal kernel calls
 /// through futex-based (Linux) or named event (Windows) synchronization.
-/// 
+///
 /// This implementation matches the grpc-go-shmem ring buffer for interoperability.
 /// </summary>
 public sealed class ShmRing : IDisposable

@@ -133,7 +133,7 @@ public class InteropTests
     }
     /// <summary>
     /// Verifies frame header encoding matches grpc-go-shmem format.
-    /// 
+    ///
     /// Go struct (16 bytes little-endian):
     /// type FrameHeader struct {
     ///     Length    uint32  // offset 0
@@ -219,7 +219,7 @@ public class InteropTests
     public void SegmentMagic_MatchesGoFormat()
     {
         var magicBytes = ShmConstants.SegmentMagicBytes.ToArray();
-        
+
         Assert.That(magicBytes.Length, Is.EqualTo(8));
         Assert.That(Encoding.ASCII.GetString(magicBytes), Is.EqualTo("GRPCSHM\0"));
     }
@@ -245,11 +245,11 @@ public class InteropTests
         // Verify format
         Assert.That(encoded[0], Is.EqualTo(1), "Version byte");
         Assert.That(encoded[1], Is.EqualTo(0), "HeaderType byte (client)");
-        
+
         // Method length at offset 2 (4 bytes little-endian)
         var methodLen = BinaryPrimitives.ReadUInt32LittleEndian(encoded.AsSpan(2, 4));
         Assert.That(methodLen, Is.EqualTo((uint)headers.Method.Length));
-        
+
         // Method string starts at offset 6
         var methodBytes = Encoding.UTF8.GetString(encoded.AsSpan(6, (int)methodLen));
         Assert.That(methodBytes, Is.EqualTo("/test.Service/Method"));
@@ -273,11 +273,11 @@ public class InteropTests
 
         // Verify format
         Assert.That(encoded[0], Is.EqualTo(1), "Version byte");
-        
+
         // Status code at offset 1 (4 bytes little-endian)
         var statusCode = BinaryPrimitives.ReadInt32LittleEndian(encoded.AsSpan(1, 4));
         Assert.That(statusCode, Is.EqualTo(0), "OK status code");
-        
+
         // Message length at offset 5 (4 bytes little-endian)
         var msgLen = BinaryPrimitives.ReadUInt32LittleEndian(encoded.AsSpan(5, 4));
         Assert.That(msgLen, Is.EqualTo((uint)"Success".Length));
@@ -443,7 +443,7 @@ public class InteropTests
 
             // Now open with .NET
             using var segment = Segment.Open(segmentName);
-            
+
             Assert.That(segment.Header.MagicValue, Is.EqualTo(BitConverter.ToUInt64(ShmConstants.SegmentMagicBytes)), "Magic");
             Assert.That(segment.Header.Version, Is.EqualTo(1u), "Version");
             Assert.That(segment.Header.RingACapacity, Is.EqualTo(4096UL), "RingA capacity");

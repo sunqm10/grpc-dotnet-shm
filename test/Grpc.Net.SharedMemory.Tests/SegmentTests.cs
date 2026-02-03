@@ -97,7 +97,7 @@ public class SegmentTests
 
         // Assert
         var header = segment.Header;
-        
+
         // Verify grpc-go-shmem compatible magic "GRPCSHM\0"
         var expectedMagic = BitConverter.ToUInt64(ShmConstants.SegmentMagicBytes);
         Assert.That(header.MagicValue, Is.EqualTo(expectedMagic));

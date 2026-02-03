@@ -89,7 +89,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         _isClient = isClient;
         _streams = new ConcurrentDictionary<uint, ShmGrpcStream>();
         _disposeCts = new CancellationTokenSource();
-        
+
         // Client uses odd stream IDs (1, 3, 5, ...), server uses even (2, 4, 6, ...)
         _nextStreamId = isClient ? 1u : 2u;
 
@@ -108,7 +108,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
         var streamId = Interlocked.Add(ref _nextStreamId, 2) - 2; // Increment by 2, return previous value
         var stream = new ShmGrpcStream(streamId, this);
-        
+
         if (!_streams.TryAdd(streamId, stream))
         {
             throw new InvalidOperationException($"Stream ID {streamId} already exists");
@@ -175,7 +175,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             while (!_disposeCts.Token.IsCancellationRequested)
             {
                 // Read frame from receive ring
-                var (header, payload) = await Task.Run(() => 
+                var (header, payload) = await Task.Run(() =>
                     FrameProtocol.ReadFrame(RxRing, _disposeCts.Token), _disposeCts.Token);
 
                 await ProcessFrameAsync(header, payload);
@@ -255,7 +255,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         if (!_disposed)
         {
             _disposed = true;
-            
+
             // Send GoAway if not already sent
             if (!_goAwaySent)
             {
@@ -263,7 +263,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             }
 
             _disposeCts.Cancel();
-            
+
             // Wait for reader to finish
             try { _frameReaderTask.Wait(TimeSpan.FromSeconds(1)); } catch { }
 
@@ -285,7 +285,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         if (!_disposed)
         {
             _disposed = true;
-            
+
             // Send GoAway if not already sent
             if (!_goAwaySent)
             {
@@ -293,7 +293,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             }
 
             _disposeCts.Cancel();
-            
+
             // Wait for reader to finish
             try { await _frameReaderTask.WaitAsync(TimeSpan.FromSeconds(1)); } catch { }
 

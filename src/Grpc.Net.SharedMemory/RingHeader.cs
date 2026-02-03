@@ -23,7 +23,7 @@ namespace Grpc.Net.SharedMemory;
 /// <summary>
 /// Ring buffer header structure (64 bytes) that resides in shared memory.
 /// This layout matches grpc-go-shmem for interoperability.
-/// 
+///
 /// Layout (grpc-go-shmem compatible):
 /// - Offset 0x00:  capacity (ulong) - ring data area size (power of 2)
 /// - Offset 0x08:  widx (ulong) - monotonic write index (producer)

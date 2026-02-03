@@ -50,11 +50,11 @@ try
     {
         // Check for incoming streams from the connection
         var serverStream = listener.Connection.CreateStream();
-        
+
         // Wait for a request to come in
         // In the current implementation, we're demonstrating the transport pattern
         // Real stream acceptance would come from frame routing on the connection
-        
+
         if (serverStream.RequestHeaders is { Method: var method } && method != null)
         {
             try
@@ -67,8 +67,8 @@ try
                 // For demonstration, send a simple response
                 // In production, the request message would be read from the stream
                 var response = await greeterService.HandleMethodAsync(
-                    serverStream, 
-                    method, 
+                    serverStream,
+                    method,
                     Array.Empty<byte>());
 
                 await serverStream.SendMessageAsync(response);
@@ -82,7 +82,7 @@ try
                 await serverStream.SendTrailersAsync(ex.StatusCode, ex.Status.Detail);
             }
         }
-        
+
         // Brief delay to prevent busy-waiting
         // Real implementation would use signaling from the ring buffer
         await Task.Delay(10, cts.Token);

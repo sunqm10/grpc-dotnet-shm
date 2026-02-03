@@ -1,3 +1,4 @@
+//go:build linux || windows
 // +build linux windows
 
 /*
@@ -79,11 +80,11 @@ func main() {
 	segHdr := SegmentHeader{
 		version:     1,
 		flags:       0,
-		totalSize:   0x20000,    // 128KB
-		ringAOff:    0x80,       // After 128-byte segment header
-		ringACap:    0x10000,    // 64KB
-		ringBOff:    0x10080,    // After ring A
-		ringBCap:    0x10000,    // 64KB
+		totalSize:   0x20000, // 128KB
+		ringAOff:    0x80,    // After 128-byte segment header
+		ringACap:    0x10000, // 64KB
+		ringBOff:    0x10080, // After ring A
+		ringBCap:    0x10000, // 64KB
 		serverPID:   1234,
 		clientPID:   5678,
 		serverReady: 1,

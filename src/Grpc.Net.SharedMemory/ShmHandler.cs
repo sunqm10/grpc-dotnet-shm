@@ -105,8 +105,8 @@ public sealed class ShmHandler : HttpMessageHandler
             {
                 foreach (var kv in responseHeaders.Metadata)
                 {
-                    var values = kv.Values.Select(v => v is byte[] bytes 
-                        ? Convert.ToBase64String(bytes) 
+                    var values = kv.Values.Select(v => v is byte[] bytes
+                        ? Convert.ToBase64String(bytes)
                         : v?.ToString() ?? "");
                     response.Headers.TryAddWithoutValidation(kv.Key, values);
                 }
@@ -125,7 +125,7 @@ public sealed class ShmHandler : HttpMessageHandler
     {
         // gRPC message format: [compressed:1][length:4][data:length]
         var headerBuffer = new byte[5];
-        
+
         while (true)
         {
             // Read message header
@@ -165,11 +165,11 @@ public sealed class ShmHandler : HttpMessageHandler
     private static Metadata? ExtractMetadata(HttpRequestHeaders headers)
     {
         var metadata = new Metadata();
-        
+
         foreach (var header in headers)
         {
             // Skip pseudo-headers and standard HTTP headers
-            if (header.Key.StartsWith(':') || 
+            if (header.Key.StartsWith(':') ||
                 header.Key.Equals("Host", StringComparison.OrdinalIgnoreCase) ||
                 header.Key.Equals("Content-Type", StringComparison.OrdinalIgnoreCase) ||
                 header.Key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase) ||
@@ -280,7 +280,7 @@ internal sealed class ShmResponseContent : HttpContent
             var header = new byte[5];
             header[0] = 0; // Not compressed
             System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(1), (uint)message.Length);
-            
+
             await stream.WriteAsync(header, cancellationToken);
             await stream.WriteAsync(message, cancellationToken);
         }

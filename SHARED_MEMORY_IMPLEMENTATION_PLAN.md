@@ -121,7 +121,7 @@ enum FrameType : byte
   - Keepalive support
   - Graceful shutdown (GOAWAY)
 
-#### 2.2 Server Transport  
+#### 2.2 Server Transport
 - [ ] `src/Grpc.Net.SharedMemory/ShmServerTransport.cs`
   - Accept connections (via listener)
   - Stream handling

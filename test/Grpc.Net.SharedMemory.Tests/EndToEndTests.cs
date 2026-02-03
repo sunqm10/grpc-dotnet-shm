@@ -39,7 +39,7 @@ public class EndToEndTests
         // Create server connection
         using var serverConnection = ShmConnection.CreateAsServer(segmentName, ringCapacity: 4096, maxStreams: 100);
 
-        // Create client connection  
+        // Create client connection
         using var clientConnection = ShmConnection.ConnectAsClient(segmentName);
 
         // Start server task to handle one request
@@ -47,7 +47,7 @@ public class EndToEndTests
         {
             // Create a server-side stream to respond
             var serverStream = serverConnection.CreateStream();
-            
+
             // Wait for request headers from client
             // In real implementation, the connection would route frames to streams
             // For this test, we simulate by directly reading from the ring
@@ -143,7 +143,7 @@ public class EndToEndTests
         {
             var serverStream = serverConnection.CreateStream();
             await serverStream.SendResponseHeadersAsync();
-            
+
             // In real implementation, server would receive and process messages
             await Task.Delay(100);
 

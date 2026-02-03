@@ -80,11 +80,11 @@ public sealed class ShmConnectionListener : IDisposable, IAsyncDisposable
                 // The server doesn't create streams - it receives them from clients
                 // Wait for an incoming stream by monitoring the connection
                 // For now, we'll need to track when new streams arrive
-                
+
                 // This is a simplified implementation - in practice, the ShmConnection
                 // should provide an event or method to accept new streams
                 await Task.Delay(10, linkedCts.Token);
-                
+
                 // Check for new streams that have received headers
                 // This would need to be wired up properly with ShmConnection
             }

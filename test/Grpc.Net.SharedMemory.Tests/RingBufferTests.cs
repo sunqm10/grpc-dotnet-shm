@@ -179,7 +179,7 @@ public class RingBufferTests
 
         // Should get remaining 20 bytes from first write + 60 from second = 80 bytes total
         Assert.That(bytesRead1, Is.EqualTo(80));
-        
+
         // First 20 bytes are from the first write (bytes 80-99)
         for (var i = 0; i < 20; i++)
         {

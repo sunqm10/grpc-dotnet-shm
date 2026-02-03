@@ -55,8 +55,8 @@ var reply = await client.SayHelloAsync(new HelloRequest { Name = "World" });
 ### Server Side (ShmConnectionListener)
 
 ```csharp
-using var listener = new ShmConnectionListener("greeter-shm", 
-    ringCapacity: 1024 * 1024, 
+using var listener = new ShmConnectionListener("greeter-shm",
+    ringCapacity: 1024 * 1024,
     maxStreams: 100);
 
 // Accept and process incoming streams
@@ -66,7 +66,7 @@ using var listener = new ShmConnectionListener("greeter-shm",
 ## Performance Characteristics
 
 - **Zero kernel calls**: Uses user-space synchronization primitives
-- **Minimal memory copies**: Data is read directly from shared memory buffers  
+- **Minimal memory copies**: Data is read directly from shared memory buffers
 - **No serialization overhead**: gRPC messages are written directly to shared memory
 - **Sub-microsecond latency**: Typical for small messages on same-machine communication
 
