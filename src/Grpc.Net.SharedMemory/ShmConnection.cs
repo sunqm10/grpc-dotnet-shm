@@ -18,6 +18,7 @@
 
 using System.Collections.Concurrent;
 using System.Runtime.Versioning;
+using System.Threading.Channels;
 
 namespace Grpc.Net.SharedMemory;
 
@@ -32,10 +33,25 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     private readonly ConcurrentDictionary<uint, ShmGrpcStream> _streams;
     private readonly CancellationTokenSource _disposeCts;
     private readonly Task _frameReaderTask;
+    private readonly Channel<ShmGrpcStream> _incomingStreamsChannel;
     private uint _nextStreamId;
     private bool _disposed;
     private bool _goAwaySent;
     private bool _goAwayReceived;
+    private bool _draining;
+    private uint _maxConcurrentStreams;
+
+    // Connection-level flow control (matches grpc-go-shmem)
+    private long _connSendQuota;
+    private uint _connInFlowLimit;
+    private uint _connInFlowUnacked;
+    private readonly object _flowControlLock = new();
+    private readonly SemaphoreSlim _quotaSignal = new(0);
+
+    /// <summary>
+    /// Gets the connection-level send quota remaining.
+    /// </summary>
+    public long ConnectionSendQuota => Interlocked.Read(ref _connSendQuota);
 
     /// <summary>
     /// Gets the connection name (shared memory segment name).
@@ -53,9 +69,19 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     public bool IsClosed => _disposed || _goAwaySent || _goAwayReceived;
 
     /// <summary>
+    /// Gets whether the connection is draining (not accepting new streams).
+    /// </summary>
+    public bool IsDraining => _draining;
+
+    /// <summary>
     /// Raised when a GoAway frame is received from the remote side.
     /// </summary>
     public event EventHandler<GoAwayEventArgs>? GoAwayReceived;
+
+    /// <summary>
+    /// Raised when a new stream is received from a client (server-side only).
+    /// </summary>
+    public event EventHandler<StreamReceivedEventArgs>? StreamReceived;
 
     /// <summary>
     /// Creates a new client-side connection by opening an existing shared memory segment.
@@ -89,6 +115,20 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         _isClient = isClient;
         _streams = new ConcurrentDictionary<uint, ShmGrpcStream>();
         _disposeCts = new CancellationTokenSource();
+        _maxConcurrentStreams = segment.Header.MaxStreams > 0 ? segment.Header.MaxStreams : 100;
+
+        // Initialize connection-level flow control (matches grpc-go-shmem)
+        _connSendQuota = ShmConstants.InitialWindowSize;
+        _connInFlowLimit = (uint)ShmConstants.InitialWindowSize;
+        _connInFlowUnacked = 0;
+
+        // Create channel for incoming streams (server-side)
+        _incomingStreamsChannel = Channel.CreateBounded<ShmGrpcStream>(new BoundedChannelOptions((int)_maxConcurrentStreams)
+        {
+            FullMode = BoundedChannelFullMode.Wait,
+            SingleReader = false,
+            SingleWriter = true
+        });
 
         // Client uses odd stream IDs (1, 3, 5, ...), server uses even (2, 4, 6, ...)
         _nextStreamId = isClient ? 1u : 2u;
@@ -98,7 +138,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Creates a new stream for a gRPC call.
+    /// Creates a new stream for a gRPC call (client-side).
     /// </summary>
     /// <returns>A new gRPC stream.</returns>
     public ShmGrpcStream CreateStream()
@@ -107,7 +147,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         ThrowIfGoAway();
 
         var streamId = Interlocked.Add(ref _nextStreamId, 2) - 2; // Increment by 2, return previous value
-        var stream = new ShmGrpcStream(streamId, this);
+        var stream = new ShmGrpcStream(streamId, this, isServerStream: false);
 
         if (!_streams.TryAdd(streamId, stream))
         {
@@ -115,6 +155,56 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         }
 
         return stream;
+    }
+
+    /// <summary>
+    /// Accepts incoming streams from clients (server-side).
+    /// Blocks until a stream is available or cancellation is requested.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>An async enumerable of incoming gRPC streams.</returns>
+    public async IAsyncEnumerable<ShmGrpcStream> AcceptStreamsAsync(
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        if (_isClient)
+        {
+            throw new InvalidOperationException("AcceptStreamsAsync is only available on server-side connections");
+        }
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
+
+        await foreach (var stream in _incomingStreamsChannel.Reader.ReadAllAsync(linkedCts.Token))
+        {
+            yield return stream;
+        }
+    }
+
+    /// <summary>
+    /// Waits for and accepts a single incoming stream from a client (server-side).
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The accepted stream, or null if the connection was closed.</returns>
+    public async ValueTask<ShmGrpcStream?> AcceptStreamAsync(CancellationToken cancellationToken = default)
+    {
+        if (_isClient)
+        {
+            throw new InvalidOperationException("AcceptStreamAsync is only available on server-side connections");
+        }
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
+
+        try
+        {
+            return await _incomingStreamsChannel.Reader.ReadAsync(linkedCts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            return null;
+        }
+        catch (ChannelClosedException)
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -192,11 +282,14 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         }
     }
 
-    private Task ProcessFrameAsync(FrameHeader header, byte[] payload)
+    private async Task ProcessFrameAsync(FrameHeader header, byte[] payload)
     {
         switch (header.Type)
         {
             case FrameType.Headers:
+                await HandleHeadersFrameAsync(header, payload);
+                break;
+
             case FrameType.Message:
             case FrameType.Trailers:
             case FrameType.HalfClose:
@@ -224,17 +317,213 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 break;
 
             case FrameType.WindowUpdate:
-                // Route window update to stream
-                if (_streams.TryGetValue(header.StreamId, out var windowStream))
-                {
-                    var increment = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(payload);
-                    windowStream.OnWindowUpdate(increment);
-                }
+                // Route window update to stream or connection
+                var increment = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(payload);
+                AddSendQuota(header.StreamId, increment);
                 break;
         }
-
-        return Task.CompletedTask;
     }
+
+    /// <summary>
+    /// Handles an incoming HEADERS frame.
+    /// For server: creates a new stream from client request.
+    /// For client: routes to existing stream (response headers).
+    /// </summary>
+    private async Task HandleHeadersFrameAsync(FrameHeader header, byte[] payload)
+    {
+        var streamId = header.StreamId;
+
+        // Check if stream already exists
+        if (_streams.TryGetValue(streamId, out var existingStream))
+        {
+            // Route to existing stream (e.g., response headers for client)
+            existingStream.OnFrameReceived(header, payload);
+            return;
+        }
+
+        // On server: new stream from client
+        if (!_isClient)
+        {
+            // Validate stream ID - clients use odd IDs
+            if (streamId % 2 != 1)
+            {
+                // Invalid stream ID from client - reject
+                System.Diagnostics.Debug.WriteLine($"Invalid stream ID {streamId} from client (must be odd)");
+                RejectStream(streamId, "invalid stream ID");
+                return;
+            }
+
+            // Check if draining
+            if (_draining || _goAwaySent || _goAwayReceived)
+            {
+                RejectStream(streamId, "transport is draining");
+                return;
+            }
+
+            // Check max concurrent streams
+            if (_streams.Count >= (int)_maxConcurrentStreams)
+            {
+                RejectStream(streamId, "max concurrent streams exceeded");
+                return;
+            }
+
+            // Decode headers
+            HeadersV1 headersV1;
+            try
+            {
+                headersV1 = HeadersV1.Decode(payload);
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"Failed to decode headers: {ex.Message}");
+                RejectStream(streamId, "invalid headers");
+                return;
+            }
+
+            // Create new server stream
+            var newStream = new ShmGrpcStream(streamId, this, isServerStream: true);
+            newStream.SetRequestHeaders(headersV1);
+
+            if (!_streams.TryAdd(streamId, newStream))
+            {
+                // Stream already exists (race condition)
+                return;
+            }
+
+            // Publish to incoming streams channel
+            if (!_incomingStreamsChannel.Writer.TryWrite(newStream))
+            {
+                // Channel full - try async
+                await _incomingStreamsChannel.Writer.WriteAsync(newStream, _disposeCts.Token);
+            }
+
+            // Raise event
+            StreamReceived?.Invoke(this, new StreamReceivedEventArgs(newStream));
+        }
+    }
+
+    /// <summary>
+    /// Rejects a stream by sending TRAILERS with an error.
+    /// </summary>
+    private void RejectStream(uint streamId, string message)
+    {
+        try
+        {
+            var trailers = new TrailersV1
+            {
+                Version = 1,
+                GrpcStatusCode = Grpc.Core.StatusCode.Unavailable,
+                GrpcStatusMessage = message
+            };
+            var trailersPayload = trailers.Encode();
+            SendFrame(FrameType.Trailers, streamId, 0, trailersPayload);
+        }
+        catch
+        {
+            // Best effort
+        }
+    }
+
+    /// <summary>
+    /// Initiates graceful shutdown - stops accepting new streams.
+    /// </summary>
+    public void Drain()
+    {
+        _draining = true;
+        SendGoAway("draining");
+    }
+
+    #region Connection-Level Flow Control
+
+    /// <summary>
+    /// Adds send quota for a stream or connection (when receiving WINDOW_UPDATE).
+    /// </summary>
+    /// <param name="streamId">Stream ID (0 for connection-level).</param>
+    /// <param name="delta">The window size increment.</param>
+    internal void AddSendQuota(uint streamId, uint delta)
+    {
+        if (streamId == 0)
+        {
+            // Connection-level
+            var oldQuota = Interlocked.Add(ref _connSendQuota, delta) - delta;
+            if (oldQuota <= 0 && oldQuota + delta > 0)
+            {
+                // Quota became positive - signal waiters
+                _quotaSignal.Release();
+            }
+        }
+        else
+        {
+            // Stream-level - route to stream
+            if (_streams.TryGetValue(streamId, out var stream))
+            {
+                stream.OnWindowUpdate(delta);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Acquires send quota from both connection and stream levels.
+    /// Blocks until quota is available or cancelled.
+    /// </summary>
+    /// <param name="streamId">The stream ID.</param>
+    /// <param name="n">Number of bytes to acquire.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    internal async Task AcquireSendQuotaAsync(uint streamId, int n, CancellationToken cancellationToken)
+    {
+        // Acquire connection-level quota first
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var current = Interlocked.Read(ref _connSendQuota);
+            if (current >= n)
+            {
+                if (Interlocked.CompareExchange(ref _connSendQuota, current - n, current) == current)
+                {
+                    break;
+                }
+                continue;
+            }
+
+            // Wait for quota update
+            await _quotaSignal.WaitAsync(cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Updates connection inflow accounting when data is received.
+    /// Returns the window update to send (if any).
+    /// </summary>
+    internal uint OnConnectionDataReceived(uint size)
+    {
+        lock (_flowControlLock)
+        {
+            _connInFlowUnacked += size;
+            if (_connInFlowUnacked >= _connInFlowLimit / 4)
+            {
+                var windowUpdate = _connInFlowUnacked;
+                _connInFlowUnacked = 0;
+                return windowUpdate;
+            }
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// Sends a connection-level window update.
+    /// </summary>
+    internal void SendConnectionWindowUpdate(uint increment)
+    {
+        if (increment > 0)
+        {
+            var payload = new byte[4];
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(payload, increment);
+            SendFrame(FrameType.WindowUpdate, 0, 0, payload);
+        }
+    }
+
+    #endregion
 
     private void ThrowIfDisposed()
     {
@@ -332,5 +621,24 @@ public sealed class GoAwayEventArgs : EventArgs
     {
         Flags = flags;
         Message = message;
+    }
+}
+
+/// <summary>
+/// Event args for stream received events.
+/// </summary>
+public sealed class StreamReceivedEventArgs : EventArgs
+{
+    /// <summary>
+    /// Gets the stream that was received.
+    /// </summary>
+    public ShmGrpcStream Stream { get; }
+
+    /// <summary>
+    /// Creates new StreamReceivedEventArgs.
+    /// </summary>
+    public StreamReceivedEventArgs(ShmGrpcStream stream)
+    {
+        Stream = stream ?? throw new ArgumentNullException(nameof(stream));
     }
 }

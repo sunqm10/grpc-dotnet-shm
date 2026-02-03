@@ -81,10 +81,16 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// </summary>
     public bool IsCancelled => _cancelled;
 
-    internal ShmGrpcStream(uint streamId, ShmConnection connection)
+    /// <summary>
+    /// Gets whether this is a server-initiated stream (i.e., server received request).
+    /// </summary>
+    public bool IsServerStream { get; }
+
+    internal ShmGrpcStream(uint streamId, ShmConnection connection, bool isServerStream = false)
     {
         StreamId = streamId;
         _connection = connection;
+        IsServerStream = isServerStream;
         _inboundFrames = Channel.CreateUnbounded<(FrameType, byte[])>(new UnboundedChannelOptions
         {
             SingleReader = true,
@@ -93,6 +99,14 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         _disposeCts = new CancellationTokenSource();
         _sendLock = new SemaphoreSlim(1, 1);
         _sendWindow = ShmConstants.InitialWindowSize;
+    }
+
+    /// <summary>
+    /// Sets the request headers from incoming HEADERS frame (server-side).
+    /// </summary>
+    internal void SetRequestHeaders(HeadersV1 headers)
+    {
+        _requestHeaders = headers;
     }
 
     /// <summary>

@@ -97,6 +97,30 @@ public static class RingSyncFactory
         }
     }
 
+    /// <summary>
+    /// Creates a ring sync primitive with direct memory access for futex operations.
+    /// </summary>
+    /// <param name="segmentName">The segment name for unique identification.</param>
+    /// <param name="ringId">The ring identifier (e.g., "A" or "B").</param>
+    /// <param name="isServer">True if this is the server (creates events), false for client (opens events).</param>
+    /// <param name="memoryManager">The memory manager providing direct access to the mapped region.</param>
+    /// <param name="ringHeaderOffset">The offset to the ring header within the mapped region.</param>
+    public static IRingSync Create(string segmentName, string ringId, bool isServer, MappedMemoryManager memoryManager, int ringHeaderOffset)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return CreateWindowsSync(segmentName, ringId, isServer);
+        }
+        else if (OperatingSystem.IsLinux())
+        {
+            return CreateLinuxSyncWithPointers(memoryManager, ringHeaderOffset);
+        }
+        else
+        {
+            throw new PlatformNotSupportedException("Shared memory transport requires Windows or Linux.");
+        }
+    }
+
 #if WINDOWS
     [System.Runtime.Versioning.SupportedOSPlatform("windows")]
     private static IRingSync CreateWindowsSync(string segmentName, string ringId, bool isServer)
@@ -116,8 +140,19 @@ public static class RingSyncFactory
     {
         return new LinuxRingSync();
     }
+
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
+    private static IRingSync CreateLinuxSyncWithPointers(MappedMemoryManager memoryManager, int ringHeaderOffset)
+    {
+        return new LinuxRingSync(memoryManager, ringHeaderOffset);
+    }
 #else
     private static IRingSync CreateLinuxSync()
+    {
+        throw new PlatformNotSupportedException("Linux sync not available on this platform.");
+    }
+
+    private static IRingSync CreateLinuxSyncWithPointers(MappedMemoryManager memoryManager, int ringHeaderOffset)
     {
         throw new PlatformNotSupportedException("Linux sync not available on this platform.");
     }

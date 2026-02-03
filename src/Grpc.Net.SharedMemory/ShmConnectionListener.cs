@@ -71,33 +71,21 @@ public sealed class ShmConnectionListener : IDisposable, IAsyncDisposable
     {
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
 
-        while (!linkedCts.Token.IsCancellationRequested && !_serverConnection.IsClosed)
+        // Use the ShmConnection's stream acceptance channel
+        await foreach (var stream in _serverConnection.AcceptStreamsAsync(linkedCts.Token))
         {
-            ShmGrpcStream? stream = null;
-
-            try
-            {
-                // The server doesn't create streams - it receives them from clients
-                // Wait for an incoming stream by monitoring the connection
-                // For now, we'll need to track when new streams arrive
-
-                // This is a simplified implementation - in practice, the ShmConnection
-                // should provide an event or method to accept new streams
-                await Task.Delay(10, linkedCts.Token);
-
-                // Check for new streams that have received headers
-                // This would need to be wired up properly with ShmConnection
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-
-            if (stream != null)
-            {
-                yield return stream;
-            }
+            yield return stream;
         }
+    }
+
+    /// <summary>
+    /// Accepts a single incoming gRPC stream from a client.
+    /// </summary>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The next incoming stream, or null if the listener is closed.</returns>
+    public ValueTask<ShmGrpcStream?> AcceptStreamAsync(CancellationToken cancellationToken = default)
+    {
+        return _serverConnection.AcceptStreamAsync(cancellationToken);
     }
 
     /// <inheritdoc/>

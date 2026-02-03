@@ -114,13 +114,16 @@ public struct SegmentHeader
 /// <summary>
 /// Represents a shared memory segment containing two ring buffers for bidirectional communication.
 /// Ring A is used for client→server data, Ring B for server→client data.
+///
+/// This implementation uses zero-copy memory access through <see cref="MappedMemoryManager"/>
+/// to operate directly on the memory-mapped region without intermediate buffer copies.
 /// </summary>
 public sealed class Segment : IDisposable
 {
     private readonly MemoryMappedFile _mappedFile;
     private readonly MemoryMappedViewAccessor _accessor;
+    private readonly MappedMemoryManager _memoryManager;
     private readonly Memory<byte> _memory;
-    private readonly byte[] _memoryBuffer;
     private readonly bool _isServer;
     private bool _disposed;
 
@@ -142,12 +145,15 @@ public sealed class Segment : IDisposable
     /// <summary>Gets the total segment size in bytes.</summary>
     public long Size { get; }
 
+    /// <summary>Gets the MappedMemoryManager for direct memory access (advanced usage).</summary>
+    public MappedMemoryManager MemoryManager => _memoryManager;
+
     private Segment(
         string name,
         string filePath,
         MemoryMappedFile mappedFile,
         MemoryMappedViewAccessor accessor,
-        byte[] memoryBuffer,
+        MappedMemoryManager memoryManager,
         bool isServer,
         ulong ringAOffset,
         ulong ringACapacity,
@@ -158,10 +164,10 @@ public sealed class Segment : IDisposable
         FilePath = filePath;
         _mappedFile = mappedFile;
         _accessor = accessor;
-        _memoryBuffer = memoryBuffer;
-        _memory = memoryBuffer;
+        _memoryManager = memoryManager;
+        _memory = memoryManager.Memory;
         _isServer = isServer;
-        Size = memoryBuffer.Length;
+        Size = memoryManager.Length;
 
         // Create ring sync primitives
         IRingSync? syncA = null;
@@ -171,8 +177,13 @@ public sealed class Segment : IDisposable
         {
             if (OperatingSystem.IsWindows())
             {
-                syncA = RingSyncFactory.Create(name, "A", isServer);
-                syncB = RingSyncFactory.Create(name, "B", isServer);
+                syncA = RingSyncFactory.Create(name, "A", isServer, memoryManager, (int)ringAOffset);
+                syncB = RingSyncFactory.Create(name, "B", isServer, memoryManager, (int)ringBOffset);
+            }
+            else if (OperatingSystem.IsLinux())
+            {
+                syncA = RingSyncFactory.Create(name, "A", isServer, memoryManager, (int)ringAOffset);
+                syncB = RingSyncFactory.Create(name, "B", isServer, memoryManager, (int)ringBOffset);
             }
         }
         catch
@@ -180,7 +191,7 @@ public sealed class Segment : IDisposable
             // Sync primitives are optional - fall back to polling if not available
         }
 
-        // Create ring buffers
+        // Create ring buffers operating directly on mapped memory (zero-copy)
         RingA = new ShmRing(_memory, (int)ringAOffset, ringACapacity, syncA);
         RingB = new ShmRing(_memory, (int)ringBOffset, ringBCapacity, syncB);
     }
@@ -238,9 +249,9 @@ public sealed class Segment : IDisposable
 
         var accessor = mappedFile.CreateViewAccessor(0, (long)totalSize, MemoryMappedFileAccess.ReadWrite);
 
-        // Read the mapped memory into a managed buffer
-        var memoryBuffer = new byte[totalSize];
-        accessor.ReadArray(0, memoryBuffer, 0, memoryBuffer.Length);
+        // Create zero-copy memory manager over the mapped region
+        var memoryManager = new MappedMemoryManager(accessor);
+        var memory = memoryManager.Memory;
 
         // Initialize segment header with grpc-go-shmem compatible magic
         var header = new SegmentHeader
@@ -262,17 +273,17 @@ public sealed class Segment : IDisposable
             MaxStreams = maxStreams
         };
 
-        // Write header to buffer
-        WriteSegmentHeader(memoryBuffer, header);
+        // Write header directly to mapped memory (zero-copy)
+        WriteSegmentHeader(memory.Span, header);
 
-        // Initialize ring headers
-        InitializeRingHeader(memoryBuffer, (int)ringAOffset, ringCapacity);
-        InitializeRingHeader(memoryBuffer, (int)ringBOffset, ringCapacity);
+        // Initialize ring headers directly in mapped memory
+        InitializeRingHeader(memory.Span, (int)ringAOffset, ringCapacity);
+        InitializeRingHeader(memory.Span, (int)ringBOffset, ringCapacity);
 
-        // Write back to mapped file
-        accessor.WriteArray(0, memoryBuffer, 0, memoryBuffer.Length);
+        // Flush to ensure visibility to other processes
+        accessor.Flush();
 
-        return new Segment(name, filePath, mappedFile, accessor, memoryBuffer, true,
+        return new Segment(name, filePath, mappedFile, accessor, memoryManager, true,
             ringAOffset, ringCapacity, ringBOffset, ringCapacity);
     }
 
@@ -343,10 +354,10 @@ public sealed class Segment : IDisposable
             : header.RingBOffset + (ulong)ShmConstants.RingHeaderSize + header.RingBCapacity;
         var accessor = mappedFile.CreateViewAccessor(0, (long)totalSize, MemoryMappedFileAccess.ReadWrite);
 
-        var memoryBuffer = new byte[totalSize];
-        accessor.ReadArray(0, memoryBuffer, 0, memoryBuffer.Length);
+        // Create zero-copy memory manager over the mapped region
+        var memoryManager = new MappedMemoryManager(accessor);
 
-        return new Segment(name, filePath, mappedFile, accessor, memoryBuffer, false,
+        return new Segment(name, filePath, mappedFile, accessor, memoryManager, false,
             header.RingAOffset, header.RingACapacity, header.RingBOffset, header.RingBCapacity);
     }
 
@@ -360,33 +371,34 @@ public sealed class Segment : IDisposable
     }
 
     /// <summary>
-    /// Synchronizes the in-memory buffer with the memory-mapped file.
-    /// Call this periodically or after writes to ensure data is visible to other processes.
+    /// Flushes the memory-mapped file to ensure visibility to other processes.
+    /// With zero-copy access, this just triggers the OS flush mechanism.
     /// </summary>
     public void Flush()
     {
         if (_disposed) return;
-        _accessor.WriteArray(0, _memoryBuffer, 0, _memoryBuffer.Length);
         _accessor.Flush();
     }
 
     /// <summary>
-    /// Reads the latest data from the memory-mapped file into the in-memory buffer.
+    /// Refreshes is no longer needed with zero-copy access.
+    /// The memory is always directly accessing the mapped region.
+    /// This method is kept for API compatibility but does nothing.
     /// </summary>
+    [Obsolete("Refresh is not needed with zero-copy memory access. Memory operations work directly on the mapped region.")]
     public void Refresh()
     {
-        if (_disposed) return;
-        _accessor.ReadArray(0, _memoryBuffer, 0, _memoryBuffer.Length);
+        // No-op: With zero-copy access, we're always reading from the mapped region
     }
 
     private SegmentHeader GetHeader()
     {
-        return ReadSegmentHeader(_memoryBuffer);
+        return ReadSegmentHeader(_memory.Span);
     }
 
-    private static void WriteSegmentHeader(byte[] buffer, SegmentHeader header)
+    private static void WriteSegmentHeader(Span<byte> buffer, SegmentHeader header)
     {
-        var span = buffer.AsSpan(0, ShmConstants.SegmentHeaderSize);
+        var span = buffer.Slice(0, ShmConstants.SegmentHeaderSize);
         span.Clear(); // Zero all bytes first
 
         // Write grpc-go-shmem compatible header (128 bytes)
@@ -407,9 +419,9 @@ public sealed class Segment : IDisposable
         BinaryPrimitives.WriteUInt32LittleEndian(span[0x50..0x54], header.MaxStreams);
     }
 
-    private static SegmentHeader ReadSegmentHeader(byte[] buffer)
+    private static SegmentHeader ReadSegmentHeader(Span<byte> buffer)
     {
-        var span = buffer.AsSpan(0, ShmConstants.SegmentHeaderSize);
+        var span = buffer.Slice(0, ShmConstants.SegmentHeaderSize);
         return new SegmentHeader
         {
             MagicValue = BinaryPrimitives.ReadUInt64LittleEndian(span[0x00..0x08]),
@@ -430,9 +442,9 @@ public sealed class Segment : IDisposable
         };
     }
 
-    private static void InitializeRingHeader(byte[] buffer, int offset, ulong capacity)
+    private static void InitializeRingHeader(Span<byte> buffer, int offset, ulong capacity)
     {
-        var span = buffer.AsSpan(offset, ShmConstants.RingHeaderSize);
+        var span = buffer.Slice(offset, ShmConstants.RingHeaderSize);
         span.Clear(); // Zero all fields
         // Write capacity at offset 0 (grpc-go-shmem layout: capacity is first field)
         BinaryPrimitives.WriteUInt64LittleEndian(span[0..8], capacity);
@@ -445,6 +457,7 @@ public sealed class Segment : IDisposable
 
         RingA.Dispose();
         RingB.Dispose();
+        _memoryManager.Dispose();
         _accessor.Dispose();
         _mappedFile.Dispose();
 
