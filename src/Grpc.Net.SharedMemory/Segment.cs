@@ -127,6 +127,9 @@ public sealed class Segment : IDisposable
     /// <summary>Gets the segment name.</summary>
     public string Name { get; }
 
+    /// <summary>Gets the path to the backing file.</summary>
+    public string FilePath { get; }
+
     /// <summary>Gets the Ring A (client→server) ring buffer.</summary>
     public ShmRing RingA { get; }
 
@@ -141,6 +144,7 @@ public sealed class Segment : IDisposable
 
     private Segment(
         string name,
+        string filePath,
         MemoryMappedFile mappedFile,
         MemoryMappedViewAccessor accessor,
         byte[] memoryBuffer,
@@ -151,6 +155,7 @@ public sealed class Segment : IDisposable
         ulong ringBCapacity)
     {
         Name = name;
+        FilePath = filePath;
         _mappedFile = mappedFile;
         _accessor = accessor;
         _memoryBuffer = memoryBuffer;
@@ -182,6 +187,7 @@ public sealed class Segment : IDisposable
 
     /// <summary>
     /// Creates a new shared memory segment (server-side).
+    /// Uses file-backed shared memory at %TEMP%\grpc_shm_{name} for grpc-go-shmem compatibility.
     /// </summary>
     /// <param name="name">The segment name for identification.</param>
     /// <param name="ringCapacity">The capacity for each ring buffer (must be power of 2).</param>
@@ -205,11 +211,30 @@ public sealed class Segment : IDisposable
         var ringBOffset = ringAOffset + (ulong)ShmConstants.RingHeaderSize + ringCapacity;
         var totalSize = ringBOffset + (ulong)ShmConstants.RingHeaderSize + ringCapacity;
 
-        // Create memory-mapped file
-        var mappedFile = MemoryMappedFile.CreateNew(
-            $"grpc_shm_{name}",
+        // Use file-backed shared memory like grpc-go-shmem: %TEMP%\grpc_shm_{name}
+        var filePath = GenerateSegmentPath(name);
+        
+        // Create the backing file if it doesn't exist, or fail if it does (like Go's O_EXCL)
+        if (File.Exists(filePath))
+        {
+            throw new IOException($"Segment '{name}' already exists at {filePath}");
+        }
+
+        // Create the backing file
+        using (var fs = new FileStream(filePath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.ReadWrite))
+        {
+            fs.SetLength((long)totalSize);
+        }
+
+        // Create memory-mapped file from the backing file
+        var backingFile = new FileStream(filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+        var mappedFile = MemoryMappedFile.CreateFromFile(
+            backingFile,
+            mapName: null, // No kernel name for file-backed
             (long)totalSize,
-            MemoryMappedFileAccess.ReadWrite);
+            MemoryMappedFileAccess.ReadWrite,
+            HandleInheritability.None,
+            leaveOpen: false);
 
         var accessor = mappedFile.CreateViewAccessor(0, (long)totalSize, MemoryMappedFileAccess.ReadWrite);
 
@@ -247,16 +272,16 @@ public sealed class Segment : IDisposable
         // Write back to mapped file
         accessor.WriteArray(0, memoryBuffer, 0, memoryBuffer.Length);
 
-        return new Segment(name, mappedFile, accessor, memoryBuffer, true,
+        return new Segment(name, filePath, mappedFile, accessor, memoryBuffer, true,
             ringAOffset, ringCapacity, ringBOffset, ringCapacity);
     }
 
     /// <summary>
     /// Opens an existing shared memory segment (client-side).
+    /// Opens file-backed shared memory at %TEMP%\grpc_shm_{name} for grpc-go-shmem compatibility.
     /// </summary>
     /// <param name="name">The segment name.</param>
     /// <returns>The opened segment.</returns>
-    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
     public static Segment Open(string name)
     {
         if (string.IsNullOrEmpty(name))
@@ -264,10 +289,34 @@ public sealed class Segment : IDisposable
             throw new ArgumentException("Segment name cannot be null or empty", nameof(name));
         }
 
-        // Open existing memory-mapped file
-        var mappedFile = MemoryMappedFile.OpenExisting($"grpc_shm_{name}", MemoryMappedFileRights.ReadWrite);
+        // Use file-backed shared memory like grpc-go-shmem: %TEMP%\grpc_shm_{name}
+        var filePath = GenerateSegmentPath(name);
+        
+        if (!File.Exists(filePath))
+        {
+            throw new FileNotFoundException($"Segment '{name}' not found at {filePath}", filePath);
+        }
 
-        // We need to read the header first to determine the size
+        // Open the backing file
+        var backingFile = new FileStream(filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+        
+        // Validate minimum size
+        if (backingFile.Length < ShmConstants.SegmentHeaderSize)
+        {
+            backingFile.Dispose();
+            throw new InvalidDataException($"Segment file too small: {backingFile.Length} bytes");
+        }
+
+        // Create memory-mapped file from the backing file (temporarily for header read)
+        var mappedFile = MemoryMappedFile.CreateFromFile(
+            backingFile,
+            mapName: null,
+            backingFile.Length,
+            MemoryMappedFileAccess.ReadWrite,
+            HandleInheritability.None,
+            leaveOpen: false);
+
+        // Read and validate header
         using var headerAccessor = mappedFile.CreateViewAccessor(0, ShmConstants.SegmentHeaderSize, MemoryMappedFileAccess.Read);
         var headerBuffer = new byte[ShmConstants.SegmentHeaderSize];
         headerAccessor.ReadArray(0, headerBuffer, 0, headerBuffer.Length);
@@ -297,8 +346,17 @@ public sealed class Segment : IDisposable
         var memoryBuffer = new byte[totalSize];
         accessor.ReadArray(0, memoryBuffer, 0, memoryBuffer.Length);
 
-        return new Segment(name, mappedFile, accessor, memoryBuffer, false,
+        return new Segment(name, filePath, mappedFile, accessor, memoryBuffer, false,
             header.RingAOffset, header.RingACapacity, header.RingBOffset, header.RingBCapacity);
+    }
+
+    /// <summary>
+    /// Generates the path to the shared memory backing file.
+    /// Uses %TEMP%\grpc_shm_{name} to match grpc-go-shmem convention.
+    /// </summary>
+    private static string GenerateSegmentPath(string name)
+    {
+        return Path.Combine(Path.GetTempPath(), $"grpc_shm_{name}");
     }
 
     /// <summary>
@@ -389,5 +447,18 @@ public sealed class Segment : IDisposable
         RingB.Dispose();
         _accessor.Dispose();
         _mappedFile.Dispose();
+
+        // Server cleans up the backing file
+        if (_isServer && !string.IsNullOrEmpty(FilePath))
+        {
+            try
+            {
+                File.Delete(FilePath);
+            }
+            catch
+            {
+                // Best effort cleanup - file may still be in use by clients
+            }
+        }
     }
 }

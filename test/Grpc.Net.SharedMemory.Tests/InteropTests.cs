@@ -17,6 +17,7 @@
 #endregion
 
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Text;
 using NUnit.Framework;
 
@@ -348,5 +349,112 @@ public class InteropTests
 
         Console.WriteLine($"Binary dumps written to: {dumpPath}");
         Assert.Pass($"Binary dumps generated at {dumpPath}");
+    }
+
+    /// <summary>
+    /// Cross-language test: Creates a segment in .NET, verifies Go can read it.
+    /// </summary>
+    [Test]
+    [Platform("Win")]
+    public void CrossLanguage_GoCanReadDotNetSegment()
+    {
+        var goVerifyExe = Path.Combine(GoInteropDir, "segment_verify.exe");
+        if (!File.Exists(goVerifyExe))
+        {
+            Assert.Ignore($"Go verifier not found at {goVerifyExe}. Build with: cd GoInterop && go build -o segment_verify.exe segment_verify.go");
+        }
+
+        var segmentName = $"dotnet_test_{Guid.NewGuid():N}";
+        using var segment = Segment.Create(segmentName, 4096, 100);
+
+        try
+        {
+            // Run Go verifier
+            var psi = new ProcessStartInfo
+            {
+                FileName = goVerifyExe,
+                Arguments = $"-name {segmentName}",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var process = Process.Start(psi);
+            var output = process!.StandardOutput.ReadToEnd();
+            var error = process.StandardError.ReadToEnd();
+            process.WaitForExit(5000);
+
+            Console.WriteLine($"Go output:\n{output}");
+            if (!string.IsNullOrEmpty(error))
+            {
+                Console.WriteLine($"Go stderr:\n{error}");
+            }
+
+            Assert.That(process.ExitCode, Is.EqualTo(0), $"Go verifier failed with code {process.ExitCode}");
+            Assert.That(output, Does.Contain("VERIFY_SUCCESS"), "Go should verify segment successfully");
+            Assert.That(output, Does.Contain("Magic: \"GRPCSHM\\x00\""), "Magic should match");
+            Assert.That(output, Does.Contain("Version: 1"), "Version should be 1");
+            Assert.That(output, Does.Contain("RingA: offset=128, capacity=4096"), "RingA layout should match");
+        }
+        finally
+        {
+            // Cleanup is handled by Dispose, but we need to ensure the segment is disposed
+            // before checking the file is deleted
+        }
+    }
+
+    /// <summary>
+    /// Cross-language test: Go creates segment, .NET reads it.
+    /// </summary>
+    [Test]
+    [Platform("Win")]
+    public void CrossLanguage_DotNetCanReadGoSegment()
+    {
+        var goVerifyExe = Path.Combine(GoInteropDir, "segment_verify.exe");
+        if (!File.Exists(goVerifyExe))
+        {
+            Assert.Ignore($"Go verifier not found at {goVerifyExe}. Build with: cd GoInterop && go build -o segment_verify.exe segment_verify.go");
+        }
+
+        var segmentName = $"go_test_{Guid.NewGuid():N}";
+        var segmentPath = Path.Combine(Path.GetTempPath(), $"grpc_shm_{segmentName}");
+
+        try
+        {
+            // Have Go create the segment
+            var psi = new ProcessStartInfo
+            {
+                FileName = goVerifyExe,
+                Arguments = $"-name {segmentName} -create -capacity 4096",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var process = Process.Start(psi);
+            process!.WaitForExit(5000);
+            var output = process.StandardOutput.ReadToEnd();
+            var error = process.StandardError.ReadToEnd();
+
+            Assert.That(process.ExitCode, Is.EqualTo(0), $"Go create failed: {error}");
+            Console.WriteLine($"Go created segment: {output}");
+
+            // Now open with .NET
+            using var segment = Segment.Open(segmentName);
+            
+            Assert.That(segment.Header.MagicValue, Is.EqualTo(BitConverter.ToUInt64(ShmConstants.SegmentMagicBytes)), "Magic");
+            Assert.That(segment.Header.Version, Is.EqualTo(1u), "Version");
+            Assert.That(segment.Header.RingACapacity, Is.EqualTo(4096UL), "RingA capacity");
+            Assert.That(segment.Header.RingBCapacity, Is.EqualTo(4096UL), "RingB capacity");
+            Assert.That(segment.Header.ServerReady, Is.EqualTo(1u), "ServerReady");
+            Assert.That(segment.Header.MaxStreams, Is.EqualTo(100u), "MaxStreams");
+        }
+        finally
+        {
+            // Clean up Go-created segment
+            try { File.Delete(segmentPath); } catch { }
+        }
     }
 }
