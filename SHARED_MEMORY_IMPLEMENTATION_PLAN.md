@@ -177,9 +177,9 @@ enum FrameType : byte
 
 ## Current Status
 
-**Phase**: 1 - Low-Level Transport Primitives
-**Status**: Phase 1.1 ✅ Complete, Phase 1.2 ✅ Complete
-**Next Step**: Phase 2 - gRPC Transport Integration
+**Phase**: 3 - E2E Tests & Examples
+**Status**: Phase 1.1 ✅, Phase 1.2 ✅, Phase 2 ✅, Phase 3 ✅ Complete
+**Next Step**: Phase 4 - Interoperability Testing & Performance Optimization
 
 ### Phase 1.1 Completed (Commit: 99a3d75c)
 - ✅ ShmRing SPSC ring buffer with blocking read/write
@@ -193,15 +193,36 @@ enum FrameType : byte
 - ✅ FrameProtocol.cs - Frame I/O operations (WriteFrame, ReadFrame, etc.)
 - ✅ HeadersV1.cs - Binary encoding/decoding for gRPC headers
 - ✅ TrailersV1.cs - Binary encoding/decoding for gRPC trailers
-- ✅ HeadersTrailersTests.cs - Encode/decode round-trip tests
-- ✅ SegmentTests.cs - Segment creation and initialization tests
-- ✅ Updated FrameProtocolTests.cs - Full frame protocol integration tests
 - ✅ 45 unit tests passing total
 
-### Known Limitations (to address in Phase 2)
+### Phase 2 Completed
+- ✅ ShmStream.cs - Stream abstraction over ring buffers
+- ✅ ShmConnection.cs - Client/server connection with stream multiplexing
+- ✅ ShmGrpcStream.cs - Single gRPC call handling
+- ✅ ShmHandler.cs - HttpMessageHandler for GrpcChannel integration
+- ✅ ShmConnectionListener.cs - Server-side listener
+- ✅ 59 tests passing
+
+### Phase 3 Completed
+- ✅ EndToEndTests.cs - Full E2E test suite
+  - Unary calls
+  - Server streaming
+  - Client streaming
+  - Bidirectional streaming
+  - Error handling
+  - Cancellation
+  - Deadline propagation
+  - Metadata round-trip
+  - Large messages
+  - Multiple connections
+- ✅ Greeter.SharedMemory example structure created
+- ✅ 69 tests passing total
+
+### Known Limitations (to address in Phase 4+)
 - Segment currently copies memory-mapped data to local buffer (breaks true sharing)
 - Cross-process memory sharing needs unsafe/pointer-based implementation
 - Linux futex implementation is stubbed (uses polling fallback)
+- Server-side stream acceptance needs better implementation
 
 ---
 
