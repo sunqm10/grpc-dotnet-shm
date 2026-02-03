@@ -48,10 +48,27 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     private readonly object _flowControlLock = new();
     private readonly SemaphoreSlim _quotaSignal = new(0);
 
+    // BDP estimation (A73 RFC Phase 5)
+    private readonly ShmBdpEstimator _bdpEstimator;
+
+    // Keepalive (A73 RFC)
+    private readonly ShmKeepaliveOptions _keepaliveOptions;
+    private readonly ShmKeepaliveEnforcementPolicy? _enforcementPolicy;
+    private Task? _keepaliveTask;
+    private DateTime _lastPingAt;
+    private DateTime _lastPingSentAt;
+    private bool _pendingPing;
+    private int _pingStrikes;
+
     /// <summary>
     /// Gets the connection-level send quota remaining.
     /// </summary>
     public long ConnectionSendQuota => Interlocked.Read(ref _connSendQuota);
+
+    /// <summary>
+    /// Gets the BDP estimator for this connection.
+    /// </summary>
+    public ShmBdpEstimator BdpEstimator => _bdpEstimator;
 
     /// <summary>
     /// Gets the connection name (shared memory segment name).
@@ -87,12 +104,13 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// Creates a new client-side connection by opening an existing shared memory segment.
     /// </summary>
     /// <param name="name">The name of the shared memory segment to connect to.</param>
+    /// <param name="keepaliveOptions">Optional keepalive options.</param>
     /// <returns>A new client connection.</returns>
     [SupportedOSPlatform("windows")]
-    public static ShmConnection ConnectAsClient(string name)
+    public static ShmConnection ConnectAsClient(string name, ShmKeepaliveOptions? keepaliveOptions = null)
     {
         var segment = Segment.Open(name);
-        return new ShmConnection(name, segment, isClient: true);
+        return new ShmConnection(name, segment, isClient: true, keepaliveOptions);
     }
 
     /// <summary>
@@ -101,18 +119,32 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// <param name="name">The name for the shared memory segment.</param>
     /// <param name="ringCapacity">The capacity of each ring buffer (default: 64MB).</param>
     /// <param name="maxStreams">Maximum concurrent streams (default: 100).</param>
+    /// <param name="keepaliveOptions">Optional keepalive options.</param>
+    /// <param name="enforcementPolicy">Optional enforcement policy for server.</param>
     /// <returns>A new server connection.</returns>
-    public static ShmConnection CreateAsServer(string name, ulong ringCapacity = 64 * 1024 * 1024, uint maxStreams = 100)
+    public static ShmConnection CreateAsServer(
+        string name, 
+        ulong ringCapacity = 64 * 1024 * 1024, 
+        uint maxStreams = 100,
+        ShmKeepaliveOptions? keepaliveOptions = null,
+        ShmKeepaliveEnforcementPolicy? enforcementPolicy = null)
     {
         var segment = Segment.Create(name, ringCapacity, maxStreams);
-        return new ShmConnection(name, segment, isClient: false);
+        return new ShmConnection(name, segment, isClient: false, keepaliveOptions, enforcementPolicy);
     }
 
-    private ShmConnection(string name, Segment segment, bool isClient)
+    private ShmConnection(
+        string name, 
+        Segment segment, 
+        bool isClient, 
+        ShmKeepaliveOptions? keepaliveOptions = null,
+        ShmKeepaliveEnforcementPolicy? enforcementPolicy = null)
     {
         Name = name;
         _segment = segment;
         _isClient = isClient;
+        _keepaliveOptions = keepaliveOptions ?? ShmKeepaliveOptions.Default;
+        _enforcementPolicy = enforcementPolicy;
         _streams = new ConcurrentDictionary<uint, ShmGrpcStream>();
         _disposeCts = new CancellationTokenSource();
         _maxConcurrentStreams = segment.Header.MaxStreams > 0 ? segment.Header.MaxStreams : 100;
@@ -121,6 +153,9 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         _connSendQuota = ShmConstants.InitialWindowSize;
         _connInFlowLimit = (uint)ShmConstants.InitialWindowSize;
         _connInFlowUnacked = 0;
+
+        // Initialize BDP estimator
+        _bdpEstimator = new ShmBdpEstimator((uint)ShmConstants.InitialWindowSize, UpdateFlowControlWindows);
 
         // Create channel for incoming streams (server-side)
         _incomingStreamsChannel = Channel.CreateBounded<ShmGrpcStream>(new BoundedChannelOptions((int)_maxConcurrentStreams)
@@ -135,6 +170,12 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
         // Start background frame reader
         _frameReaderTask = Task.Run(FrameReaderLoopAsync);
+
+        // Start keepalive task if enabled
+        if (_keepaliveOptions.IsEnabled)
+        {
+            _keepaliveTask = Task.Run(KeepaliveLoopAsync);
+        }
     }
 
     /// <summary>
@@ -298,16 +339,32 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 if (_streams.TryGetValue(header.StreamId, out var stream))
                 {
                     stream.OnFrameReceived(header, payload);
+
+                    // BDP estimation: track bytes received
+                    if (header.Type == FrameType.Message)
+                    {
+                        var sendBdpPing = _bdpEstimator.Add((uint)payload.Length);
+                        var windowUpdate = OnConnectionDataReceived((uint)payload.Length);
+                        if (windowUpdate > 0)
+                        {
+                            SendConnectionWindowUpdate(windowUpdate);
+                        }
+                        if (sendBdpPing)
+                        {
+                            SendBdpPing();
+                        }
+                    }
                 }
                 break;
 
             case FrameType.Ping:
-                // Respond with Pong
-                FrameProtocol.WritePong(TxRing, header.Flags, payload, _disposeCts.Token);
+                // Use new handler for BDP and enforcement
+                HandlePing(header, payload);
                 break;
 
             case FrameType.Pong:
-                // Ping response received - could track latency
+                // Use new handler for BDP and keepalive
+                HandlePong(header, payload);
                 break;
 
             case FrameType.GoAway:
@@ -521,6 +578,161 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(payload, increment);
             SendFrame(FrameType.WindowUpdate, 0, 0, payload);
         }
+    }
+
+    /// <summary>
+    /// Updates flow control windows based on BDP estimation.
+    /// Called by the BDP estimator when it calculates a new estimate.
+    /// </summary>
+    private void UpdateFlowControlWindows(uint newBdp)
+    {
+        lock (_flowControlLock)
+        {
+            if (newBdp > _connInFlowLimit)
+            {
+                var delta = newBdp - _connInFlowLimit;
+                _connInFlowLimit = newBdp;
+                SendConnectionWindowUpdate(delta);
+            }
+        }
+
+        // Also update stream-level windows
+        foreach (var stream in _streams.Values)
+        {
+            stream.UpdateFlowControlWindow(newBdp);
+        }
+    }
+
+    /// <summary>
+    /// Sends a BDP ping to estimate bandwidth-delay product.
+    /// </summary>
+    internal void SendBdpPing()
+    {
+        if (_disposed || IsClosed)
+        {
+            return;
+        }
+
+        _bdpEstimator.Timesnap();
+        SendFrame(FrameType.Ping, 0, PingFlags.Bdp, ShmBdpEstimator.BdpPingData);
+    }
+
+    #endregion
+
+    #region Keepalive
+
+    /// <summary>
+    /// Keepalive background loop that sends periodic pings.
+    /// </summary>
+    private async Task KeepaliveLoopAsync()
+    {
+        try
+        {
+            while (!_disposeCts.Token.IsCancellationRequested && !IsClosed)
+            {
+                await Task.Delay(_keepaliveOptions.Time, _disposeCts.Token);
+
+                if (_disposeCts.Token.IsCancellationRequested || IsClosed)
+                {
+                    break;
+                }
+
+                // Check if we should send a ping
+                var hasActiveStreams = _streams.Count > 0;
+                if (!hasActiveStreams && !_keepaliveOptions.PermitWithoutStream)
+                {
+                    continue;
+                }
+
+                // Check if there's already a pending ping
+                if (_pendingPing)
+                {
+                    // Check if timeout exceeded
+                    if (DateTime.UtcNow - _lastPingSentAt > _keepaliveOptions.PingTimeout)
+                    {
+                        // Timeout - close connection
+                        SendGoAway("keepalive timeout");
+                        break;
+                    }
+                    continue;
+                }
+
+                // Send keepalive ping
+                _pendingPing = true;
+                _lastPingSentAt = DateTime.UtcNow;
+                var pingData = BitConverter.GetBytes(DateTime.UtcNow.Ticks);
+                SendFrame(FrameType.Ping, 0, 0, pingData);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected during shutdown
+        }
+    }
+
+    /// <summary>
+    /// Handles an incoming PING frame.
+    /// </summary>
+    private void HandlePing(FrameHeader header, byte[] payload)
+    {
+        // Check for BDP ping
+        if ((header.Flags & PingFlags.Bdp) != 0)
+        {
+            // BDP ping - respond with pong and BDP flag
+            SendFrame(FrameType.Pong, 0, PingFlags.Bdp, payload);
+            return;
+        }
+
+        // Server-side: check ping enforcement policy
+        if (!_isClient && _enforcementPolicy != null)
+        {
+            var now = DateTime.UtcNow;
+            var hasActiveStreams = _streams.Count > 0;
+
+            // Check if ping is allowed without streams
+            if (!hasActiveStreams && !_enforcementPolicy.PermitWithoutStream)
+            {
+                _pingStrikes++;
+                if (_pingStrikes > _enforcementPolicy.MaxPingStrikes)
+                {
+                    SendGoAway("too many pings without streams");
+                    return;
+                }
+            }
+
+            // Check if ping is too frequent
+            if (_lastPingAt != DateTime.MinValue && now - _lastPingAt < _enforcementPolicy.MinTime)
+            {
+                _pingStrikes++;
+                if (_pingStrikes > _enforcementPolicy.MaxPingStrikes)
+                {
+                    SendGoAway("too many pings");
+                    return;
+                }
+            }
+
+            _lastPingAt = now;
+        }
+
+        // Regular ping - respond with pong
+        SendFrame(FrameType.Pong, header.StreamId, header.Flags, payload);
+    }
+
+    /// <summary>
+    /// Handles an incoming PONG frame.
+    /// </summary>
+    private void HandlePong(FrameHeader header, byte[] payload)
+    {
+        // Check for BDP pong
+        if ((header.Flags & PingFlags.Bdp) != 0 && payload.Length == 8 && 
+            payload.SequenceEqual(ShmBdpEstimator.BdpPingData))
+        {
+            _bdpEstimator.Calculate();
+            return;
+        }
+
+        // Regular keepalive pong - clear pending ping
+        _pendingPing = false;
     }
 
     #endregion

@@ -377,6 +377,20 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         Interlocked.Add(ref _sendWindow, increment);
     }
 
+    /// <summary>
+    /// Updates the flow control window based on BDP estimation.
+    /// </summary>
+    /// <param name="newWindow">The new window size.</param>
+    internal void UpdateFlowControlWindow(uint newWindow)
+    {
+        var currentWindow = Interlocked.Read(ref _sendWindow);
+        if (newWindow > currentWindow)
+        {
+            var delta = (long)newWindow - currentWindow;
+            Interlocked.Add(ref _sendWindow, delta);
+        }
+    }
+
     private async Task SendFrameAsync(FrameType type, byte flags, byte[] payload, CancellationToken cancellationToken = default)
     {
         await _sendLock.WaitAsync(cancellationToken);
