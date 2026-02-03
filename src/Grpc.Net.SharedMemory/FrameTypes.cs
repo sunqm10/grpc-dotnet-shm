@@ -117,11 +117,14 @@ public static class ShmConstants
     /// <summary>Size of the ring header in bytes.</summary>
     public const int RingHeaderSize = 64;
 
-    /// <summary>Size of the segment header in bytes.</summary>
-    public const int SegmentHeaderSize = 64;
+    /// <summary>Size of the segment header in bytes (matches grpc-go-shmem).</summary>
+    public const int SegmentHeaderSize = 128;
 
-    /// <summary>Magic number for segment identification ("SHM1").</summary>
-    public const uint SegmentMagic = 0x53484D31;
+    /// <summary>Magic string for segment identification ("GRPCSHM\0").</summary>
+    public static ReadOnlySpan<byte> SegmentMagicBytes => "GRPCSHM\0"u8;
+
+    /// <summary>Legacy magic number for backward compatibility.</summary>
+    public const uint SegmentMagicLegacy = 0x53484D31;
 
     /// <summary>Current protocol version.</summary>
     public const uint ProtocolVersion = 1;

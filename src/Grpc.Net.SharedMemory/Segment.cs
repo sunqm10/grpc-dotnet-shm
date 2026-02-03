@@ -24,56 +24,71 @@ using Grpc.Net.SharedMemory.Synchronization;
 namespace Grpc.Net.SharedMemory;
 
 /// <summary>
-/// Segment header structure (64 bytes) that identifies and configures a shared memory segment.
+/// Segment header structure (128 bytes) that identifies and configures a shared memory segment.
 /// This layout matches grpc-go-shmem for interoperability.
 /// 
 /// Layout:
-/// - Offset 0-3:   magic (uint32) - "SHM1" = 0x53484D31
-/// - Offset 4-7:   version (uint32) - protocol version
-/// - Offset 8-11:  maxStreams (uint32) - maximum concurrent streams
-/// - Offset 12-15: flags (uint32) - reserved flags
-/// - Offset 16-23: ringAOffset (uint64) - offset to Ring A in segment
-/// - Offset 24-31: ringACapacity (uint64) - data area capacity for Ring A
-/// - Offset 32-39: ringBOffset (uint64) - offset to Ring B in segment
-/// - Offset 40-47: ringBCapacity (uint64) - data area capacity for Ring B
-/// - Offset 48-63: reserved (16 bytes) - future use
+/// - Offset 0-7:    magic (8 bytes) - "GRPCSHM\0"
+/// - Offset 8-11:   version (uint32) - protocol version
+/// - Offset 12-15:  flags (uint32) - reserved flags
+/// - Offset 16-23:  totalSize (uint64) - total segment size
+/// - Offset 24-31:  ringAOffset (uint64) - offset to Ring A in segment
+/// - Offset 32-39:  ringACapacity (uint64) - data area capacity for Ring A
+/// - Offset 40-47:  ringBOffset (uint64) - offset to Ring B in segment
+/// - Offset 48-55:  ringBCapacity (uint64) - data area capacity for Ring B
+/// - Offset 56-59:  maxStreams (uint32) - maximum concurrent streams
+/// - Offset 60-63:  clientReady (uint32) - client ready flag
+/// - Offset 64-67:  serverReady (uint32) - server ready flag
+/// - Offset 68-127: reserved (60 bytes) - future use
 /// </summary>
-[StructLayout(LayoutKind.Explicit, Size = 64)]
+[StructLayout(LayoutKind.Explicit, Size = 128)]
 public struct SegmentHeader
 {
-    /// <summary>Magic number identifying this as a shared memory segment ("SHM1").</summary>
+    /// <summary>Magic bytes identifying this as a shared memory segment ("GRPCSHM\0").</summary>
     [FieldOffset(0)]
-    public uint Magic;
+    public ulong MagicValue;
 
     /// <summary>Protocol version.</summary>
-    [FieldOffset(4)]
-    public uint Version;
-
-    /// <summary>Maximum concurrent streams.</summary>
     [FieldOffset(8)]
-    public uint MaxStreams;
+    public uint Version;
 
     /// <summary>Reserved flags.</summary>
     [FieldOffset(12)]
     public uint Flags;
 
-    /// <summary>Offset to Ring A (client→server) in the segment.</summary>
+    /// <summary>Total segment size in bytes.</summary>
     [FieldOffset(16)]
+    public ulong TotalSize;
+
+    /// <summary>Offset to Ring A (client→server) in the segment.</summary>
+    [FieldOffset(24)]
     public ulong RingAOffset;
 
     /// <summary>Data area capacity for Ring A.</summary>
-    [FieldOffset(24)]
+    [FieldOffset(32)]
     public ulong RingACapacity;
 
     /// <summary>Offset to Ring B (server→client) in the segment.</summary>
-    [FieldOffset(32)]
+    [FieldOffset(40)]
     public ulong RingBOffset;
 
     /// <summary>Data area capacity for Ring B.</summary>
-    [FieldOffset(40)]
+    [FieldOffset(48)]
     public ulong RingBCapacity;
 
-    // Offset 48-63: Reserved (16 bytes) - implicitly zeroed
+    /// <summary>Maximum concurrent streams.</summary>
+    [FieldOffset(56)]
+    public uint MaxStreams;
+
+    /// <summary>Client ready flag.</summary>
+    [FieldOffset(60)]
+    public uint ClientReady;
+
+    /// <summary>Server ready flag.</summary>
+    [FieldOffset(64)]
+    public uint ServerReady;
+
+    // Offset 68-127: Reserved (60 bytes) - implicitly zeroed
 }
 
 /// <summary>
@@ -165,7 +180,7 @@ public sealed class Segment : IDisposable
         }
 
         // Calculate total segment size
-        // Layout: [SegmentHeader (64)] [RingA Header (64)] [RingA Data] [RingB Header (64)] [RingB Data]
+        // Layout: [SegmentHeader (128)] [RingA Header (64)] [RingA Data] [RingB Header (64)] [RingB Data]
         var ringAOffset = (ulong)ShmConstants.SegmentHeaderSize;
         var ringBOffset = ringAOffset + (ulong)ShmConstants.RingHeaderSize + ringCapacity;
         var totalSize = ringBOffset + (ulong)ShmConstants.RingHeaderSize + ringCapacity;
@@ -182,17 +197,19 @@ public sealed class Segment : IDisposable
         var memoryBuffer = new byte[totalSize];
         accessor.ReadArray(0, memoryBuffer, 0, memoryBuffer.Length);
 
-        // Initialize segment header
+        // Initialize segment header with grpc-go-shmem compatible magic
         var header = new SegmentHeader
         {
-            Magic = ShmConstants.SegmentMagic,
+            MagicValue = BitConverter.ToUInt64(ShmConstants.SegmentMagicBytes),
             Version = ShmConstants.ProtocolVersion,
-            MaxStreams = maxStreams,
             Flags = 0,
+            TotalSize = totalSize,
             RingAOffset = ringAOffset,
             RingACapacity = ringCapacity,
             RingBOffset = ringBOffset,
-            RingBCapacity = ringCapacity
+            RingBCapacity = ringCapacity,
+            MaxStreams = maxStreams,
+            ServerReady = 1  // Server is ready when creating
         };
 
         // Write header to buffer
@@ -232,10 +249,12 @@ public sealed class Segment : IDisposable
 
         var header = ReadSegmentHeader(headerBuffer);
 
-        if (header.Magic != ShmConstants.SegmentMagic)
+        // Validate magic - check for grpc-go-shmem compatible "GRPCSHM\0"
+        var expectedMagic = BitConverter.ToUInt64(ShmConstants.SegmentMagicBytes);
+        if (header.MagicValue != expectedMagic)
         {
             mappedFile.Dispose();
-            throw new InvalidDataException($"Invalid segment magic: expected 0x{ShmConstants.SegmentMagic:X8}, got 0x{header.Magic:X8}");
+            throw new InvalidDataException($"Invalid segment magic: expected 'GRPCSHM\\0', got 0x{header.MagicValue:X16}");
         }
 
         if (header.Version != ShmConstants.ProtocolVersion)
@@ -244,8 +263,10 @@ public sealed class Segment : IDisposable
             throw new InvalidDataException($"Unsupported protocol version: expected {ShmConstants.ProtocolVersion}, got {header.Version}");
         }
 
-        // Calculate total size and open full view
-        var totalSize = header.RingBOffset + (ulong)ShmConstants.RingHeaderSize + header.RingBCapacity;
+        // Use TotalSize from header if available, otherwise calculate
+        var totalSize = header.TotalSize > 0 
+            ? header.TotalSize 
+            : header.RingBOffset + (ulong)ShmConstants.RingHeaderSize + header.RingBCapacity;
         var accessor = mappedFile.CreateViewAccessor(0, (long)totalSize, MemoryMappedFileAccess.ReadWrite);
 
         var memoryBuffer = new byte[totalSize];
@@ -283,14 +304,20 @@ public sealed class Segment : IDisposable
     private static void WriteSegmentHeader(byte[] buffer, SegmentHeader header)
     {
         var span = buffer.AsSpan(0, ShmConstants.SegmentHeaderSize);
-        BinaryPrimitives.WriteUInt32LittleEndian(span[0..4], header.Magic);
-        BinaryPrimitives.WriteUInt32LittleEndian(span[4..8], header.Version);
-        BinaryPrimitives.WriteUInt32LittleEndian(span[8..12], header.MaxStreams);
+        span.Clear(); // Zero all bytes first
+        
+        // Write grpc-go-shmem compatible header (128 bytes)
+        BinaryPrimitives.WriteUInt64LittleEndian(span[0..8], header.MagicValue);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[8..12], header.Version);
         BinaryPrimitives.WriteUInt32LittleEndian(span[12..16], header.Flags);
-        BinaryPrimitives.WriteUInt64LittleEndian(span[16..24], header.RingAOffset);
-        BinaryPrimitives.WriteUInt64LittleEndian(span[24..32], header.RingACapacity);
-        BinaryPrimitives.WriteUInt64LittleEndian(span[32..40], header.RingBOffset);
-        BinaryPrimitives.WriteUInt64LittleEndian(span[40..48], header.RingBCapacity);
+        BinaryPrimitives.WriteUInt64LittleEndian(span[16..24], header.TotalSize);
+        BinaryPrimitives.WriteUInt64LittleEndian(span[24..32], header.RingAOffset);
+        BinaryPrimitives.WriteUInt64LittleEndian(span[32..40], header.RingACapacity);
+        BinaryPrimitives.WriteUInt64LittleEndian(span[40..48], header.RingBOffset);
+        BinaryPrimitives.WriteUInt64LittleEndian(span[48..56], header.RingBCapacity);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[56..60], header.MaxStreams);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[60..64], header.ClientReady);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[64..68], header.ServerReady);
     }
 
     private static SegmentHeader ReadSegmentHeader(byte[] buffer)
@@ -298,14 +325,17 @@ public sealed class Segment : IDisposable
         var span = buffer.AsSpan(0, ShmConstants.SegmentHeaderSize);
         return new SegmentHeader
         {
-            Magic = BinaryPrimitives.ReadUInt32LittleEndian(span[0..4]),
-            Version = BinaryPrimitives.ReadUInt32LittleEndian(span[4..8]),
-            MaxStreams = BinaryPrimitives.ReadUInt32LittleEndian(span[8..12]),
+            MagicValue = BinaryPrimitives.ReadUInt64LittleEndian(span[0..8]),
+            Version = BinaryPrimitives.ReadUInt32LittleEndian(span[8..12]),
             Flags = BinaryPrimitives.ReadUInt32LittleEndian(span[12..16]),
-            RingAOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[16..24]),
-            RingACapacity = BinaryPrimitives.ReadUInt64LittleEndian(span[24..32]),
-            RingBOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[32..40]),
-            RingBCapacity = BinaryPrimitives.ReadUInt64LittleEndian(span[40..48])
+            TotalSize = BinaryPrimitives.ReadUInt64LittleEndian(span[16..24]),
+            RingAOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[24..32]),
+            RingACapacity = BinaryPrimitives.ReadUInt64LittleEndian(span[32..40]),
+            RingBOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[40..48]),
+            RingBCapacity = BinaryPrimitives.ReadUInt64LittleEndian(span[48..56]),
+            MaxStreams = BinaryPrimitives.ReadUInt32LittleEndian(span[56..60]),
+            ClientReady = BinaryPrimitives.ReadUInt32LittleEndian(span[60..64]),
+            ServerReady = BinaryPrimitives.ReadUInt32LittleEndian(span[64..68])
         };
     }
 
@@ -313,8 +343,8 @@ public sealed class Segment : IDisposable
     {
         var span = buffer.AsSpan(offset, ShmConstants.RingHeaderSize);
         span.Clear(); // Zero all fields
-        // Write capacity at offset 40
-        BinaryPrimitives.WriteUInt64LittleEndian(span[40..48], capacity);
+        // Write capacity at offset 0 (grpc-go-shmem layout: capacity is first field)
+        BinaryPrimitives.WriteUInt64LittleEndian(span[0..8], capacity);
     }
 
     public void Dispose()

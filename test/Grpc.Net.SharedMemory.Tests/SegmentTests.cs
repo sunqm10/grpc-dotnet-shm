@@ -97,9 +97,71 @@ public class SegmentTests
 
         // Assert
         var header = segment.Header;
-        Assert.That(header.Magic, Is.EqualTo(ShmConstants.SegmentMagic));
+        
+        // Verify grpc-go-shmem compatible magic "GRPCSHM\0"
+        var expectedMagic = BitConverter.ToUInt64(ShmConstants.SegmentMagicBytes);
+        Assert.That(header.MagicValue, Is.EqualTo(expectedMagic));
         Assert.That(header.Version, Is.EqualTo(ShmConstants.ProtocolVersion));
         Assert.That(header.MaxStreams, Is.EqualTo(100));
+        Assert.That(header.ServerReady, Is.EqualTo(1));
+    }
+
+    [Test]
+    [Platform("Win")]
+    public void SegmentHeader_Size_Is128Bytes()
+    {
+        // Verify 128-byte header size for grpc-go-shmem compatibility
+        Assert.That(ShmConstants.SegmentHeaderSize, Is.EqualTo(128));
+        Assert.That(System.Runtime.InteropServices.Marshal.SizeOf<SegmentHeader>(), Is.EqualTo(128));
+    }
+
+    [Test]
+    [Platform("Win")]
+    public void RingHeader_Size_Is64Bytes()
+    {
+        // Verify 64-byte ring header size
+        Assert.That(ShmConstants.RingHeaderSize, Is.EqualTo(64));
+        Assert.That(System.Runtime.InteropServices.Marshal.SizeOf<RingHeader>(), Is.EqualTo(64));
+    }
+
+    [Test]
+    [Platform("Win")]
+    public void RingHeader_Layout_MatchesGoShmem()
+    {
+        // Verify field offsets match grpc-go-shmem
+        // Capacity at offset 0, WriteIdx at 8, ReadIdx at 16, etc.
+        var header = new RingHeader
+        {
+            Capacity = 0x1234567890ABCDEF,
+            WriteIdx = 0x1111111111111111,
+            ReadIdx = 0x2222222222222222,
+            DataSeq = 0x33333333,
+            SpaceSeq = 0x44444444,
+            ContigSeq = 0x55555555,
+            Closed = 0x66666666,
+            DataWaiters = 0x77777777,
+            SpaceWaiters = 0x88888888,
+            ContigWaiters = 0x99999999
+        };
+
+        // Marshal to bytes and verify layout
+        var bytes = new byte[64];
+        var handle = System.Runtime.InteropServices.GCHandle.Alloc(bytes, System.Runtime.InteropServices.GCHandleType.Pinned);
+        try
+        {
+            System.Runtime.InteropServices.Marshal.StructureToPtr(header, handle.AddrOfPinnedObject(), false);
+        }
+        finally
+        {
+            handle.Free();
+        }
+
+        // Check capacity is at offset 0
+        Assert.That(BitConverter.ToUInt64(bytes, 0), Is.EqualTo(0x1234567890ABCDEF));
+        // Check writeIdx is at offset 8
+        Assert.That(BitConverter.ToUInt64(bytes, 8), Is.EqualTo(0x1111111111111111));
+        // Check readIdx is at offset 16
+        Assert.That(BitConverter.ToUInt64(bytes, 16), Is.EqualTo(0x2222222222222222));
     }
 
     [Test]

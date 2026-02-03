@@ -1,0 +1,244 @@
+#region Copyright notice and license
+
+// Copyright 2025 The gRPC Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#endregion
+
+using System.Buffers.Binary;
+using System.Text;
+using NUnit.Framework;
+
+namespace Grpc.Net.SharedMemory.Tests;
+
+/// <summary>
+/// Tests verifying byte-level compatibility with grpc-go-shmem.
+/// These tests can be used to generate binary dumps for cross-language verification.
+/// </summary>
+[TestFixture]
+public class InteropTests
+{
+    /// <summary>
+    /// Verifies frame header encoding matches grpc-go-shmem format.
+    /// 
+    /// Go struct (16 bytes little-endian):
+    /// type FrameHeader struct {
+    ///     Length    uint32  // offset 0
+    ///     StreamID  uint32  // offset 4
+    ///     Type      uint8   // offset 8
+    ///     Flags     uint8   // offset 9
+    ///     Reserved1 uint16  // offset 10
+    ///     Reserved2 uint32  // offset 12
+    /// }
+    /// </summary>
+    [Test]
+    public void FrameHeader_ByteLayout_MatchesGo()
+    {
+        var header = new FrameHeader
+        {
+            Length = 0x12345678,
+            StreamId = 0xABCDEF01,
+            Type = FrameType.Message,
+            Flags = 0x42
+        };
+
+        var bytes = new byte[16];
+        header.EncodeTo(bytes);
+
+        // Verify little-endian layout
+        Assert.That(BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(0, 4)), Is.EqualTo(0x12345678), "Length at offset 0");
+        Assert.That(BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(4, 4)), Is.EqualTo(0xABCDEF01), "StreamID at offset 4");
+        Assert.That(bytes[8], Is.EqualTo((byte)FrameType.Message), "Type at offset 8");
+        Assert.That(bytes[9], Is.EqualTo(0x42), "Flags at offset 9");
+        Assert.That(bytes[10], Is.EqualTo(0), "Reserved1 at offset 10");
+        Assert.That(bytes[11], Is.EqualTo(0), "Reserved1 at offset 11");
+        Assert.That(BinaryPrimitives.ReadUInt32LittleEndian(bytes.AsSpan(12, 4)), Is.EqualTo(0), "Reserved2 at offset 12");
+    }
+
+    /// <summary>
+    /// Verifies ring header layout matches grpc-go-shmem format.
+    /// </summary>
+    [Test]
+    public void RingHeader_ByteLayout_MatchesGo()
+    {
+        // Verify struct offsets
+        Assert.That(System.Runtime.InteropServices.Marshal.OffsetOf<RingHeader>(nameof(RingHeader.Capacity)), Is.EqualTo((IntPtr)0));
+        Assert.That(System.Runtime.InteropServices.Marshal.OffsetOf<RingHeader>(nameof(RingHeader.WriteIdx)), Is.EqualTo((IntPtr)8));
+        Assert.That(System.Runtime.InteropServices.Marshal.OffsetOf<RingHeader>(nameof(RingHeader.ReadIdx)), Is.EqualTo((IntPtr)16));
+        Assert.That(System.Runtime.InteropServices.Marshal.OffsetOf<RingHeader>(nameof(RingHeader.DataSeq)), Is.EqualTo((IntPtr)24));
+        Assert.That(System.Runtime.InteropServices.Marshal.OffsetOf<RingHeader>(nameof(RingHeader.SpaceSeq)), Is.EqualTo((IntPtr)28));
+        Assert.That(System.Runtime.InteropServices.Marshal.OffsetOf<RingHeader>(nameof(RingHeader.ContigSeq)), Is.EqualTo((IntPtr)32));
+        Assert.That(System.Runtime.InteropServices.Marshal.OffsetOf<RingHeader>(nameof(RingHeader.Closed)), Is.EqualTo((IntPtr)36));
+        Assert.That(System.Runtime.InteropServices.Marshal.OffsetOf<RingHeader>(nameof(RingHeader.DataWaiters)), Is.EqualTo((IntPtr)40));
+        Assert.That(System.Runtime.InteropServices.Marshal.OffsetOf<RingHeader>(nameof(RingHeader.SpaceWaiters)), Is.EqualTo((IntPtr)44));
+        Assert.That(System.Runtime.InteropServices.Marshal.OffsetOf<RingHeader>(nameof(RingHeader.ContigWaiters)), Is.EqualTo((IntPtr)48));
+    }
+
+    /// <summary>
+    /// Verifies segment header layout matches grpc-go-shmem format.
+    /// </summary>
+    [Test]
+    public void SegmentHeader_ByteLayout_MatchesGo()
+    {
+        // Verify struct offsets
+        Assert.That(System.Runtime.InteropServices.Marshal.OffsetOf<SegmentHeader>(nameof(SegmentHeader.MagicValue)), Is.EqualTo((IntPtr)0));
+        Assert.That(System.Runtime.InteropServices.Marshal.OffsetOf<SegmentHeader>(nameof(SegmentHeader.Version)), Is.EqualTo((IntPtr)8));
+        Assert.That(System.Runtime.InteropServices.Marshal.OffsetOf<SegmentHeader>(nameof(SegmentHeader.Flags)), Is.EqualTo((IntPtr)12));
+        Assert.That(System.Runtime.InteropServices.Marshal.OffsetOf<SegmentHeader>(nameof(SegmentHeader.TotalSize)), Is.EqualTo((IntPtr)16));
+        Assert.That(System.Runtime.InteropServices.Marshal.OffsetOf<SegmentHeader>(nameof(SegmentHeader.RingAOffset)), Is.EqualTo((IntPtr)24));
+        Assert.That(System.Runtime.InteropServices.Marshal.OffsetOf<SegmentHeader>(nameof(SegmentHeader.RingACapacity)), Is.EqualTo((IntPtr)32));
+        Assert.That(System.Runtime.InteropServices.Marshal.OffsetOf<SegmentHeader>(nameof(SegmentHeader.RingBOffset)), Is.EqualTo((IntPtr)40));
+        Assert.That(System.Runtime.InteropServices.Marshal.OffsetOf<SegmentHeader>(nameof(SegmentHeader.RingBCapacity)), Is.EqualTo((IntPtr)48));
+        Assert.That(System.Runtime.InteropServices.Marshal.OffsetOf<SegmentHeader>(nameof(SegmentHeader.MaxStreams)), Is.EqualTo((IntPtr)56));
+    }
+
+    /// <summary>
+    /// Verifies magic string format matches "GRPCSHM\0".
+    /// </summary>
+    [Test]
+    public void SegmentMagic_MatchesGoFormat()
+    {
+        var magicBytes = ShmConstants.SegmentMagicBytes.ToArray();
+        
+        Assert.That(magicBytes.Length, Is.EqualTo(8));
+        Assert.That(Encoding.ASCII.GetString(magicBytes), Is.EqualTo("GRPCSHM\0"));
+    }
+
+    /// <summary>
+    /// Verifies HeadersV1 encoding format matches grpc-go-shmem.
+    /// </summary>
+    [Test]
+    public void HeadersV1_Encoding_MatchesGo()
+    {
+        var headers = new HeadersV1
+        {
+            Version = 1,
+            HeaderType = 0, // Client headers
+            Method = "/test.Service/Method",
+            Authority = "localhost",
+            DeadlineUnixNano = 0,
+            Metadata = new[] { new MetadataKV("custom-key", "value1") }
+        };
+
+        var encoded = headers.Encode();
+
+        // Verify format
+        Assert.That(encoded[0], Is.EqualTo(1), "Version byte");
+        Assert.That(encoded[1], Is.EqualTo(0), "HeaderType byte (client)");
+        
+        // Method length at offset 2 (4 bytes little-endian)
+        var methodLen = BinaryPrimitives.ReadUInt32LittleEndian(encoded.AsSpan(2, 4));
+        Assert.That(methodLen, Is.EqualTo((uint)headers.Method.Length));
+        
+        // Method string starts at offset 6
+        var methodBytes = Encoding.UTF8.GetString(encoded.AsSpan(6, (int)methodLen));
+        Assert.That(methodBytes, Is.EqualTo("/test.Service/Method"));
+    }
+
+    /// <summary>
+    /// Verifies TrailersV1 encoding format matches grpc-go-shmem.
+    /// </summary>
+    [Test]
+    public void TrailersV1_Encoding_MatchesGo()
+    {
+        var trailers = new TrailersV1
+        {
+            Version = 1,
+            GrpcStatusCode = Grpc.Core.StatusCode.OK,
+            GrpcStatusMessage = "Success",
+            Metadata = Array.Empty<MetadataKV>()
+        };
+
+        var encoded = trailers.Encode();
+
+        // Verify format
+        Assert.That(encoded[0], Is.EqualTo(1), "Version byte");
+        
+        // Status code at offset 1 (4 bytes little-endian)
+        var statusCode = BinaryPrimitives.ReadInt32LittleEndian(encoded.AsSpan(1, 4));
+        Assert.That(statusCode, Is.EqualTo(0), "OK status code");
+        
+        // Message length at offset 5 (4 bytes little-endian)
+        var msgLen = BinaryPrimitives.ReadUInt32LittleEndian(encoded.AsSpan(5, 4));
+        Assert.That(msgLen, Is.EqualTo((uint)"Success".Length));
+    }
+
+    /// <summary>
+    /// Generates a binary dump file for Go verification.
+    /// </summary>
+    [Test]
+    [Platform("Win")]
+    [Explicit("Run manually to generate binary dump for Go verification")]
+    public void GenerateBinaryDumpForGoVerification()
+    {
+        var dumpPath = Path.Combine(Path.GetTempPath(), "grpc_shm_binary_dump");
+        Directory.CreateDirectory(dumpPath);
+
+        // Dump frame header
+        var frameHeader = new FrameHeader
+        {
+            Length = 100,
+            StreamId = 1,
+            Type = FrameType.Headers,
+            Flags = HeadersFlags.Initial
+        };
+        var frameBytes = new byte[16];
+        frameHeader.EncodeTo(frameBytes);
+        File.WriteAllBytes(Path.Combine(dumpPath, "frame_header.bin"), frameBytes);
+
+        // Dump ring header
+        var ringHeader = new RingHeader
+        {
+            Capacity = 4096,
+            WriteIdx = 0,
+            ReadIdx = 0
+        };
+        var ringBytes = new byte[64];
+        var handle = System.Runtime.InteropServices.GCHandle.Alloc(ringBytes, System.Runtime.InteropServices.GCHandleType.Pinned);
+        try
+        {
+            System.Runtime.InteropServices.Marshal.StructureToPtr(ringHeader, handle.AddrOfPinnedObject(), false);
+        }
+        finally
+        {
+            handle.Free();
+        }
+        File.WriteAllBytes(Path.Combine(dumpPath, "ring_header.bin"), ringBytes);
+
+        // Dump headers
+        var headers = new HeadersV1
+        {
+            Version = 1,
+            HeaderType = 0,
+            Method = "/greet.Greeter/SayHello",
+            Authority = "localhost",
+            DeadlineUnixNano = 0,
+            Metadata = Array.Empty<MetadataKV>()
+        };
+        File.WriteAllBytes(Path.Combine(dumpPath, "headers_v1.bin"), headers.Encode());
+
+        // Dump trailers
+        var trailers = new TrailersV1
+        {
+            Version = 1,
+            GrpcStatusCode = Grpc.Core.StatusCode.OK,
+            GrpcStatusMessage = "",
+            Metadata = Array.Empty<MetadataKV>()
+        };
+        File.WriteAllBytes(Path.Combine(dumpPath, "trailers_v1.bin"), trailers.Encode());
+
+        Console.WriteLine($"Binary dumps written to: {dumpPath}");
+        Assert.Pass($"Binary dumps generated at {dumpPath}");
+    }
+}
