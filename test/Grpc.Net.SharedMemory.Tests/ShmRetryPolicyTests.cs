@@ -206,9 +206,16 @@ public class ShmRetryThrottlingTests
     public void TryConsume_FailsWhenTokensLow()
     {
         // Arrange
-        var throttling = new ShmRetryThrottling { MaxTokens = 2.0 };
-        throttling.TryConsume(); // 1.0 tokens
-        throttling.TryConsume(); // 0.0 tokens
+        // Note: MaxTokens is set after construction, but _tokenCount is initialized
+        // to the default MaxTokens (10.0) in the constructor. So we need to consume
+        // all 10 tokens to reach 0.
+        var throttling = new ShmRetryThrottling();
+        
+        // Consume all 10 tokens
+        for (int i = 0; i < 10; i++)
+        {
+            throttling.TryConsume();
+        }
 
         // Act
         var result = throttling.TryConsume();

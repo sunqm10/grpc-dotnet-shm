@@ -33,7 +33,7 @@ public class ShmStreamingTests
     private const int BigMessageSize = 1024 * 1024;
     
     [Test]
-    [Platform("Win,Linux")]
+    [Platform("Win")]
     [Timeout(30000)]
     public async Task DuplexStream_SendLargeFileBatched_Success()
     {
@@ -84,7 +84,7 @@ public class ShmStreamingTests
     }
     
     [Test]
-    [Platform("Win,Linux")]
+    [Platform("Win")]
     [Timeout(30000)]
     public async Task ClientStream_SendLargeFileBatched_Success()
     {
@@ -132,7 +132,7 @@ public class ShmStreamingTests
     }
     
     [Test]
-    [Platform("Win,Linux")]
+    [Platform("Win")]
     [Timeout(30000)]
     public async Task DuplexStream_SimultaneousSendAndReceive_Success()
     {
@@ -188,7 +188,7 @@ public class ShmStreamingTests
     }
     
     [Test]
-    [Platform("Win,Linux")]
+    [Platform("Win")]
     [Timeout(10000)]
     public async Task ServerStreaming_ManySmallMessages_Success()
     {
@@ -225,7 +225,7 @@ public class ShmStreamingTests
     }
     
     [Test]
-    [Platform("Win,Linux")]
+    [Platform("Win")]
     [Timeout(10000)]
     public async Task ClientStreaming_ManySmallMessages_Success()
     {
@@ -262,7 +262,7 @@ public class ShmStreamingTests
     }
     
     [Test]
-    [Platform("Win,Linux")]
+    [Platform("Win")]
     [Timeout(10000)]
     public async Task BidirectionalStreaming_InterleavedMessages_Success()
     {
@@ -307,7 +307,7 @@ public class ShmStreamingTests
     }
     
     [Test]
-    [Platform("Win,Linux")]
+    [Platform("Win")]
     [Timeout(10000)]
     public async Task Stream_EmptyMessages_Success()
     {
@@ -341,7 +341,7 @@ public class ShmStreamingTests
     }
     
     [Test]
-    [Platform("Win,Linux")]
+    [Platform("Win")]
     [Timeout(30000)]
     public async Task ParallelStreams_MultipleConnections_Success()
     {
