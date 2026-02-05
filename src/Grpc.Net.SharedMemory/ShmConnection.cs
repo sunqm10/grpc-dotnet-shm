@@ -347,7 +347,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         catch (Exception ex)
         {
             // Log error and close connection
-            System.Diagnostics.Debug.WriteLine($"Frame reader error: {ex.Message}");
+            System.Diagnostics.Debug.WriteLine($"Frame reader error: {ex}");
         }
     }
 
