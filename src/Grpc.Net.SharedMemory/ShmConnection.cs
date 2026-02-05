@@ -39,6 +39,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     private bool _goAwaySent;
     private bool _goAwayReceived;
     private bool _draining;
+    private volatile bool _readerStopped;
     private uint _maxConcurrentStreams;
 
     // Connection-level flow control (matches grpc-go-shmem)
@@ -81,9 +82,9 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     public bool IsClient => _isClient;
 
     /// <summary>
-    /// Gets whether the connection has been closed.
+    /// Gets whether the connection has been closed or is no longer functional.
     /// </summary>
-    public bool IsClosed => _disposed || _goAwaySent || _goAwayReceived;
+    public bool IsClosed => _disposed || _goAwaySent || _goAwayReceived || _readerStopped;
 
     /// <summary>
     /// Gets whether the connection is draining (not accepting new streams).
@@ -348,6 +349,11 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         {
             // Log error and close connection
             System.Diagnostics.Debug.WriteLine($"Frame reader error: {ex}");
+        }
+        finally
+        {
+            // Mark connection as no longer functional - the reader can't process any more frames
+            _readerStopped = true;
         }
     }
 

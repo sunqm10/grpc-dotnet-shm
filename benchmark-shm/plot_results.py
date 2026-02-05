@@ -47,6 +47,10 @@ def plot_throughput_comparison(results, output_dir, workload='unary'):
     """Create throughput comparison bar chart for TCP vs SHM."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     
+    # Ensure axes is always indexable
+    if not hasattr(axes, '__len__'):
+        axes = [axes]
+    
     # Filter results by workload
     filtered = [r for r in results if r['Workload'] == workload]
     
@@ -55,7 +59,9 @@ def plot_throughput_comparison(results, output_dir, workload='unary'):
     concurrencies = sorted(set(r['Concurrency'] for r in filtered))
     
     for idx, concurrency in enumerate(concurrencies[:2]):  # Plot first 2 concurrency levels
-        ax = axes[idx] if len(concurrencies) > 1 else axes
+        if idx >= len(axes):
+            break
+        ax = axes[idx]
         
         tcp_throughput = []
         shm_throughput = []
@@ -101,13 +107,19 @@ def plot_latency_comparison(results, output_dir, workload='unary'):
     """Create latency comparison chart for TCP vs SHM."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
     
+    # Ensure axes is always indexable
+    if not hasattr(axes, '__len__'):
+        axes = [axes]
+    
     filtered = [r for r in results if r['Workload'] == workload]
     
     sizes = sorted(set(r['MessageSize'] for r in filtered))
     concurrencies = sorted(set(r['Concurrency'] for r in filtered))
     
     for idx, concurrency in enumerate(concurrencies[:2]):
-        ax = axes[idx] if len(concurrencies) > 1 else axes
+        if idx >= len(axes):
+            break
+        ax = axes[idx]
         
         tcp_p50 = []
         tcp_p99 = []
