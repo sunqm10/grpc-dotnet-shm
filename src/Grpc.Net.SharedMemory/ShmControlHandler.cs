@@ -121,7 +121,13 @@ public sealed class ShmControlHandler : HttpMessageHandler
 
             return response;
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (OperationCanceledException)
+        {
+            // Clean up the stream on cancellation
+            await stream.CancelAsync().ConfigureAwait(false);
+            throw;
+        }
+        catch (Exception)
         {
             await stream.CancelAsync().ConfigureAwait(false);
             throw;

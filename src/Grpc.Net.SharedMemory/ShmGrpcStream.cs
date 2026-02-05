@@ -207,6 +207,9 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         var payload = _trailers.Encode();
         await SendFrameAsync(FrameType.Trailers, TrailersFlags.EndStream, payload);
         _halfCloseSent = true;
+        
+        // After sending trailers, the stream is complete - remove from connection
+        _connection.RemoveStream(StreamId);
     }
 
     /// <summary>
@@ -236,6 +239,9 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         catch { }
 
         _inboundFrames.Writer.TryComplete();
+        
+        // Remove from connection's stream tracking
+        _connection.RemoveStream(StreamId);
     }
 
     /// <summary>
