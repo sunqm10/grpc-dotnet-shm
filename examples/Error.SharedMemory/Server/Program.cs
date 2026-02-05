@@ -29,8 +29,8 @@ Console.WriteLine($"Segment name: {SegmentName}");
 // Create the greeter service with validation
 var greeterService = new GreeterService();
 
-// Create the shared memory listener
-using var listener = new ShmConnectionListener(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
+// Create the shared memory listener using ShmControlListener for grpc-go-shmem compatibility
+using var listener = new ShmControlListener(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
 Console.WriteLine("Server listening on shared memory segment: " + SegmentName);
 Console.WriteLine("Press Ctrl+C to stop the server.");
 
@@ -43,45 +43,60 @@ Console.CancelKeyPress += (_, e) =>
 
 try
 {
-    while (!cts.Token.IsCancellationRequested)
+    await foreach (var connection in listener.AcceptConnectionsAsync(cts.Token))
     {
-        var serverStream = listener.Connection.CreateStream();
+        Console.WriteLine($"New connection accepted: {connection.Name}");
 
-        if (serverStream.RequestHeaders is { Method: var method } && method != null)
+        _ = Task.Run(async () =>
         {
             try
             {
-                Console.WriteLine($"Received request for method: {method}");
+                await foreach (var stream in connection.AcceptStreamsAsync(cts.Token))
+                {
+                    try
+                    {
+                        var headers = stream.RequestHeaders;
+                        if (headers?.Method is { } method)
+                        {
+                            Console.WriteLine($"Received request for method: {method}");
 
-                // Send response headers
-                await serverStream.SendResponseHeadersAsync();
+                            // Read the request message
+                            byte[]? requestBytes = null;
+                            await foreach (var msg in stream.ReceiveMessagesAsync(cts.Token))
+                            {
+                                requestBytes = msg;
+                                break;
+                            }
 
-                // Handle the method with validation
-                var response = await greeterService.HandleMethodAsync(
-                    serverStream,
-                    method,
-                    Array.Empty<byte>());
+                            // Send response headers
+                            await stream.SendResponseHeadersAsync();
 
-                await serverStream.SendMessageAsync(response);
-                await serverStream.SendTrailersAsync(StatusCode.OK);
+                            // Handle the method with validation
+                            var response = await greeterService.HandleMethodAsync(
+                                stream,
+                                method,
+                                requestBytes ?? Array.Empty<byte>());
 
-                Console.WriteLine("Response sent successfully.");
+                            await stream.SendMessageAsync(response);
+                            await stream.SendTrailersAsync(StatusCode.OK);
+
+                            Console.WriteLine("Response sent successfully.");
+                        }
+                    }
+                    catch (RpcException ex)
+                    {
+                        Console.WriteLine($"RPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
+                        await stream.SendTrailersAsync(ex.Status.StatusCode, ex.Status.Detail);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error: {ex.Message}");
+                        await stream.SendTrailersAsync(StatusCode.Internal, ex.Message);
+                    }
+                }
             }
-            catch (RpcException ex)
-            {
-                Console.WriteLine($"RPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
-                
-                // Send the error trailers
-                await serverStream.SendTrailersAsync(ex.Status.StatusCode, ex.Status.Detail);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error: {ex.Message}");
-                await serverStream.SendTrailersAsync(StatusCode.Internal, ex.Message);
-            }
-        }
-
-        await Task.Delay(10, cts.Token);
+            catch (OperationCanceledException) { }
+        });
     }
 }
 catch (OperationCanceledException)

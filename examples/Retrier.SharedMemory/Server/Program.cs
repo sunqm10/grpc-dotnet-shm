@@ -29,7 +29,8 @@ Console.WriteLine($"Starting shared memory server on segment: {SegmentName}");
 
 var retrierService = new RetrierService();
 
-using var listener = new ShmConnectionListener(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
+// Create the shared memory listener using ShmControlListener for grpc-go-shmem compatibility
+using var listener = new ShmControlListener(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
 Console.WriteLine($"Server listening on shared memory segment: {SegmentName}");
 Console.WriteLine("The server simulates 50% delivery failure rate for retry demonstration.");
 Console.WriteLine();
@@ -44,47 +45,64 @@ Console.CancelKeyPress += (_, e) =>
 
 try
 {
-    while (!cts.Token.IsCancellationRequested)
+    await foreach (var connection in listener.AcceptConnectionsAsync(cts.Token))
     {
-        var serverStream = listener.Connection.CreateStream();
+        Console.WriteLine($"New connection accepted: {connection.Name}");
 
-        if (serverStream.RequestHeaders is { Method: var method } && method != null)
+        _ = Task.Run(async () =>
         {
             try
             {
-                Console.WriteLine($"Received request for: {method}");
+                await foreach (var stream in connection.AcceptStreamsAsync(cts.Token))
+                {
+                    try
+                    {
+                        var headers = stream.RequestHeaders;
+                        if (headers?.Method is { } method)
+                        {
+                            Console.WriteLine($"Received request for: {method}");
 
-                await serverStream.SendResponseHeadersAsync();
+                            // Read the request message
+                            byte[]? requestBytes = null;
+                            await foreach (var msg in stream.ReceiveMessagesAsync(cts.Token))
+                            {
+                                requestBytes = msg;
+                                break;
+                            }
 
-                var response = await retrierService.HandleMethodAsync(
-                    serverStream,
-                    method,
-                    Array.Empty<byte>());
+                            await stream.SendResponseHeadersAsync();
 
-                await serverStream.SendMessageAsync(response);
-                await serverStream.SendTrailersAsync(StatusCode.OK);
+                            var response = await retrierService.HandleMethodAsync(
+                                stream,
+                                method,
+                                requestBytes ?? Array.Empty<byte>());
 
-                Console.ForegroundColor = ConsoleColor.Green;
-                Console.WriteLine("  Package delivered successfully");
-                Console.ResetColor();
+                            await stream.SendMessageAsync(response);
+                            await stream.SendTrailersAsync(StatusCode.OK);
+
+                            Console.ForegroundColor = ConsoleColor.Green;
+                            Console.WriteLine("  Package delivered successfully");
+                            Console.ResetColor();
+                        }
+                    }
+                    catch (RpcException ex)
+                    {
+                        await stream.SendTrailersAsync(ex.StatusCode, ex.Status.Detail);
+                        Console.ForegroundColor = ConsoleColor.Yellow;
+                        Console.WriteLine($"  Delivery failed: {ex.Status.Detail}");
+                        Console.ResetColor();
+                    }
+                    catch (Exception ex)
+                    {
+                        await stream.SendTrailersAsync(StatusCode.Internal, ex.Message);
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine($"  Error: {ex.Message}");
+                        Console.ResetColor();
+                    }
+                }
             }
-            catch (RpcException ex)
-            {
-                await serverStream.SendTrailersAsync(ex.StatusCode, ex.Status.Detail);
-                Console.ForegroundColor = ConsoleColor.Yellow;
-                Console.WriteLine($"  Delivery failed: {ex.Status.Detail}");
-                Console.ResetColor();
-            }
-            catch (Exception ex)
-            {
-                await serverStream.SendTrailersAsync(StatusCode.Internal, ex.Message);
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"  Error: {ex.Message}");
-                Console.ResetColor();
-            }
-        }
-
-        await Task.Delay(10, cts.Token);
+            catch (OperationCanceledException) { }
+        });
     }
 }
 catch (OperationCanceledException)

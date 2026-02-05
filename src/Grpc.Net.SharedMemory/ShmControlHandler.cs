@@ -463,12 +463,16 @@ internal sealed class ShmControlResponseContent : HttpContent
 
     protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken cancellationToken)
     {
-        // The MESSAGE frames from grpc-go-shmem already contain gRPC framing:
-        // [compressed:1][length:4][protobuf-data]
-        // So we just write the raw frame payload directly without adding additional framing
+        // ReceiveMessagesAsync now returns raw protobuf data (the 5-byte gRPC framing
+        // was stripped). We need to add the gRPC framing back for the HTTP response
+        // since the gRPC client library expects wire format [compressed:1][length:4][data]
         await foreach (var message in _stream.ReceiveMessagesAsync(cancellationToken))
         {
-            // Write the message directly - it already has gRPC framing
+            // Write gRPC wire format: [compressed:1][length:4 BE][data]
+            var header = new byte[5];
+            header[0] = 0; // Not compressed
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(1), (uint)message.Length);
+            await stream.WriteAsync(header, cancellationToken).ConfigureAwait(false);
             await stream.WriteAsync(message, cancellationToken).ConfigureAwait(false);
         }
 

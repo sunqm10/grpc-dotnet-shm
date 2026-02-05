@@ -314,6 +314,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Receives messages from the stream.
+    /// Decodes the gRPC wire format: [compressed:1][length:4 BE][data].
     /// </summary>
     public async IAsyncEnumerable<byte[]> ReceiveMessagesAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
@@ -333,7 +334,28 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                         _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0,
                             BitConverter.GetBytes(increment));
                     }
-                    yield return frame.Value.Payload;
+                    
+                    // Decode gRPC wire format: [compressed:1][length:4 BE][data]
+                    var payload = frame.Value.Payload;
+                    if (payload.Length < 5)
+                    {
+                        throw new InvalidDataException($"MESSAGE payload too short: {payload.Length} bytes, expected at least 5");
+                    }
+                    
+                    var compressed = payload[0] != 0;
+                    if (compressed)
+                    {
+                        throw new NotSupportedException("Compression not yet supported");
+                    }
+                    
+                    var messageLength = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(payload.AsSpan(1, 4));
+                    if (payload.Length != 5 + messageLength)
+                    {
+                        throw new InvalidDataException($"MESSAGE payload length mismatch: got {payload.Length} bytes, expected {5 + messageLength}");
+                    }
+                    
+                    // Return just the protobuf data (without the 5-byte header)
+                    yield return payload[5..];
                     break;
 
                 case FrameType.HalfClose:

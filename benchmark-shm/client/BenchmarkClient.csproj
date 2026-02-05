@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <OutputType>Exe</OutputType>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <NoWarn>CA1305;CA1416;CA1822;CA2007;CA2016</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Protobuf Include="../proto/benchmark.proto" GrpcServices="Client" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Grpc.Net.Client" Version="2.70.0" />
+    <PackageReference Include="Google.Protobuf" Version="3.29.0" />
+    <PackageReference Include="Grpc.Tools" Version="2.70.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Grpc.Net.SharedMemory/Grpc.Net.SharedMemory.csproj">
+      <SetTargetFramework>TargetFramework=net9.0</SetTargetFramework>
+    </ProjectReference>
+  </ItemGroup>
+
+</Project>

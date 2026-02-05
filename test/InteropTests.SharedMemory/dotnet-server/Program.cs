@@ -66,8 +66,8 @@ try
                 {
                     try
                     {
-                        // Wait for request headers
-                        var headers = await stream.ReceiveRequestHeadersAsync(cts.Token);
+                        // Headers are already set when stream is accepted
+                        var headers = stream.RequestHeaders;
 
                         if (headers != null)
                         {

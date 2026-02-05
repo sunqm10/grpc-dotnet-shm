@@ -26,8 +26,8 @@ Console.WriteLine("================================================");
 Console.WriteLine($"Segment name: {SegmentName}");
 Console.WriteLine();
 
-// Create the shared memory listener with high capacity for racing
-using var listener = new ShmConnectionListener(SegmentName, ringCapacity: 16 * 1024 * 1024, maxStreams: 100);
+// Create the shared memory listener using ShmControlListener for grpc-go-shmem compatibility
+using var listener = new ShmControlListener(SegmentName, ringCapacity: 16 * 1024 * 1024, maxStreams: 100);
 Console.WriteLine($"Server listening on shared memory segment: {SegmentName}");
 Console.WriteLine("Press Ctrl+C to stop the server.");
 Console.WriteLine();
@@ -41,18 +41,37 @@ Console.CancelKeyPress += (_, e) =>
 
 try
 {
-    while (!cts.Token.IsCancellationRequested)
+    await foreach (var connection in listener.AcceptConnectionsAsync(cts.Token))
     {
-        var stream = listener.Connection.CreateStream();
-        
-        // Get race duration from headers
-        var durationStr = stream.RequestHeaders?.GetValueOrDefault("race-duration");
-        var duration = TimeSpan.TryParse(durationStr, out var d) ? d : TimeSpan.FromSeconds(30);
-        
-        Console.WriteLine($"New race started! Duration: {duration.TotalSeconds}s");
-        
-        // Handle concurrent bidirectional streaming
-        _ = HandleRaceAsync(stream, duration, cts.Token);
+        Console.WriteLine($"New connection accepted: {connection.Name}");
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await foreach (var stream in connection.AcceptStreamsAsync(cts.Token))
+                {
+                    try
+                    {
+                        // Get race duration from headers
+                        var durationStr = stream.RequestHeaders?.Metadata?.FirstOrDefault(h => h.Key == "race-duration")?.Values.FirstOrDefault();
+                        var duration = durationStr != null && TimeSpan.TryParse(System.Text.Encoding.UTF8.GetString(durationStr), out var d) 
+                            ? d 
+                            : TimeSpan.FromSeconds(30);
+                        
+                        Console.WriteLine($"New race started! Duration: {duration.TotalSeconds}s");
+                        
+                        // Handle concurrent bidirectional streaming
+                        await HandleRaceAsync(stream, duration, cts.Token);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Stream error: {ex.Message}");
+                    }
+                }
+            }
+            catch (OperationCanceledException) { }
+        });
     }
 }
 catch (OperationCanceledException)
@@ -73,25 +92,27 @@ static async Task HandleRaceAsync(ShmGrpcStream stream, TimeSpan duration, Cance
         // Concurrent stream: read and write simultaneously
         var readTask = Task.Run(async () =>
         {
-            while (!ct.IsCancellationRequested)
+            await foreach (var msg in stream.ReceiveMessagesAsync(ct))
             {
-                var message = await stream.ReceiveRequestAsync<RaceMessage>();
-                if (message == null) break;
+                if (msg == null) break;
+                var message = RaceMessage.Parser.ParseFrom(msg);
                 Interlocked.Increment(ref received);
             }
         });
         
         var writeTask = Task.Run(async () =>
         {
+            await stream.SendResponseHeadersAsync();
             while (!ct.IsCancellationRequested && (DateTime.UtcNow - startTime) < duration)
             {
                 var count = Interlocked.Increment(ref sent);
-                await stream.SendResponseAsync(new RaceMessage { Count = count });
+                await stream.SendMessageAsync(new RaceMessage { Count = count }.ToByteArray());
             }
         });
         
         await Task.WhenAll(readTask, writeTask);
         
+        await stream.SendTrailersAsync(Grpc.Core.StatusCode.OK);
         Console.WriteLine($"Race completed! Received: {received:n0}, Sent: {sent:n0}");
     }
     catch (Exception ex)

@@ -20,6 +20,7 @@ using Grpc.Core;
 using Grpc.Net.SharedMemory;
 using Mail;
 using System.Collections.Concurrent;
+using System.Text;
 
 const string SegmentName = "mailer_shm_example";
 
@@ -31,8 +32,8 @@ Console.WriteLine();
 // Repository to track mailboxes
 var mailQueues = new ConcurrentDictionary<string, MailQueue>();
 
-// Create the shared memory listener
-using var listener = new ShmConnectionListener(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
+// Create the shared memory listener using ShmControlListener for grpc-go-shmem compatibility
+using var listener = new ShmControlListener(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
 Console.WriteLine($"Server listening on shared memory segment: {SegmentName}");
 Console.WriteLine("Press Ctrl+C to stop the server.");
 Console.WriteLine();
@@ -61,18 +62,36 @@ Console.CancelKeyPress += (_, e) =>
 // Handle incoming bidirectional streaming connections
 try
 {
-    while (!cts.Token.IsCancellationRequested)
+    await foreach (var connection in listener.AcceptConnectionsAsync(cts.Token))
     {
-        var stream = listener.Connection.CreateStream();
-        
-        // Get mailbox name from headers
-        var mailboxName = stream.RequestHeaders?.GetValueOrDefault("mailbox-name") ?? "default";
-        var queue = mailQueues.GetOrAdd(mailboxName, _ => new MailQueue());
-        
-        Console.WriteLine($"New mailbox connection: {mailboxName}");
-        
-        // Handle bidirectional streaming
-        _ = HandleMailboxStreamAsync(stream, queue, mailboxName, cts.Token);
+        Console.WriteLine($"New connection accepted: {connection.Name}");
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await foreach (var stream in connection.AcceptStreamsAsync(cts.Token))
+                {
+                    try
+                    {
+                        // Get mailbox name from headers
+                        var mailboxNameBytes = stream.RequestHeaders?.Metadata?.FirstOrDefault(h => h.Key == "mailbox-name")?.Values.FirstOrDefault();
+                        var mailboxName = mailboxNameBytes != null ? Encoding.UTF8.GetString(mailboxNameBytes) : "default";
+                        var queue = mailQueues.GetOrAdd(mailboxName, _ => new MailQueue());
+                        
+                        Console.WriteLine($"New mailbox connection: {mailboxName}");
+                        
+                        // Handle bidirectional streaming
+                        await HandleMailboxStreamAsync(stream, queue, mailboxName, cts.Token);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Stream error: {ex.Message}");
+                    }
+                }
+            }
+            catch (OperationCanceledException) { }
+        });
     }
 }
 catch (OperationCanceledException)
@@ -86,45 +105,49 @@ static async Task HandleMailboxStreamAsync(ShmGrpcStream stream, MailQueue queue
 {
     try
     {
+        await stream.SendResponseHeadersAsync();
+
         // Send initial state
-        await stream.SendResponseAsync(new MailboxMessage
+        await stream.SendMessageAsync(new MailboxMessage
         {
             New = queue.NewCount,
             Forwarded = queue.ForwardedCount,
             Reason = MailboxMessage.Types.Reason.Received
-        });
+        }.ToByteArray());
         
         // Subscribe to mail updates
         queue.OnMailReceived += async () =>
         {
             try
             {
-                await stream.SendResponseAsync(new MailboxMessage
+                await stream.SendMessageAsync(new MailboxMessage
                 {
                     New = queue.NewCount,
                     Forwarded = queue.ForwardedCount,
                     Reason = MailboxMessage.Types.Reason.Received
-                });
+                }.ToByteArray());
             }
             catch { }
         };
         
         // Handle forward requests from client
-        while (!ct.IsCancellationRequested)
+        await foreach (var msg in stream.ReceiveMessagesAsync(ct))
         {
-            var request = await stream.ReceiveRequestAsync<ForwardMailMessage>();
-            if (request == null) break;
+            if (msg == null) break;
             
+            var request = ForwardMailMessage.Parser.ParseFrom(msg);
             queue.ForwardMail();
             Console.WriteLine($"[{mailboxName}] Mail forwarded");
             
-            await stream.SendResponseAsync(new MailboxMessage
+            await stream.SendMessageAsync(new MailboxMessage
             {
                 New = queue.NewCount,
                 Forwarded = queue.ForwardedCount,
                 Reason = MailboxMessage.Types.Reason.Forwarded
-            });
+            }.ToByteArray());
         }
+
+        await stream.SendTrailersAsync(StatusCode.OK);
     }
     catch (Exception ex)
     {
