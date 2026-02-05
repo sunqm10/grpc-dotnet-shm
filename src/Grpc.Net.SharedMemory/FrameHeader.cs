@@ -114,4 +114,24 @@ public struct FrameHeader
     {
         return $"FrameHeader(Type={Type}, StreamId={StreamId}, Length={Length}, Flags=0x{Flags:X2})";
     }
+
+    /// <summary>
+    /// Parses a frame header from a byte array.
+    /// </summary>
+    public static FrameHeader Parse(byte[] data) => DecodeFrom(data);
+
+    /// <summary>
+    /// Parses a frame header from a span.
+    /// </summary>
+    public static FrameHeader Parse(ReadOnlySpan<byte> data) => DecodeFrom(data);
+
+    /// <summary>
+    /// Converts this frame header to a byte array.
+    /// </summary>
+    public readonly byte[] ToBytes()
+    {
+        var bytes = new byte[ShmConstants.FrameHeaderSize];
+        EncodeTo(bytes);
+        return bytes;
+    }
 }

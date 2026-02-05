@@ -159,7 +159,8 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Sends a message payload.
+    /// Sends a message payload with gRPC length-prefix header.
+    /// The data should be the raw protobuf message (without gRPC header).
     /// </summary>
     public async Task SendMessageAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
     {
@@ -169,15 +170,21 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
 
-        // Wait for send window
-        while (Interlocked.Read(ref _sendWindow) < data.Length)
+        // Build gRPC wire format: [compressed:1][length:4 BE][data]
+        var grpcMessage = new byte[5 + data.Length];
+        grpcMessage[0] = 0; // Not compressed
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(grpcMessage.AsSpan(1, 4), (uint)data.Length);
+        data.Span.CopyTo(grpcMessage.AsSpan(5));
+
+        // Wait for send window (account for full gRPC message size)
+        while (Interlocked.Read(ref _sendWindow) < grpcMessage.Length)
         {
             linkedCts.Token.ThrowIfCancellationRequested();
             await Task.Delay(1, linkedCts.Token); // Simple backpressure
         }
 
-        Interlocked.Add(ref _sendWindow, -data.Length);
-        await SendFrameAsync(FrameType.Message, 0, data.ToArray(), linkedCts.Token);
+        Interlocked.Add(ref _sendWindow, -grpcMessage.Length);
+        await SendFrameAsync(FrameType.Message, 0, grpcMessage, linkedCts.Token);
     }
 
     /// <summary>
@@ -310,7 +317,8 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// </summary>
     public async IAsyncEnumerable<byte[]> ReceiveMessagesAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        while (!_halfCloseReceived && !_cancelled)
+        // Read from the channel until it's completed or we get end-of-stream indicators
+        while (!_cancelled)
         {
             var frame = await ReceiveFrameAsync(cancellationToken);
             if (frame == null) break;
@@ -356,12 +364,13 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 break;
 
             case FrameType.HalfClose:
-                _halfCloseReceived = true;
+                // Queue the frame; the consumer will set _halfCloseReceived when reading
                 _inboundFrames.Writer.TryWrite((header.Type, payload));
+                _inboundFrames.Writer.TryComplete();
                 break;
 
             case FrameType.Trailers:
-                _halfCloseReceived = true;
+                // Queue the frame; the consumer will decode and set _trailers when reading
                 _inboundFrames.Writer.TryWrite((header.Type, payload));
                 _inboundFrames.Writer.TryComplete();
                 break;

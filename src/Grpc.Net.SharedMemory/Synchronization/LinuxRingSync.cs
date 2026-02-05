@@ -224,6 +224,15 @@ internal sealed partial class LinuxRingSync : IRingSync
         // Futex doesn't need explicit cleanup - the memory is managed by the Segment
     }
 
+    /// <summary>
+    /// Wake up to one waiter on the futex at the specified address.
+    /// Used for signaling client ready state during handshake.
+    /// </summary>
+    public static unsafe void WakeOne(byte* addr)
+    {
+        futex((uint*)addr, FUTEX_WAKE, 1, null, null, 0);
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     private struct Timespec
     {
@@ -231,16 +240,19 @@ internal sealed partial class LinuxRingSync : IRingSync
         public long tv_nsec;
     }
 
-    // P/Invoke for futex syscall
-    // Uses FUTEX_WAIT (0) and FUTEX_WAKE (1) without PRIVATE flag for cross-process support
+    // SYS_futex syscall number for x86-64 Linux
+    private const int SYS_futex = 202;
+
+    // P/Invoke for syscall wrapper to invoke futex
+    // futex is not directly exported by glibc, so we use syscall()
     [LibraryImport("libc", SetLastError = true)]
-    private static unsafe partial int futex(
-        uint* uaddr,
-        int futex_op,
-        uint val,
-        Timespec* timeout,
-        uint* uaddr2,
-        uint val3);
+    private static unsafe partial long syscall(long number, uint* uaddr, int futex_op, uint val, Timespec* timeout, uint* uaddr2, uint val3);
+
+    private static unsafe int futex(uint* uaddr, int futex_op, uint val, Timespec* timeout, uint* uaddr2, uint val3)
+    {
+        var result = syscall(SYS_futex, uaddr, futex_op, val, timeout, uaddr2, val3);
+        return (int)result;
+    }
 }
 
 #endif

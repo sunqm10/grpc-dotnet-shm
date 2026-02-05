@@ -561,6 +561,16 @@ public sealed class ShmRing : IDisposable
         _sync?.Dispose();
     }
 
+    /// <summary>
+    /// Disposes sync resources without closing the ring.
+    /// Use for control segments where we don't want to affect server state.
+    /// </summary>
+    public void DisposeWithoutClose()
+    {
+        _localClosed = true;  // Mark as closed locally to prevent further operations
+        _sync?.Dispose();
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private ref RingHeader GetHeader()
     {
@@ -683,5 +693,195 @@ public sealed class ShmRing : IDisposable
     private static bool IsPowerOfTwo(ulong value)
     {
         return value > 0 && (value & (value - 1)) == 0;
+    }
+
+    /// <summary>
+    /// Gets the number of bytes available to read.
+    /// </summary>
+    public ulong ReadableBytes
+    {
+        get
+        {
+            ref var header = ref GetHeader();
+            var writeIdx = Volatile.Read(ref header.WriteIdx);
+            var readIdx = Volatile.Read(ref header.ReadIdx);
+            return writeIdx - readIdx;
+        }
+    }
+
+    /// <summary>
+    /// Gets the number of bytes available to write.
+    /// </summary>
+    public ulong WritableBytes
+    {
+        get
+        {
+            ref var header = ref GetHeader();
+            var writeIdx = Volatile.Read(ref header.WriteIdx);
+            var readIdx = Volatile.Read(ref header.ReadIdx);
+            var used = writeIdx - readIdx;
+            return _capacity - used;
+        }
+    }
+
+    /// <summary>
+    /// Checks if at least the specified number of bytes can be read.
+    /// </summary>
+    public bool TryPeek(int minBytes, out int available)
+    {
+        if (_localClosed)
+        {
+            available = 0;
+            return false;
+        }
+
+        ref var header = ref GetHeader();
+        var writeIdx = Volatile.Read(ref header.WriteIdx);
+        var readIdx = Volatile.Read(ref header.ReadIdx);
+        var used = (int)(writeIdx - readIdx);
+        available = used;
+        return used >= minBytes;
+    }
+
+    /// <summary>
+    /// Checks if at least the specified number of bytes can be written.
+    /// </summary>
+    public bool CanWrite(int size)
+    {
+        if (_localClosed)
+        {
+            return false;
+        }
+
+        ref var header = ref GetHeader();
+        var writeIdx = Volatile.Read(ref header.WriteIdx);
+        var readIdx = Volatile.Read(ref header.ReadIdx);
+        var used = writeIdx - readIdx;
+        var available = _capacity - used;
+        return (ulong)size <= available;
+    }
+
+    /// <summary>
+    /// Tries to read data without blocking.
+    /// </summary>
+    /// <param name="buffer">The buffer to read into.</param>
+    /// <returns>True if data was read, false if no data available.</returns>
+    public bool TryRead(Span<byte> buffer)
+    {
+        if (buffer.IsEmpty || _localClosed)
+        {
+            return false;
+        }
+
+        ref var header = ref GetHeader();
+        var writeIdx = Volatile.Read(ref header.WriteIdx);
+        var readIdx = Volatile.Read(ref header.ReadIdx);
+        var used = writeIdx - readIdx;
+
+        if (used < (ulong)buffer.Length)
+        {
+            return false; // Not enough data
+        }
+
+        // Data available - perform the read
+        var readPos = readIdx & _capMask;
+        var dataSpan = GetDataSpan();
+
+        if (readPos + (ulong)buffer.Length <= _capacity)
+        {
+            // Simple case: no wrap
+            dataSpan.Slice((int)readPos, buffer.Length).CopyTo(buffer);
+        }
+        else
+        {
+            // Wrap case: split the read
+            var firstChunk = (int)(_capacity - readPos);
+            dataSpan.Slice((int)readPos, firstChunk).CopyTo(buffer);
+            var secondChunk = buffer.Length - firstChunk;
+            dataSpan[..secondChunk].CopyTo(buffer[firstChunk..]);
+        }
+
+        // Publish new read index (release semantics)
+        Volatile.Write(ref header.ReadIdx, readIdx + (ulong)buffer.Length);
+
+        // Signal space availability
+        if (buffer.Length > 0)
+        {
+            Interlocked.Increment(ref header.ContigSeq);
+            if (Volatile.Read(ref header.SpaceWaiters) > 0)
+            {
+                Interlocked.Increment(ref header.SpaceSeq);
+                _sync?.SignalSpace();
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Tries to write data without blocking.
+    /// </summary>
+    /// <param name="data">The data to write.</param>
+    /// <returns>True if data was written, false if not enough space.</returns>
+    public bool TryWrite(ReadOnlySpan<byte> data)
+    {
+        if (data.IsEmpty)
+        {
+            return true;
+        }
+
+        if (_localClosed || (ulong)data.Length > _capacity)
+        {
+            return false;
+        }
+
+        ref var header = ref GetHeader();
+
+        if (header.Closed != 0)
+        {
+            return false;
+        }
+
+        var writeIdx = Volatile.Read(ref header.WriteIdx);
+        var readIdx = Volatile.Read(ref header.ReadIdx);
+        var used = writeIdx - readIdx;
+        var available = _capacity - used;
+
+        if ((ulong)data.Length > available)
+        {
+            return false; // Not enough space
+        }
+
+        // Space available - perform the write
+        var writePos = writeIdx & _capMask;
+        var dataSpan = GetDataSpan();
+
+        if (writePos + (ulong)data.Length <= _capacity)
+        {
+            // Simple case: no wrap
+            data.CopyTo(dataSpan.Slice((int)writePos, data.Length));
+        }
+        else
+        {
+            // Wrap case: split the write
+            var firstChunk = (int)(_capacity - writePos);
+            data[..firstChunk].CopyTo(dataSpan.Slice((int)writePos, firstChunk));
+            data[firstChunk..].CopyTo(dataSpan[..(data.Length - firstChunk)]);
+        }
+
+        // Publish new write index (release semantics)
+        Volatile.Write(ref header.WriteIdx, writeIdx + (ulong)data.Length);
+
+        // Signal waiters
+        if (data.Length > 0)
+        {
+            Interlocked.Increment(ref header.DataSeq);
+            if (Volatile.Read(ref header.DataWaiters) > 0)
+            {
+                _sync?.SignalData();
+            }
+        }
+
+        return true;
     }
 }

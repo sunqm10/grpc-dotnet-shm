@@ -52,7 +52,19 @@ public enum FrameType : byte
     HalfClose = 0x08,
 
     /// <summary>Flow control window update frame.</summary>
-    WindowUpdate = 0x09
+    WindowUpdate = 0x09,
+
+    // Control-plane frame types (used only on the control segment)
+    // These match grpc-go-shmem for interoperability
+
+    /// <summary>Connection request frame (control segment only).</summary>
+    Connect = 0x10,
+
+    /// <summary>Connection accepted frame (control segment only).</summary>
+    Accept = 0x11,
+
+    /// <summary>Connection rejected frame (control segment only).</summary>
+    Reject = 0x12
 }
 
 /// <summary>
@@ -152,4 +164,13 @@ public static class ShmConstants
 
     /// <summary>Maximum spin iterations to prevent excessive CPU use.</summary>
     public const int SpinIterationsMax = 2000;
+
+    /// <summary>Suffix for control segment names.</summary>
+    public const string ControlSegmentSuffix = "_ctl";
+
+    /// <summary>Control wire protocol version.</summary>
+    public const byte ControlWireVersion = 1;
+
+    /// <summary>Minimum ring capacity for control segments (4KB).</summary>
+    public const ulong MinRingCapacity = 4096;
 }

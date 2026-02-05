@@ -148,6 +148,12 @@ public sealed class Segment : IDisposable
     /// <summary>Gets the MappedMemoryManager for direct memory access (advanced usage).</summary>
     public MappedMemoryManager MemoryManager => _memoryManager;
 
+    /// <summary>Gets the raw memory span for the entire segment.</summary>
+    public Memory<byte> Memory => _memory;
+
+    /// <summary>Gets whether this is the server side of the segment.</summary>
+    public bool IsServer => _isServer;
+
     private Segment(
         string name,
         string filePath,
@@ -198,7 +204,8 @@ public sealed class Segment : IDisposable
 
     /// <summary>
     /// Creates a new shared memory segment (server-side).
-    /// Uses file-backed shared memory at %TEMP%\grpc_shm_{name} for grpc-go-shmem compatibility.
+    /// Uses file-backed shared memory at /dev/shm/grpc_shm_{name} on Linux (preferred)
+    /// or %TEMP%\grpc_shm_{name} as fallback, for grpc-go-shmem compatibility.
     /// </summary>
     /// <param name="name">The segment name for identification.</param>
     /// <param name="ringCapacity">The capacity for each ring buffer (must be power of 2).</param>
@@ -289,7 +296,8 @@ public sealed class Segment : IDisposable
 
     /// <summary>
     /// Opens an existing shared memory segment (client-side).
-    /// Opens file-backed shared memory at %TEMP%\grpc_shm_{name} for grpc-go-shmem compatibility.
+    /// Opens file-backed shared memory at /dev/shm/grpc_shm_{name} on Linux (preferred)
+    /// or %TEMP%\grpc_shm_{name} as fallback, for grpc-go-shmem compatibility.
     /// </summary>
     /// <param name="name">The segment name.</param>
     /// <returns>The opened segment.</returns>
@@ -300,13 +308,9 @@ public sealed class Segment : IDisposable
             throw new ArgumentException("Segment name cannot be null or empty", nameof(name));
         }
 
-        // Use file-backed shared memory like grpc-go-shmem: %TEMP%\grpc_shm_{name}
-        var filePath = GenerateSegmentPath(name);
-
-        if (!File.Exists(filePath))
-        {
-            throw new FileNotFoundException($"Segment '{name}' not found at {filePath}", filePath);
-        }
+        // Try to find the segment in either location (like grpc-go-shmem does)
+        var filePath = FindExistingSegmentPath(name)
+            ?? throw new FileNotFoundException($"Segment '{name}' not found at /dev/shm/grpc_shm_{name} or /tmp/grpc_shm_{name}");
 
         // Open the backing file
         var backingFile = new FileStream(filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
@@ -363,11 +367,49 @@ public sealed class Segment : IDisposable
 
     /// <summary>
     /// Generates the path to the shared memory backing file.
-    /// Uses %TEMP%\grpc_shm_{name} to match grpc-go-shmem convention.
+    /// Uses /dev/shm/grpc_shm_{name} on Linux (preferred) or %TEMP%\grpc_shm_{name} as fallback.
+    /// This matches the grpc-go-shmem convention for cross-language interoperability.
     /// </summary>
     private static string GenerateSegmentPath(string name)
     {
+        // On Linux, prefer /dev/shm for true shared memory (matches grpc-go-shmem)
+        if (OperatingSystem.IsLinux())
+        {
+            const string devShm = "/dev/shm";
+            if (Directory.Exists(devShm))
+            {
+                return Path.Combine(devShm, $"grpc_shm_{name}");
+            }
+        }
+        
+        // Fallback to temp directory (Windows or Linux without /dev/shm)
         return Path.Combine(Path.GetTempPath(), $"grpc_shm_{name}");
+    }
+
+    /// <summary>
+    /// Finds an existing segment by checking both /dev/shm and /tmp.
+    /// This matches grpc-go-shmem's behavior of trying both locations.
+    /// </summary>
+    private static string? FindExistingSegmentPath(string name)
+    {
+        if (OperatingSystem.IsLinux())
+        {
+            // Try /dev/shm first (preferred)
+            var devShmPath = Path.Combine("/dev/shm", $"grpc_shm_{name}");
+            if (File.Exists(devShmPath))
+            {
+                return devShmPath;
+            }
+        }
+
+        // Try temp directory
+        var tempPath = Path.Combine(Path.GetTempPath(), $"grpc_shm_{name}");
+        if (File.Exists(tempPath))
+        {
+            return tempPath;
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -448,6 +490,152 @@ public sealed class Segment : IDisposable
         span.Clear(); // Zero all fields
         // Write capacity at offset 0 (grpc-go-shmem layout: capacity is first field)
         BinaryPrimitives.WriteUInt64LittleEndian(span[0..8], capacity);
+    }
+
+    /// <summary>
+    /// Sets the ServerReady flag and signals waiting clients.
+    /// </summary>
+    public void SetServerReady(bool ready)
+    {
+        var span = _memory.Span;
+        var value = ready ? 1u : 0u;
+        BinaryPrimitives.WriteUInt32LittleEndian(span[0x40..0x44], value);
+        Flush();
+    }
+
+    /// <summary>
+    /// Sets the ClientReady flag and signals waiting servers.
+    /// </summary>
+    public unsafe void SetClientReady(bool ready)
+    {
+        var span = _memory.Span;
+        var value = ready ? 1u : 0u;
+        BinaryPrimitives.WriteUInt32LittleEndian(span[0x44..0x48], value);
+        Flush();
+        
+        // Wake any server waiting on the client ready flag using futex
+        // The Go server uses futexWait on this address, expecting a wake signal
+#if NET8_0_OR_GREATER
+        if (OperatingSystem.IsLinux())
+        {
+            fixed (byte* ptr = span)
+            {
+                Synchronization.LinuxRingSync.WakeOne(ptr + 0x44);
+            }
+        }
+#endif
+    }
+
+    /// <summary>
+    /// Checks if the server is ready.
+    /// </summary>
+    public bool IsServerReady()
+    {
+        var span = _memory.Span;
+        return BinaryPrimitives.ReadUInt32LittleEndian(span[0x40..0x44]) != 0;
+    }
+
+    /// <summary>
+    /// Checks if the client is ready.
+    /// </summary>
+    public bool IsClientReady()
+    {
+        var span = _memory.Span;
+        return BinaryPrimitives.ReadUInt32LittleEndian(span[0x44..0x48]) != 0;
+    }
+
+    /// <summary>
+    /// Waits for the server to be ready.
+    /// </summary>
+    public async Task WaitForServerAsync(CancellationToken cancellationToken = default)
+    {
+        while (!IsServerReady())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await Task.Delay(1, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Waits for the client to be ready.
+    /// </summary>
+    public async Task WaitForClientAsync(CancellationToken cancellationToken = default)
+    {
+        while (!IsClientReady())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await Task.Delay(1, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Tries to delete a segment file if it exists.
+    /// </summary>
+    public static bool TryRemoveSegment(string name)
+    {
+        var filePath = GenerateSegmentPath(name);
+        try
+        {
+            if (File.Exists(filePath))
+            {
+                File.Delete(filePath);
+                return true;
+            }
+        }
+        catch
+        {
+            // Ignore errors
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Checks if a segment exists (checks both /dev/shm and /tmp on Linux).
+    /// </summary>
+    public static bool Exists(string name)
+    {
+        return FindExistingSegmentPath(name) != null;
+    }
+
+    /// <summary>
+    /// Creates a control segment with minimal ring sizes for connection establishment.
+    /// </summary>
+    public static Segment CreateControlSegment(string baseName)
+    {
+        var ctlName = baseName + ShmConstants.ControlSegmentSuffix;
+        
+        // Clean up any stale segment from previous run
+        TryRemoveSegment(ctlName);
+        
+        return Create(ctlName, ShmConstants.MinRingCapacity, 0);
+    }
+
+    /// <summary>
+    /// Opens a control segment for client-side connection.
+    /// </summary>
+    public static Segment OpenControlSegment(string baseName)
+    {
+        var ctlName = baseName + ShmConstants.ControlSegmentSuffix;
+        return Open(ctlName);
+    }
+
+    /// <summary>
+    /// Unmaps the segment without closing/modifying the ring buffers.
+    /// Use this for control segments where we don't want to affect the server's state.
+    /// </summary>
+    public void UnmapWithoutClose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        // Don't dispose rings - that would close them and affect the server
+        // Just dispose sync primitives without closing
+        RingA.DisposeWithoutClose();
+        RingB.DisposeWithoutClose();
+        
+        _memoryManager.Dispose();
+        _accessor.Dispose();
+        _mappedFile.Dispose();
     }
 
     public void Dispose()

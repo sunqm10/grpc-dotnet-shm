@@ -133,6 +133,22 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         return new ShmConnection(name, segment, isClient: false, keepaliveOptions, enforcementPolicy);
     }
 
+    /// <summary>
+    /// Creates a server-side connection from an existing segment (used by ShmControlListener).
+    /// </summary>
+    internal ShmConnection(string name, Segment segment)
+        : this(name, segment, isClient: false)
+    {
+    }
+
+    /// <summary>
+    /// Creates a client-side connection from an existing segment (used by ShmControlDialer).
+    /// </summary>
+    internal static ShmConnection FromClientSegment(string name, Segment segment, ShmKeepaliveOptions? keepaliveOptions = null)
+    {
+        return new ShmConnection(name, segment, isClient: true, keepaliveOptions);
+    }
+
     private ShmConnection(
         string name, 
         Segment segment, 
@@ -147,7 +163,17 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         _enforcementPolicy = enforcementPolicy;
         _streams = new ConcurrentDictionary<uint, ShmGrpcStream>();
         _disposeCts = new CancellationTokenSource();
-        _maxConcurrentStreams = segment.Header.MaxStreams > 0 ? segment.Header.MaxStreams : 100;
+        
+        // Handle MaxStreams: 0 or max uint means unlimited - use reasonable default
+        var headerMaxStreams = segment.Header.MaxStreams;
+        if (headerMaxStreams == 0 || headerMaxStreams == uint.MaxValue)
+        {
+            _maxConcurrentStreams = 100;
+        }
+        else
+        {
+            _maxConcurrentStreams = headerMaxStreams;
+        }
 
         // Initialize connection-level flow control (matches grpc-go-shmem)
         _connSendQuota = ShmConstants.InitialWindowSize;
@@ -158,7 +184,9 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         _bdpEstimator = new ShmBdpEstimator((uint)ShmConstants.InitialWindowSize, UpdateFlowControlWindows);
 
         // Create channel for incoming streams (server-side)
-        _incomingStreamsChannel = Channel.CreateBounded<ShmGrpcStream>(new BoundedChannelOptions((int)_maxConcurrentStreams)
+        // Limit to a reasonable max for the bounded channel
+        var channelCapacity = Math.Min((int)_maxConcurrentStreams, 10000);
+        _incomingStreamsChannel = Channel.CreateBounded<ShmGrpcStream>(new BoundedChannelOptions(channelCapacity)
         {
             FullMode = BoundedChannelFullMode.Wait,
             SingleReader = false,

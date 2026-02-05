@@ -12,6 +12,13 @@
     <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
   </PropertyGroup>
 
+  <!-- Exclude GoInterop subprojects - they are standalone projects -->
+  <ItemGroup>
+    <Compile Remove="GoInterop\**" />
+    <Content Remove="GoInterop\**" />
+    <None Remove="GoInterop\**" />
+  </ItemGroup>
+
   <ItemGroup>
     <PackageReference Include="NUnit" Version="4.0.1" />
     <PackageReference Include="NUnit3TestAdapter" Version="4.5.0" />

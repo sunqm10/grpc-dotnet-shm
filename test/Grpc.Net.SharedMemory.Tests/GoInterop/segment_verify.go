@@ -1,4 +1,5 @@
-//go:build windows
+//go:build linux || windows
+// +build linux windows
 
 /*
  * Segment verification tool for grpc-go-shmem / .NET interoperability testing.
@@ -14,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 const (
@@ -95,6 +97,18 @@ func main() {
 }
 
 func generateSegmentPath(name string) string {
+	// On Linux, prefer /dev/shm for true shared memory (matches .NET and grpc-go-shmem)
+	if runtime.GOOS == "linux" {
+		devShmPath := filepath.Join("/dev/shm", "grpc_shm_"+name)
+		if _, err := os.Stat(devShmPath); err == nil {
+			return devShmPath
+		}
+		// For creating new segments, always use /dev/shm on Linux
+		if _, err := os.Stat("/dev/shm"); err == nil {
+			return devShmPath
+		}
+	}
+	// Fallback to temp directory (Windows or Linux without /dev/shm)
 	return filepath.Join(os.TempDir(), "grpc_shm_"+name)
 }
 
