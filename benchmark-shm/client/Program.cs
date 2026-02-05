@@ -261,6 +261,7 @@ public class BenchmarkRunner
         long totalOps = 0;
         var tasks = new Task[concurrency];
         var request = CreateRequest(payload);
+        var errorCount = 0;
 
         for (int i = 0; i < concurrency; i++)
         {
@@ -276,7 +277,11 @@ public class BenchmarkRunner
                         _latencies.Add(sw.ElapsedTicks);
                         Interlocked.Increment(ref totalOps);
                     }
-                    catch (RpcException) { }
+                    catch (RpcException ex) 
+                    { 
+                        if (Interlocked.Increment(ref errorCount) <= 3)
+                            Console.Error.WriteLine($"  RPC Error: {ex.StatusCode} - {ex.Status.Detail}");
+                    }
                     catch (OperationCanceledException) { break; }
                 }
             });
