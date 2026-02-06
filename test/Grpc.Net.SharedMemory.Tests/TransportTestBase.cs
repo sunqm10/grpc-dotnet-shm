@@ -48,10 +48,10 @@ public abstract class TransportTestBase
         ShmCompressionOptions? compressionOptions = null)
     {
         var segmentName = $"test_{Guid.NewGuid():N}";
-        var server = ShmConnection.CreateAsServer(segmentName, ringCapacity, maxStreams);
+        var server = ShmConnection.CreateAsServer(segmentName, ringCapacity, maxStreams, compressionOptions: compressionOptions);
         _disposables.Add(server);
 
-        var client = ShmConnection.ConnectAsClient(segmentName);
+        var client = ShmConnection.ConnectAsClient(segmentName, compressionOptions: compressionOptions);
         _disposables.Add(client);
 
         return (server, client);

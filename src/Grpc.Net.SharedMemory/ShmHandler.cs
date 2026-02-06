@@ -216,10 +216,11 @@ public sealed class ShmHandler : HttpMessageHandler
             var compressed = headerBuffer[0] != 0;
             var length = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(headerBuffer.AsSpan(1));
 
-            if (compressed)
-            {
-                throw new NotSupportedException("Compression not yet supported");
-            }
+            // Note: 'compressed' flag here is from the upstream gRPC channel's HTTP-level compression.
+            // SHM transport handles its own compression in ShmGrpcStream.SendMessageAsync.
+            // For now, pass data through as-is; if the upstream already compressed it and
+            // the SHM stream also compresses, the data will be double-compressed which is
+            // suboptimal but not incorrect. Typically SHM compression replaces HTTP-level compression.
 
             // Read message body into a pooled buffer to avoid per-message heap allocation
             var messageBuffer = ArrayPool<byte>.Shared.Rent((int)length);

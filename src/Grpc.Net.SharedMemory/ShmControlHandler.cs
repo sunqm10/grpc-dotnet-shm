@@ -331,10 +331,8 @@ public sealed class ShmControlHandler : HttpMessageHandler
             var compressed = headerBuffer[0] != 0;
             var length = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(headerBuffer.AsSpan(1));
 
-            if (compressed)
-            {
-                throw new NotSupportedException("Compression not yet supported");
-            }
+            // Note: 'compressed' flag here is from the upstream gRPC channel's HTTP-level compression.
+            // SHM transport handles its own compression in ShmGrpcStream.SendMessageAsync.
 
             // Read message body into a pooled buffer to avoid per-message heap allocation
             var messageBuffer = ArrayPool<byte>.Shared.Rent((int)length);

@@ -19,6 +19,7 @@
 using System.Buffers;
 using System.Threading.Channels;
 using Grpc.Core;
+using Grpc.Net.SharedMemory.Compression;
 
 namespace Grpc.Net.SharedMemory;
 
@@ -32,6 +33,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     private readonly Channel<(FrameType Type, byte[] Payload, int PayloadLength)> _inboundFrames;
     private readonly CancellationTokenSource _disposeCts;
     private readonly SemaphoreSlim _sendLock;
+    private readonly ShmCompressionOptions? _compressionOptions;
 
     private HeadersV1? _requestHeaders;
     private HeadersV1? _responseHeaders;
@@ -87,11 +89,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// </summary>
     public bool IsServerStream { get; }
 
-    internal ShmGrpcStream(uint streamId, ShmConnection connection, bool isServerStream = false)
+    internal ShmGrpcStream(uint streamId, ShmConnection connection, bool isServerStream = false, ShmCompressionOptions? compressionOptions = null)
     {
         StreamId = streamId;
         _connection = connection;
         IsServerStream = isServerStream;
+        _compressionOptions = compressionOptions;
         _inboundFrames = Channel.CreateUnbounded<(FrameType, byte[], int)>(new UnboundedChannelOptions
         {
             SingleReader = true,
@@ -171,8 +174,24 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
 
+        // Apply compression if configured
+        byte compressedFlag = 0;
+        ReadOnlyMemory<byte> wireData = data;
+        byte[]? compressedBuffer = null;
+
+        if (_compressionOptions != null && _compressionOptions.ShouldCompress(data.Length))
+        {
+            var compressor = _compressionOptions.GetSendCompressor();
+            if (compressor != null && !compressor.IsIdentity)
+            {
+                compressedBuffer = compressor.Compress(data.Span);
+                wireData = compressedBuffer;
+                compressedFlag = 1;
+            }
+        }
+
         // gRPC wire format total: [compressed:1][length:4 BE][data]
-        var totalGrpcSize = 5 + data.Length;
+        var totalGrpcSize = 5 + wireData.Length;
 
         // Wait for send window (account for full gRPC message size)
         while (Interlocked.Read(ref _sendWindow) < totalGrpcSize)
@@ -186,10 +205,10 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         // Build 5-byte gRPC length-prefix header separately and use scatter write
         // to avoid copying data into an intermediate buffer
         var grpcPrefix = new byte[5];
-        grpcPrefix[0] = 0; // Not compressed
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(grpcPrefix.AsSpan(1, 4), (uint)data.Length);
+        grpcPrefix[0] = compressedFlag;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(grpcPrefix.AsSpan(1, 4), (uint)wireData.Length);
 
-        await SendFrameScatterAsync(FrameType.Message, 0, grpcPrefix, data, linkedCts.Token);
+        await SendFrameScatterAsync(FrameType.Message, 0, grpcPrefix, wireData, linkedCts.Token);
     }
 
     /// <summary>
@@ -413,12 +432,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                         }
 
                         var compressed = framePayload[0] != 0;
-                        if (compressed)
-                        {
-                            ReturnPooledBuffer(framePayload, framePayloadLength);
-                            throw new NotSupportedException("Compression not yet supported");
-                        }
-
                         var messageLength = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(framePayload.AsSpan(1, 4));
                         if (framePayloadLength != 5 + messageLength)
                         {
@@ -426,11 +439,39 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                             throw new InvalidDataException($"MESSAGE payload length mismatch: got {framePayloadLength} bytes, expected {5 + messageLength}");
                         }
 
-                        // Yield the protobuf data as a slice of the pooled buffer.
-                        // Defer returning the buffer until the next iteration when the caller is done.
-                        previousPooledBuffer = framePayload;
-                        previousPooledLength = framePayloadLength;
-                        yield return framePayload.AsMemory(5, (int)messageLength);
+                        if (compressed)
+                        {
+                            // Decompress the message data
+                            if (_compressionOptions == null)
+                            {
+                                ReturnPooledBuffer(framePayload, framePayloadLength);
+                                throw new InvalidOperationException("Received compressed message but no compression options configured");
+                            }
+
+                            var decompressor = _compressionOptions.GetSendCompressor();
+                            if (decompressor.IsIdentity)
+                            {
+                                ReturnPooledBuffer(framePayload, framePayloadLength);
+                                throw new InvalidOperationException("Received compressed message but no real compressor configured (only identity)");
+                            }
+
+                            var decompressedData = decompressor.Decompress(framePayload.AsSpan(5, (int)messageLength));
+                            ReturnPooledBuffer(framePayload, framePayloadLength);
+
+                            // Yield decompressed data - use the decompressed array directly
+                            // (no pooling needed since Decompress allocates a new array)
+                            previousPooledBuffer = null;
+                            previousPooledLength = 0;
+                            yield return decompressedData;
+                        }
+                        else
+                        {
+                            // Yield the protobuf data as a slice of the pooled buffer.
+                            // Defer returning the buffer until the next iteration when the caller is done.
+                            previousPooledBuffer = framePayload;
+                            previousPooledLength = framePayloadLength;
+                            yield return framePayload.AsMemory(5, (int)messageLength);
+                        }
                         break;
 
                     case FrameType.HalfClose:

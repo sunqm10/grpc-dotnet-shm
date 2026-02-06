@@ -19,6 +19,7 @@
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Threading.Channels;
+using Grpc.Net.SharedMemory.Compression;
 
 namespace Grpc.Net.SharedMemory;
 
@@ -55,6 +56,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     // Keepalive (A73 RFC)
     private readonly ShmKeepaliveOptions _keepaliveOptions;
     private readonly ShmKeepaliveEnforcementPolicy? _enforcementPolicy;
+    private readonly ShmCompressionOptions? _compressionOptions;
     private Task? _keepaliveTask;
     private DateTime _lastPingAt;
     private DateTime _lastPingSentAt;
@@ -107,10 +109,10 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// <param name="name">The name of the shared memory segment to connect to.</param>
     /// <param name="keepaliveOptions">Optional keepalive options.</param>
     /// <returns>A new client connection.</returns>
-    public static ShmConnection ConnectAsClient(string name, ShmKeepaliveOptions? keepaliveOptions = null)
+    public static ShmConnection ConnectAsClient(string name, ShmKeepaliveOptions? keepaliveOptions = null, ShmCompressionOptions? compressionOptions = null)
     {
         var segment = Segment.Open(name);
-        return new ShmConnection(name, segment, isClient: true, keepaliveOptions);
+        return new ShmConnection(name, segment, isClient: true, keepaliveOptions, compressionOptions: compressionOptions);
     }
 
     /// <summary>
@@ -127,26 +129,27 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         ulong ringCapacity = 64 * 1024 * 1024, 
         uint maxStreams = 100,
         ShmKeepaliveOptions? keepaliveOptions = null,
-        ShmKeepaliveEnforcementPolicy? enforcementPolicy = null)
+        ShmKeepaliveEnforcementPolicy? enforcementPolicy = null,
+        ShmCompressionOptions? compressionOptions = null)
     {
         var segment = Segment.Create(name, ringCapacity, maxStreams);
-        return new ShmConnection(name, segment, isClient: false, keepaliveOptions, enforcementPolicy);
+        return new ShmConnection(name, segment, isClient: false, keepaliveOptions, enforcementPolicy, compressionOptions);
     }
 
     /// <summary>
     /// Creates a server-side connection from an existing segment (used by ShmControlListener).
     /// </summary>
-    internal ShmConnection(string name, Segment segment)
-        : this(name, segment, isClient: false)
+    internal ShmConnection(string name, Segment segment, ShmCompressionOptions? compressionOptions = null)
+        : this(name, segment, isClient: false, compressionOptions: compressionOptions)
     {
     }
 
     /// <summary>
     /// Creates a client-side connection from an existing segment (used by ShmControlDialer).
     /// </summary>
-    internal static ShmConnection FromClientSegment(string name, Segment segment, ShmKeepaliveOptions? keepaliveOptions = null)
+    internal static ShmConnection FromClientSegment(string name, Segment segment, ShmKeepaliveOptions? keepaliveOptions = null, ShmCompressionOptions? compressionOptions = null)
     {
-        return new ShmConnection(name, segment, isClient: true, keepaliveOptions);
+        return new ShmConnection(name, segment, isClient: true, keepaliveOptions, compressionOptions: compressionOptions);
     }
 
     private ShmConnection(
@@ -154,13 +157,15 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         Segment segment, 
         bool isClient, 
         ShmKeepaliveOptions? keepaliveOptions = null,
-        ShmKeepaliveEnforcementPolicy? enforcementPolicy = null)
+        ShmKeepaliveEnforcementPolicy? enforcementPolicy = null,
+        ShmCompressionOptions? compressionOptions = null)
     {
         Name = name;
         _segment = segment;
         _isClient = isClient;
         _keepaliveOptions = keepaliveOptions ?? ShmKeepaliveOptions.Default;
         _enforcementPolicy = enforcementPolicy;
+        _compressionOptions = compressionOptions;
         _streams = new ConcurrentDictionary<uint, ShmGrpcStream>();
         _disposeCts = new CancellationTokenSource();
         
@@ -216,7 +221,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         ThrowIfGoAway();
 
         var streamId = Interlocked.Add(ref _nextStreamId, 2) - 2; // Increment by 2, return previous value
-        var stream = new ShmGrpcStream(streamId, this, isServerStream: false);
+        var stream = new ShmGrpcStream(streamId, this, isServerStream: false, compressionOptions: _compressionOptions);
 
         if (!_streams.TryAdd(streamId, stream))
         {
@@ -502,7 +507,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             }
 
             // Create new server stream
-            var newStream = new ShmGrpcStream(streamId, this, isServerStream: true);
+            var newStream = new ShmGrpcStream(streamId, this, isServerStream: true, compressionOptions: _compressionOptions);
             newStream.SetRequestHeaders(headersV1);
 
             if (!_streams.TryAdd(streamId, newStream))
