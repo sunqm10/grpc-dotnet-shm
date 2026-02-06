@@ -19,7 +19,7 @@
 using System.Text;
 using Grpc.Core;
 using Grpc.Net.SharedMemory;
-using Helloworld;
+using Greet;
 using Google.Protobuf;
 
 Console.WriteLine("==========================================");
@@ -66,8 +66,8 @@ try
                 {
                     try
                     {
-                        // Headers are already set when stream is accepted
-                        var headers = stream.RequestHeaders;
+                        // Wait for request headers
+                        var headers = await stream.ReceiveRequestHeadersAsync(cts.Token);
 
                         if (headers != null)
                         {

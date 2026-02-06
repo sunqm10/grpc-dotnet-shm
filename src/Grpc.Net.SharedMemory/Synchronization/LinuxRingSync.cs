@@ -224,15 +224,6 @@ internal sealed partial class LinuxRingSync : IRingSync
         // Futex doesn't need explicit cleanup - the memory is managed by the Segment
     }
 
-    /// <summary>
-    /// Wake up to one waiter on the futex at the specified address.
-    /// Used for signaling client ready state during handshake.
-    /// </summary>
-    public static unsafe void WakeOne(byte* addr)
-    {
-        futex((uint*)addr, FUTEX_WAKE, 1, null, null, 0);
-    }
-
     [StructLayout(LayoutKind.Sequential)]
     private struct Timespec
     {

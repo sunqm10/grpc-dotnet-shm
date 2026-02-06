@@ -34,12 +34,30 @@ public static class FrameProtocol
     /// <param name="cancellationToken">Cancellation token.</param>
     public static void WriteFrame(ShmRing ring, FrameHeader header, ReadOnlySpan<byte> payload, CancellationToken cancellationToken = default)
     {
-        // Ensure header length matches payload
-        header.Length = (uint)payload.Length;
+        // Delegate to the scatter-write overload with an empty second payload
+        WriteFrame(ring, header, payload, ReadOnlySpan<byte>.Empty, cancellationToken);
+    }
+
+
+
+    /// <summary>
+    /// Writes a frame with a two-part payload (scatter write) to the ring buffer atomically.
+    /// This avoids an intermediate copy when the payload is logically split (e.g., gRPC prefix + data).
+    /// The frame header's Length is set to payload1.Length + payload2.Length.
+    /// </summary>
+    /// <param name="ring">The ring buffer to write to.</param>
+    /// <param name="header">The frame header.</param>
+    /// <param name="payload1">The first part of the frame payload (e.g., gRPC length-prefix header).</param>
+    /// <param name="payload2">The second part of the frame payload (e.g., protobuf message data).</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public static void WriteFrame(ShmRing ring, FrameHeader header, ReadOnlySpan<byte> payload1, ReadOnlySpan<byte> payload2, CancellationToken cancellationToken = default)
+    {
+        var totalPayloadSize = payload1.Length + payload2.Length;
+        header.Length = (uint)totalPayloadSize;
         header.Reserved = 0;
         header.Reserved2 = 0;
 
-        var totalSize = ShmConstants.FrameHeaderSize + payload.Length;
+        var totalSize = ShmConstants.FrameHeaderSize + totalPayloadSize;
 
         // Reserve space for the entire frame atomically
         var reservation = ring.ReserveWrite(totalSize, cancellationToken);
@@ -48,51 +66,61 @@ public static class FrameProtocol
         Span<byte> headerBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
         header.EncodeTo(headerBytes);
 
-        // Write header + payload to reservation
+        // We need to write 3 parts into potentially 2 slices (First/Second).
+        // Use a helper approach: treat the reservation as a linear span and write sequentially.
+        var firstSpan = reservation.First.Span;
+        var secondSpan = reservation.Second.Span;
         var written = 0;
 
-        // Write to First slice
-        var firstSpan = reservation.First.Span;
-        var headerToFirst = Math.Min(headerBytes.Length, firstSpan.Length);
-        headerBytes[..headerToFirst].CopyTo(firstSpan);
-        written += headerToFirst;
+        // Write header
+        written = WriteToReservation(firstSpan, secondSpan, written, headerBytes);
 
-        var payloadToFirst = Math.Min(payload.Length, firstSpan.Length - headerToFirst);
-        if (payloadToFirst > 0)
+        // Write payload1
+        if (payload1.Length > 0)
         {
-            payload[..payloadToFirst].CopyTo(firstSpan[headerToFirst..]);
-            written += payloadToFirst;
+            written = WriteToReservation(firstSpan, secondSpan, written, payload1);
         }
 
-        // Write remaining to Second slice if needed
-        if (reservation.Second.Length > 0)
+        // Write payload2
+        if (payload2.Length > 0)
         {
-            var secondSpan = reservation.Second.Span;
-            var secondOffset = 0;
-
-            // Remaining header bytes
-            var headerRemaining = headerBytes.Length - headerToFirst;
-            if (headerRemaining > 0)
-            {
-                headerBytes[headerToFirst..].CopyTo(secondSpan);
-                secondOffset += headerRemaining;
-                written += headerRemaining;
-            }
-
-            // Remaining payload bytes
-            var payloadRemaining = payload.Length - payloadToFirst;
-            if (payloadRemaining > 0)
-            {
-                payload[payloadToFirst..].CopyTo(secondSpan[secondOffset..]);
-                written += payloadRemaining;
-            }
+            written = WriteToReservation(firstSpan, secondSpan, written, payload2);
         }
 
         // Commit the write
         ring.CommitWrite(reservation, written);
     }
 
+    /// <summary>
+    /// Writes data to a two-part reservation (First/Second spans) starting at the given offset.
+    /// Returns the new offset after writing.
+    /// </summary>
+    private static int WriteToReservation(Span<byte> first, Span<byte> second, int offset, ReadOnlySpan<byte> data)
+    {
+        var remaining = data.Length;
+        var dataOffset = 0;
 
+        // Write to First span if we haven't passed it yet
+        if (offset < first.Length && remaining > 0)
+        {
+            var available = first.Length - offset;
+            var toCopy = Math.Min(remaining, available);
+            data.Slice(dataOffset, toCopy).CopyTo(first.Slice(offset));
+            offset += toCopy;
+            dataOffset += toCopy;
+            remaining -= toCopy;
+        }
+
+        // Write to Second span for anything remaining
+        if (remaining > 0)
+        {
+            var secondOffset = offset - first.Length;
+            data.Slice(dataOffset, remaining).CopyTo(second.Slice(secondOffset));
+            offset += remaining;
+        }
+
+        return offset;
+    }
 
     /// <summary>
     /// Reads a frame from the ring buffer, skipping PAD frames.

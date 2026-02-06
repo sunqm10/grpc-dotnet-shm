@@ -48,7 +48,7 @@ public class RetrierService : Retrier.RetrierBase
     /// <summary>
     /// Handles method calls for shared memory transport.
     /// </summary>
-    public Task<byte[]> HandleMethodAsync(ShmGrpcStream stream, string method, byte[] requestData)
+    public Task<byte[]> HandleMethodAsync(ShmGrpcStream stream, string method, ReadOnlyMemory<byte> requestData)
     {
         // Simulate intermittent failures
         if (_random.NextDouble() > DeliverySuccessRate)

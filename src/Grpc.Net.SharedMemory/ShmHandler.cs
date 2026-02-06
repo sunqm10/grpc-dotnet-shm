@@ -20,6 +20,7 @@ using System.Net;
 using System.Net.Http.Headers;
 using System.Runtime.Versioning;
 using Grpc.Core;
+using Grpc.Net.SharedMemory.Compression;
 
 namespace Grpc.Net.SharedMemory;
 
@@ -43,17 +44,25 @@ public sealed class ShmHandler : HttpMessageHandler
     private readonly string _segmentName;
     private readonly ShmConnection _connection;
     private readonly SemaphoreSlim _connectionLock;
+    private readonly ShmRetryPolicy? _retryPolicy;
+    private readonly ShmRetryThrottling? _retryThrottling;
     private bool _disposed;
 
     /// <summary>
     /// Creates a new ShmHandler that connects to the specified shared memory segment.
     /// </summary>
     /// <param name="segmentName">The name of the shared memory segment to connect to.</param>
-    public ShmHandler(string segmentName)
+    /// <param name="compressionOptions">Optional compression options.</param>
+    /// <param name="retryPolicy">Optional retry policy for transient failures.</param>
+    /// <param name="retryThrottling">Optional retry throttling to prevent overwhelming the server.</param>
+    public ShmHandler(string segmentName, ShmCompressionOptions? compressionOptions = null,
+        ShmRetryPolicy? retryPolicy = null, ShmRetryThrottling? retryThrottling = null)
     {
         _segmentName = segmentName ?? throw new ArgumentNullException(nameof(segmentName));
         _connection = ShmConnection.ConnectAsClient(segmentName);
         _connectionLock = new SemaphoreSlim(1, 1);
+        _retryPolicy = retryPolicy;
+        _retryThrottling = retryThrottling;
     }
 
     /// <summary>
@@ -66,6 +75,70 @@ public sealed class ShmHandler : HttpMessageHandler
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
+        // Without retry policy, execute single attempt directly
+        if (_retryPolicy == null)
+        {
+            return await SendSingleAttemptAsync(request, null, cancellationToken);
+        }
+
+        // Buffer request content for potential retry replay
+        byte[]? requestBody = null;
+        if (request.Content != null)
+        {
+            requestBody = await request.Content.ReadAsByteArrayAsync(cancellationToken);
+        }
+
+        var retryState = new ShmRetryState(_retryPolicy, _retryThrottling);
+
+        while (true)
+        {
+            retryState.IncrementAttempt();
+            var response = await SendSingleAttemptAsync(request, requestBody, cancellationToken);
+
+            if (retryState.IsCommitted)
+            {
+                return response;
+            }
+
+            // For retry to work, we must read the full response to get trailers.
+            // Buffer the content so we can either return it or discard it on retry.
+            var contentBytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
+
+            // Check grpc-status from trailing headers (populated after reading content)
+            if (response.TrailingHeaders.TryGetValues("grpc-status", out var statusValues))
+            {
+                var statusStr = statusValues.FirstOrDefault();
+                if (int.TryParse(statusStr, out var statusInt))
+                {
+                    var grpcStatus = (Grpc.Core.StatusCode)statusInt;
+                    if (grpcStatus == Grpc.Core.StatusCode.OK)
+                    {
+                        retryState.RecordSuccess();
+                        // Re-wrap the already-read content
+                        response.Content = new ByteArrayContent(contentBytes);
+                        response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/grpc");
+                        return response;
+                    }
+
+                    if (retryState.ShouldRetry(grpcStatus, out var backoff))
+                    {
+                        response.Dispose();
+                        await Task.Delay(backoff, cancellationToken);
+                        continue;
+                    }
+                }
+            }
+
+            // Cannot retry — return response with buffered content
+            response.Content = new ByteArrayContent(contentBytes);
+            response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/grpc");
+            return response;
+        }
+    }
+
+    private async Task<HttpResponseMessage> SendSingleAttemptAsync(
+        HttpRequestMessage request, byte[]? requestBody, CancellationToken cancellationToken)
+    {
         // Create a new stream for this request
         var stream = _connection.CreateStream();
 
@@ -81,7 +154,12 @@ public sealed class ShmHandler : HttpMessageHandler
             await stream.SendRequestHeadersAsync(method, authority, metadata, deadline);
 
             // Send request body if present
-            if (request.Content != null)
+            if (requestBody != null)
+            {
+                using var bodyStream = new MemoryStream(requestBody);
+                await SendMessagesAsync(stream, bodyStream, cancellationToken);
+            }
+            else if (request.Content != null)
             {
                 var bodyStream = await request.Content.ReadAsStreamAsync(cancellationToken);
                 await SendMessagesAsync(stream, bodyStream, cancellationToken);
@@ -96,9 +174,10 @@ public sealed class ShmHandler : HttpMessageHandler
             // Create response with streaming content
             var response = new HttpResponseMessage(HttpStatusCode.OK)
             {
-                Content = new ShmResponseContent(stream),
+                Content = new ShmResponseContent(stream, null!),
                 Version = new Version(2, 0)
             };
+            ((ShmResponseContent)response.Content).SetTrailingHeaders(response.TrailingHeaders);
 
             // Add response headers
             if (responseHeaders.Metadata != null)
@@ -259,11 +338,18 @@ public sealed class ShmHandler : HttpMessageHandler
 internal sealed class ShmResponseContent : HttpContent
 {
     private readonly ShmGrpcStream _stream;
+    private HttpHeaders? _trailingHeaders;
 
-    public ShmResponseContent(ShmGrpcStream stream)
+    public ShmResponseContent(ShmGrpcStream stream, HttpHeaders? trailingHeaders)
     {
         _stream = stream;
+        _trailingHeaders = trailingHeaders;
         Headers.ContentType = new MediaTypeHeaderValue("application/grpc");
+    }
+
+    internal void SetTrailingHeaders(HttpHeaders trailingHeaders)
+    {
+        _trailingHeaders = trailingHeaders;
     }
 
     protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context)
@@ -278,19 +364,33 @@ internal sealed class ShmResponseContent : HttpContent
         {
             // gRPC message format: [compressed:1][length:4][data]
             var header = new byte[5];
-            header[0] = 0; // Not compressed
+            header[0] = 0; // Not compressed (SHM-level compression is transparent)
             System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(1), (uint)message.Length);
 
             await stream.WriteAsync(header, cancellationToken);
             await stream.WriteAsync(message, cancellationToken);
         }
 
-        // Add trailers
-        if (_stream.Trailers != null)
+        // Surface gRPC trailers as HTTP trailing headers.
+        // This is critical for grpc-dotnet's retry/hedging to inspect grpc-status.
+        if (_stream.Trailers != null && _trailingHeaders != null)
         {
-            // Trailers are sent as trailing headers in HTTP/2
-            // For HTTP/1.1-style content, we need to handle this differently
-            // The caller should check stream.Trailers after reading content
+            var trailers = _stream.Trailers;
+            _trailingHeaders.TryAddWithoutValidation("grpc-status", ((int)trailers.GrpcStatusCode).ToString());
+            if (!string.IsNullOrEmpty(trailers.GrpcStatusMessage))
+            {
+                _trailingHeaders.TryAddWithoutValidation("grpc-message", Uri.EscapeDataString(trailers.GrpcStatusMessage));
+            }
+            if (trailers.Metadata != null)
+            {
+                foreach (var kv in trailers.Metadata)
+                {
+                    var values = kv.Values.Select(v => v is byte[] bytes
+                        ? Convert.ToBase64String(bytes)
+                        : v?.ToString() ?? "");
+                    _trailingHeaders.TryAddWithoutValidation(kv.Key, values);
+                }
+            }
         }
     }
 

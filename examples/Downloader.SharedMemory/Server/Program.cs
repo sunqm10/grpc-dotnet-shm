@@ -29,8 +29,8 @@ Console.WriteLine($"Segment name: {SegmentName}");
 // Create the downloader service
 var downloaderService = new DownloaderService();
 
-// Create the shared memory listener using ShmControlListener for grpc-go-shmem compatibility
-using var listener = new ShmControlListener(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
+// Create the shared memory listener
+using var listener = new ShmConnectionListener(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
 Console.WriteLine("Server listening on shared memory segment: " + SegmentName);
 Console.WriteLine("Press Ctrl+C to stop the server.");
 
@@ -43,49 +43,40 @@ Console.CancelKeyPress += (_, e) =>
 
 try
 {
-    await foreach (var connection in listener.AcceptConnectionsAsync(cts.Token))
+    while (!cts.Token.IsCancellationRequested)
     {
-        Console.WriteLine($"New connection accepted: {connection.Name}");
+        var serverStream = listener.Connection.CreateStream();
 
-        _ = Task.Run(async () =>
+        if (serverStream.RequestHeaders is { Method: var method } && method != null)
         {
             try
             {
-                await foreach (var stream in connection.AcceptStreamsAsync(cts.Token))
-                {
-                    try
-                    {
-                        var headers = stream.RequestHeaders;
-                        if (headers?.Method is { } method)
-                        {
-                            Console.WriteLine($"Received request for method: {method}");
+                Console.WriteLine($"Received request for method: {method}");
 
-                            if (method == "/download.Downloader/DownloadFile")
-                            {
-                                await stream.SendResponseHeadersAsync();
-                                await downloaderService.DownloadFileAsync(stream, cts.Token);
-                                await stream.SendTrailersAsync(StatusCode.OK);
-                            }
-                            else
-                            {
-                                throw new RpcException(new Status(StatusCode.Unimplemented, $"Method {method} is not implemented"));
-                            }
-                        }
-                    }
-                    catch (RpcException ex)
-                    {
-                        Console.WriteLine($"RPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
-                        await stream.SendTrailersAsync(ex.Status.StatusCode, ex.Status.Detail);
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Error: {ex.Message}");
-                        await stream.SendTrailersAsync(StatusCode.Internal, ex.Message);
-                    }
+                if (method == "/download.Downloader/DownloadFile")
+                {
+                    await serverStream.SendResponseHeadersAsync();
+                    await downloaderService.DownloadFileAsync(serverStream, cts.Token);
+                    await serverStream.SendTrailersAsync(StatusCode.OK);
+                }
+                else
+                {
+                    throw new RpcException(new Status(StatusCode.Unimplemented, $"Method {method} is not implemented"));
                 }
             }
-            catch (OperationCanceledException) { }
-        });
+            catch (RpcException ex)
+            {
+                Console.WriteLine($"RPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
+                await serverStream.SendTrailersAsync(ex.Status.StatusCode, ex.Status.Detail);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error: {ex.Message}");
+                await serverStream.SendTrailersAsync(StatusCode.Internal, ex.Message);
+            }
+        }
+
+        await Task.Delay(10, cts.Token);
     }
 }
 catch (OperationCanceledException)

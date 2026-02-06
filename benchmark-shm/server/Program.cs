@@ -226,19 +226,19 @@ public class Program
     private static async Task HandleUnaryCallAsync(ShmGrpcStream stream, CancellationToken ct)
     {
         // Read first message
-        byte[]? requestData = null;
+        ReadOnlyMemory<byte> requestData = default;
         await foreach (var message in stream.ReceiveMessagesAsync(ct).ConfigureAwait(false))
         {
             requestData = message;
             break; // Only expect one message for unary
         }
 
-        if (requestData == null)
+        if (requestData.IsEmpty)
         {
             return;
         }
 
-        var request = SimpleRequest.Parser.ParseFrom(requestData);
+        var request = SimpleRequest.Parser.ParseFrom(requestData.Span);
         var responseSize = request.ResponseSize;
         var payload = BenchmarkServiceImpl.GetOrCreatePayload(responseSize);
 

@@ -24,7 +24,6 @@ namespace Grpc.Net.SharedMemory.Tests;
 public class ShmConnectionTests
 {
     [Test]
-    [Platform("Win")]
     public void ShmConnection_CreateAsServer_CreatesConnection()
     {
         // Arrange
@@ -41,7 +40,6 @@ public class ShmConnectionTests
     }
 
     [Test]
-    [Platform("Win")]
     public void ShmConnection_CreateStream_ReturnsNewStream()
     {
         // Arrange
@@ -61,7 +59,6 @@ public class ShmConnectionTests
     }
 
     [Test]
-    [Platform("Win")]
     public void ShmConnection_ClientConnection_UsesOddStreamIds()
     {
         // Arrange
@@ -81,7 +78,6 @@ public class ShmConnectionTests
     }
 
     [Test]
-    [Platform("Win")]
     public void ShmConnection_SendGoAway_SetsClosedFlag()
     {
         // Arrange
@@ -96,7 +92,6 @@ public class ShmConnectionTests
     }
 
     [Test]
-    [Platform("Win")]
     public void ShmConnection_Dispose_ClosesConnection()
     {
         // Arrange
@@ -112,7 +107,6 @@ public class ShmConnectionTests
     }
 
     [Test]
-    [Platform("Win")]
     public async Task ShmConnection_DisposeAsync_ClosesConnection()
     {
         // Arrange

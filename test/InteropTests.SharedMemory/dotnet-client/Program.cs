@@ -16,7 +16,7 @@
 
 #endregion
 
-using Helloworld;
+using Greet;
 using Grpc.Net.Client;
 using Grpc.Net.SharedMemory;
 
@@ -34,7 +34,8 @@ Console.WriteLine($"Connecting to segment: {segmentName}");
 try
 {
     // Create a channel using the grpc-go-shmem compatible control handler
-    using var handler = new ShmControlHandler(segmentName, TimeSpan.FromSeconds(30));
+    // We use http://localhost as a dummy address since ShmControlHandler intercepts all requests
+    using var handler = new ShmControlHandler(segmentName);
     using var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
     {
         HttpHandler = handler
@@ -42,11 +43,10 @@ try
 
     var client = new Greeter.GreeterClient(channel);
 
-    // Make the RPC call with timeout
+    // Make the RPC call
     Console.WriteLine($"Sending: SayHello(name=\"{name}\")");
-    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
-    var reply = await client.SayHelloAsync(new HelloRequest { Name = name }, cancellationToken: cts.Token);
+    var reply = await client.SayHelloAsync(new HelloRequest { Name = name });
 
     Console.WriteLine();
     Console.WriteLine($"Response: {reply.Message}");
@@ -61,6 +61,10 @@ catch (Exception ex)
     Console.WriteLine($"Full exception: {ex}");
     Console.WriteLine();
     Console.WriteLine("Make sure the server is running first.");
+    Console.WriteLine();
+    Console.WriteLine("To test with Go server:");
+    Console.WriteLine("  cd ../go/server");
+    Console.WriteLine($"  go run server.go -segment {segmentName}");
 
     return 1;
 }

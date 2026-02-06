@@ -24,7 +24,6 @@ namespace Grpc.Net.SharedMemory.Tests;
 public class SegmentTests
 {
     [Test]
-    [Platform("Win")]
     public void Segment_Create_CreatesNewSegment()
     {
         // Arrange
@@ -40,7 +39,6 @@ public class SegmentTests
     }
 
     [Test]
-    [Platform("Win")]
     public void Segment_RingBuffers_HaveCorrectCapacity()
     {
         // Arrange
@@ -55,7 +53,6 @@ public class SegmentTests
     }
 
     [Test]
-    [Platform("Win")]
     public void Segment_WriteFrameHeader_Works()
     {
         // Arrange
@@ -87,7 +84,6 @@ public class SegmentTests
     }
 
     [Test]
-    [Platform("Win")]
     public void Segment_Header_HasCorrectMagicAndVersion()
     {
         // Arrange
@@ -107,7 +103,6 @@ public class SegmentTests
     }
 
     [Test]
-    [Platform("Win")]
     public void SegmentHeader_Size_Is128Bytes()
     {
         // Verify 128-byte header size for grpc-go-shmem compatibility
@@ -116,7 +111,6 @@ public class SegmentTests
     }
 
     [Test]
-    [Platform("Win")]
     public void RingHeader_Size_Is64Bytes()
     {
         // Verify 64-byte ring header size
@@ -125,7 +119,6 @@ public class SegmentTests
     }
 
     [Test]
-    [Platform("Win")]
     public void RingHeader_Layout_MatchesGoShmem()
     {
         // Verify field offsets match grpc-go-shmem shm_segment.go RingHeader
@@ -175,7 +168,6 @@ public class SegmentTests
     }
 
     [Test]
-    [Platform("Win")]
     public void Segment_Create_InvalidName_ThrowsArgumentException()
     {
         Assert.Throws<ArgumentException>(() => Segment.Create("", ringCapacity: 4096, maxStreams: 100));
@@ -183,7 +175,6 @@ public class SegmentTests
     }
 
     [Test]
-    [Platform("Win")]
     public void Segment_Create_NonPowerOfTwo_ThrowsArgumentException()
     {
         var name = $"grpc_test_{Guid.NewGuid():N}";

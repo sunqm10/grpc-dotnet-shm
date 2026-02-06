@@ -1,38 +1,27 @@
 #!/bin/bash
 # Interop Test: .NET Server + Go Client
-# Uses the grpc-go-shmem helloworld example client
 
 set -e
-SEGMENT="${1:-interop_helloworld}"
+SEGMENT="${1:-interop_greeter}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GRPC_GO_SHMEM="/workspaces/grpc-go-shmem"
 
-echo "========================================"
-echo ".NET Server + Go Client Interop Test"
-echo "========================================"
-echo "Segment: $SEGMENT"
-echo ""
-
-# Check if grpc-go-shmem is available
-if [ ! -d "$GRPC_GO_SHMEM" ]; then
-    echo "ERROR: grpc-go-shmem not found at $GRPC_GO_SHMEM"
-    echo "Please clone it first:"
-    echo "  git clone https://github.com/markrussinovich/grpc-go-shmem.git $GRPC_GO_SHMEM"
-    exit 1
-fi
+echo ".NET Server + Go Client (segment: $SEGMENT)"
 
 # Build .NET server
-echo "Building .NET server..."
 cd "$SCRIPT_DIR/dotnet-server"
 dotnet build -c Release --nologo -v q
 
-# Build Go client from grpc-go-shmem
-echo "Building Go client..."
-cd "$GRPC_GO_SHMEM/examples/shm/helloworld/greeter_client"
-go build -o /tmp/greeter_client_interop .
+# Generate Go protobuf
+cd "$SCRIPT_DIR/go"
+if [ ! -f "greetpb/greet.pb.go" ]; then
+    mkdir -p greetpb
+    protoc --go_out=greetpb --go-grpc_out=greetpb \
+           --go_opt=paths=source_relative \
+           --go-grpc_opt=paths=source_relative \
+           -I .. ../greet.proto 2>/dev/null || echo "Note: protoc not available, using pre-generated files"
+fi
 
 # Start .NET server
-echo "Starting .NET server on shm://$SEGMENT..."
 cd "$SCRIPT_DIR/dotnet-server"
 dotnet run -c Release --no-build -- "$SEGMENT" &
 SERVER_PID=$!
@@ -44,32 +33,14 @@ if ! kill -0 $SERVER_PID 2>/dev/null; then
 fi
 
 # Run Go client
-echo ""
-echo "Running Go client..."
+cd "$SCRIPT_DIR/go/client"
 set +e
-/tmp/greeter_client_interop -addr "shm://$SEGMENT" -name "GoClient"
+go run client.go -segment "$SEGMENT" -name "Go Client"
 EXIT_CODE=$?
 set -e
 
 # Cleanup
-echo ""
-echo "Cleaning up..."
 kill $SERVER_PID 2>/dev/null || true
 wait $SERVER_PID 2>/dev/null || true
-
-# Clean up shared memory segment
-rm -f "/dev/shm/$SEGMENT"* 2>/dev/null || true
-
-if [ $EXIT_CODE -eq 0 ]; then
-    echo ""
-    echo "========================================"
-    echo "TEST PASSED: .NET Server + Go Client"
-    echo "========================================"
-else
-    echo ""
-    echo "========================================"
-    echo "TEST FAILED: .NET Server + Go Client"
-    echo "========================================"
-fi
 
 exit $EXIT_CODE

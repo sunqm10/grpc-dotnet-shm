@@ -94,8 +94,8 @@ static async Task HandleRaceAsync(ShmGrpcStream stream, TimeSpan duration, Cance
         {
             await foreach (var msg in stream.ReceiveMessagesAsync(ct))
             {
-                if (msg == null) break;
-                var message = RaceMessage.Parser.ParseFrom(msg);
+                if (msg.IsEmpty) break;
+                var message = RaceMessage.Parser.ParseFrom(msg.Span);
                 Interlocked.Increment(ref received);
             }
         });

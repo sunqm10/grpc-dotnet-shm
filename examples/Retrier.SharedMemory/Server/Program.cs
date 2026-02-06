@@ -63,7 +63,7 @@ try
                             Console.WriteLine($"Received request for: {method}");
 
                             // Read the request message
-                            byte[]? requestBytes = null;
+                            ReadOnlyMemory<byte> requestBytes = default;
                             await foreach (var msg in stream.ReceiveMessagesAsync(cts.Token))
                             {
                                 requestBytes = msg;
@@ -75,7 +75,7 @@ try
                             var response = await retrierService.HandleMethodAsync(
                                 stream,
                                 method,
-                                requestBytes ?? Array.Empty<byte>());
+                                requestBytes);
 
                             await stream.SendMessageAsync(response);
                             await stream.SendTrailersAsync(StatusCode.OK);

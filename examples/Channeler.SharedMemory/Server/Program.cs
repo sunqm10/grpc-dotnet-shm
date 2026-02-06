@@ -110,8 +110,8 @@ static async Task HandleUploadDataAsync(ShmGrpcStream stream, int streamId, Canc
     // Receive all chunks from client streaming
     await foreach (var msg in stream.ReceiveMessagesAsync(ct))
     {
-        if (msg == null) break;
-        var request = DataRequest.Parser.ParseFrom(msg);
+        if (msg.IsEmpty) break;
+        var request = DataRequest.Parser.ParseFrom(msg.Span);
         totalBytes += request.Value.Length;
         Console.WriteLine($"[Stream-{streamId}] Received chunk: {request.Value.Length} bytes (total: {totalBytes})");
     }
@@ -125,16 +125,16 @@ static async Task HandleUploadDataAsync(ShmGrpcStream stream, int streamId, Canc
 static async Task HandleDownloadResultsAsync(ShmGrpcStream stream, int streamId, CancellationToken ct)
 {
     // Read the request
-    byte[]? requestBytes = null;
+    ReadOnlyMemory<byte> requestBytes = default;
     await foreach (var msg in stream.ReceiveMessagesAsync(ct))
     {
         requestBytes = msg;
         break;
     }
     
-    if (requestBytes == null) return;
+    if (requestBytes.IsEmpty) return;
     
-    var request = DataRequest.Parser.ParseFrom(requestBytes);
+    var request = DataRequest.Parser.ParseFrom(requestBytes.Span);
     var requestSize = request.Value.Length;
     Console.WriteLine($"[Stream-{streamId}] Download request: {requestSize} bytes");
     

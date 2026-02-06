@@ -24,7 +24,6 @@ namespace Grpc.Net.SharedMemory.Tests;
 public class FrameProtocolTests
 {
     [Test]
-    [Platform("Win")]
     public void FrameProtocol_WriteAndRead_HeadersFrame()
     {
         // Arrange
@@ -59,7 +58,6 @@ public class FrameProtocolTests
     }
 
     [Test]
-    [Platform("Win")]
     public void FrameProtocol_WriteAndRead_MessageFrame()
     {
         // Arrange
@@ -85,7 +83,6 @@ public class FrameProtocolTests
     }
 
     [Test]
-    [Platform("Win")]
     public void FrameProtocol_WriteAndRead_TrailersFrame()
     {
         // Arrange
@@ -115,7 +112,6 @@ public class FrameProtocolTests
     }
 
     [Test]
-    [Platform("Win")]
     public void FrameProtocol_WriteAndRead_PingFrame()
     {
         // Arrange
@@ -136,7 +132,6 @@ public class FrameProtocolTests
     }
 
     [Test]
-    [Platform("Win")]
     public void FrameProtocol_MultipleFrames_ReadInOrder()
     {
         // Arrange
@@ -161,7 +156,6 @@ public class FrameProtocolTests
     }
 
     [Test]
-    [Platform("Win")]
     public void FrameProtocol_WriteCancel_Works()
     {
         // Arrange
@@ -180,7 +174,6 @@ public class FrameProtocolTests
     }
 
     [Test]
-    [Platform("Win")]
     public void FrameProtocol_WriteGoAway_Works()
     {
         // Arrange
@@ -199,7 +192,6 @@ public class FrameProtocolTests
     }
 
     [Test]
-    [Platform("Win")]
     public void FrameProtocol_WriteWindowUpdate_Works()
     {
         // Arrange

@@ -36,10 +36,10 @@ public class GreeterService
     /// <param name="stream">The gRPC stream from the client.</param>
     /// <param name="requestData">The serialized request message.</param>
     /// <returns>The serialized response message.</returns>
-    public Task<byte[]> SayHelloAsync(ShmGrpcStream stream, byte[] requestData)
+    public Task<byte[]> SayHelloAsync(ShmGrpcStream stream, ReadOnlyMemory<byte> requestData)
     {
         // Deserialize the request
-        var request = HelloRequest.Parser.ParseFrom(requestData);
+        var request = HelloRequest.Parser.ParseFrom(requestData.Span);
 
         Console.WriteLine($"Received greeting request from: {request.Name}");
 
@@ -60,7 +60,7 @@ public class GreeterService
     /// <param name="method">The method name (e.g., "/greet.Greeter/SayHello").</param>
     /// <param name="requestData">The serialized request data.</param>
     /// <returns>The serialized response data.</returns>
-    public Task<byte[]> HandleMethodAsync(ShmGrpcStream stream, string method, byte[] requestData)
+    public Task<byte[]> HandleMethodAsync(ShmGrpcStream stream, string method, ReadOnlyMemory<byte> requestData)
     {
         return method switch
         {

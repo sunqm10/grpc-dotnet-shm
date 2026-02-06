@@ -159,8 +159,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Sends a message payload with gRPC length-prefix header.
-    /// The data should be the raw protobuf message (without gRPC header).
+    /// Sends a message payload.
     /// </summary>
     public async Task SendMessageAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
     {
@@ -170,21 +169,15 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
 
-        // Build gRPC wire format: [compressed:1][length:4 BE][data]
-        var grpcMessage = new byte[5 + data.Length];
-        grpcMessage[0] = 0; // Not compressed
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(grpcMessage.AsSpan(1, 4), (uint)data.Length);
-        data.Span.CopyTo(grpcMessage.AsSpan(5));
-
-        // Wait for send window (account for full gRPC message size)
-        while (Interlocked.Read(ref _sendWindow) < grpcMessage.Length)
+        // Wait for send window
+        while (Interlocked.Read(ref _sendWindow) < data.Length)
         {
             linkedCts.Token.ThrowIfCancellationRequested();
             await Task.Delay(1, linkedCts.Token); // Simple backpressure
         }
 
-        Interlocked.Add(ref _sendWindow, -grpcMessage.Length);
-        await SendFrameAsync(FrameType.Message, 0, grpcMessage, linkedCts.Token);
+        Interlocked.Add(ref _sendWindow, -data.Length);
+        await SendFrameAsync(FrameType.Message, 0, data.ToArray(), linkedCts.Token);
     }
 
     /// <summary>
@@ -207,9 +200,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         var payload = _trailers.Encode();
         await SendFrameAsync(FrameType.Trailers, TrailersFlags.EndStream, payload);
         _halfCloseSent = true;
-        
-        // After sending trailers, the stream is complete - remove from connection
-        _connection.RemoveStream(StreamId);
     }
 
     /// <summary>
@@ -239,9 +229,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         catch { }
 
         _inboundFrames.Writer.TryComplete();
-        
-        // Remove from connection's stream tracking
-        _connection.RemoveStream(StreamId);
     }
 
     /// <summary>
@@ -320,12 +307,10 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Receives messages from the stream.
-    /// Decodes the gRPC wire format: [compressed:1][length:4 BE][data].
     /// </summary>
     public async IAsyncEnumerable<byte[]> ReceiveMessagesAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        // Read from the channel until it's completed or we get end-of-stream indicators
-        while (!_cancelled)
+        while (!_halfCloseReceived && !_cancelled)
         {
             var frame = await ReceiveFrameAsync(cancellationToken);
             if (frame == null) break;
@@ -340,28 +325,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                         _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0,
                             BitConverter.GetBytes(increment));
                     }
-                    
-                    // Decode gRPC wire format: [compressed:1][length:4 BE][data]
-                    var payload = frame.Value.Payload;
-                    if (payload.Length < 5)
-                    {
-                        throw new InvalidDataException($"MESSAGE payload too short: {payload.Length} bytes, expected at least 5");
-                    }
-                    
-                    var compressed = payload[0] != 0;
-                    if (compressed)
-                    {
-                        throw new NotSupportedException("Compression not yet supported");
-                    }
-                    
-                    var messageLength = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(payload.AsSpan(1, 4));
-                    if (payload.Length != 5 + messageLength)
-                    {
-                        throw new InvalidDataException($"MESSAGE payload length mismatch: got {payload.Length} bytes, expected {5 + messageLength}");
-                    }
-                    
-                    // Return just the protobuf data (without the 5-byte header)
-                    yield return payload[5..];
+                    yield return frame.Value.Payload;
                     break;
 
                 case FrameType.HalfClose:
@@ -392,13 +356,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 break;
 
             case FrameType.HalfClose:
-                // Queue the frame; the consumer will set _halfCloseReceived when reading
+                _halfCloseReceived = true;
                 _inboundFrames.Writer.TryWrite((header.Type, payload));
-                _inboundFrames.Writer.TryComplete();
                 break;
 
             case FrameType.Trailers:
-                // Queue the frame; the consumer will decode and set _trailers when reading
+                _halfCloseReceived = true;
                 _inboundFrames.Writer.TryWrite((header.Type, payload));
                 _inboundFrames.Writer.TryComplete();
                 break;

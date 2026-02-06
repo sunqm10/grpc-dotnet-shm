@@ -25,7 +25,6 @@ namespace Grpc.Net.SharedMemory.Tests;
 public class ShmGrpcStreamTests
 {
     [Test]
-    [Platform("Win")]
     public void ShmGrpcStream_InitialState_IsCorrect()
     {
         // Arrange
@@ -45,7 +44,6 @@ public class ShmGrpcStreamTests
     }
 
     [Test]
-    [Platform("Win")]
     public async Task ShmGrpcStream_SendRequestHeaders_SetsHeaders()
     {
         // Arrange
@@ -73,7 +71,6 @@ public class ShmGrpcStreamTests
     }
 
     [Test]
-    [Platform("Win")]
     public async Task ShmGrpcStream_SendHalfClose_SetsHalfClosedFlag()
     {
         // Arrange
@@ -90,7 +87,6 @@ public class ShmGrpcStreamTests
     }
 
     [Test]
-    [Platform("Win")]
     public async Task ShmGrpcStream_SendTrailers_SetsTrailersAndHalfClose()
     {
         // Arrange
@@ -114,7 +110,6 @@ public class ShmGrpcStreamTests
     }
 
     [Test]
-    [Platform("Win")]
     public async Task ShmGrpcStream_Cancel_SetsCancelledFlag()
     {
         // Arrange
@@ -131,7 +126,6 @@ public class ShmGrpcStreamTests
     }
 
     [Test]
-    [Platform("Win")]
     public void ShmGrpcStream_SendRequestHeaders_OnServerStream_Throws()
     {
         // Arrange
@@ -145,7 +139,6 @@ public class ShmGrpcStreamTests
     }
 
     [Test]
-    [Platform("Win")]
     public void ShmGrpcStream_SendTrailers_OnClientStream_Throws()
     {
         // Arrange
@@ -160,7 +153,6 @@ public class ShmGrpcStreamTests
     }
 
     [Test]
-    [Platform("Win")]
     public void ShmGrpcStream_Dispose_DisposesStream()
     {
         // Arrange

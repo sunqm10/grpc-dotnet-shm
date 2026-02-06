@@ -294,7 +294,6 @@ public class InteropTests
     /// Generates a binary dump file for Go verification.
     /// </summary>
     [Test]
-    [Platform("Win")]
     [Explicit("Run manually to generate binary dump for Go verification")]
     public void GenerateBinaryDumpForGoVerification()
     {

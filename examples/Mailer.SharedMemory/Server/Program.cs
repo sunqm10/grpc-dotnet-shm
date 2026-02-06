@@ -133,9 +133,9 @@ static async Task HandleMailboxStreamAsync(ShmGrpcStream stream, MailQueue queue
         // Handle forward requests from client
         await foreach (var msg in stream.ReceiveMessagesAsync(ct))
         {
-            if (msg == null) break;
+            if (msg.IsEmpty) break;
             
-            var request = ForwardMailMessage.Parser.ParseFrom(msg);
+            var request = ForwardMailMessage.Parser.ParseFrom(msg.Span);
             queue.ForwardMail();
             Console.WriteLine($"[{mailboxName}] Mail forwarded");
             

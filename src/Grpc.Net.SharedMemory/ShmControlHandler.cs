@@ -101,11 +101,9 @@ public sealed class ShmControlHandler : HttpMessageHandler
             // Create response with streaming content
             var response = new HttpResponseMessage(HttpStatusCode.OK)
             {
+                Content = new ShmControlResponseContent(stream),
                 Version = new Version(2, 0)
             };
-            
-            // Set content with access to trailing headers
-            response.Content = new ShmControlResponseContent(stream, response.TrailingHeaders);
 
             // Add response headers
             if (responseHeaders.Metadata != null)
@@ -121,13 +119,7 @@ public sealed class ShmControlHandler : HttpMessageHandler
 
             return response;
         }
-        catch (OperationCanceledException)
-        {
-            // Clean up the stream on cancellation
-            await stream.CancelAsync().ConfigureAwait(false);
-            throw;
-        }
-        catch (Exception)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             await stream.CancelAsync().ConfigureAwait(false);
             throw;
@@ -220,13 +212,11 @@ public sealed class ShmControlHandler : HttpMessageHandler
         }
         finally
         {
-            // Use UnmapWithoutClose to avoid affecting the server's control segment
-            // The server needs to keep accepting new connections
-            ctlSegment.UnmapWithoutClose();
+            ctlSegment.Dispose();
         }
     }
 
-    private static Task WriteControlFrameAsync(ShmRing ring, FrameType type, byte[] payload, CancellationToken ct)
+    private static async Task WriteControlFrameAsync(ShmRing ring, FrameType type, byte[] payload, CancellationToken ct)
     {
         var header = new FrameHeader
         {
@@ -239,41 +229,19 @@ public sealed class ShmControlHandler : HttpMessageHandler
         var headerBytes = header.ToBytes();
         var totalLength = headerBytes.Length + payload.Length;
 
-        // Reserve space atomically for header + payload
-        // This is critical: we must commit header+payload together so the reader
-        // sees a complete frame, not a header without its payload
-        var reservation = ring.ReserveWrite(totalLength, ct);
-
-        // Copy header into reservation
-        headerBytes.CopyTo(reservation.First.Span);
-
-        // Copy payload, handling potential wrap
-        if (payload.Length > 0)
+        // Wait for space
+        while (!ring.CanWrite(totalLength))
         {
-            var payloadStart = headerBytes.Length;
-            if (payloadStart < reservation.First.Length)
-            {
-                // Header fit in first segment, payload starts there
-                var firstChunkLen = Math.Min(payload.Length, reservation.First.Length - payloadStart);
-                payload.AsSpan(0, firstChunkLen).CopyTo(reservation.First.Span.Slice(payloadStart));
-
-                if (firstChunkLen < payload.Length)
-                {
-                    // Payload wraps to second segment
-                    payload.AsSpan(firstChunkLen).CopyTo(reservation.Second.Span);
-                }
-            }
-            else
-            {
-                // Header spanned both segments, payload is entirely in second
-                var payloadOffset = payloadStart - reservation.First.Length;
-                payload.CopyTo(reservation.Second.Span.Slice(payloadOffset));
-            }
+            ct.ThrowIfCancellationRequested();
+            await Task.Delay(1, ct).ConfigureAwait(false);
         }
 
-        // Commit the entire frame atomically
-        ring.CommitWrite(reservation, totalLength);
-        return Task.CompletedTask;
+        // Write header and payload
+        ring.Write(headerBytes, ct);
+        if (payload.Length > 0)
+        {
+            ring.Write(payload, ct);
+        }
     }
 
     private static async Task<(FrameHeader header, Memory<byte> payload)> ReadControlFrameAsync(ShmRing ring, CancellationToken ct)
@@ -453,12 +421,10 @@ public sealed class ShmControlHandler : HttpMessageHandler
 internal sealed class ShmControlResponseContent : HttpContent
 {
     private readonly ShmGrpcStream _stream;
-    private readonly HttpHeaders _trailingHeaders;
 
-    public ShmControlResponseContent(ShmGrpcStream stream, HttpHeaders trailingHeaders)
+    public ShmControlResponseContent(ShmGrpcStream stream)
     {
         _stream = stream;
-        _trailingHeaders = trailingHeaders;
         Headers.ContentType = new MediaTypeHeaderValue("application/grpc");
     }
 
@@ -469,39 +435,16 @@ internal sealed class ShmControlResponseContent : HttpContent
 
     protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken cancellationToken)
     {
-        // ReceiveMessagesAsync now returns raw protobuf data (the 5-byte gRPC framing
-        // was stripped). We need to add the gRPC framing back for the HTTP response
-        // since the gRPC client library expects wire format [compressed:1][length:4][data]
+        // Write gRPC-format messages to the output stream
         await foreach (var message in _stream.ReceiveMessagesAsync(cancellationToken))
         {
-            // Write gRPC wire format: [compressed:1][length:4 BE][data]
+            // gRPC message format: [compressed:1][length:4][data]
             var header = new byte[5];
             header[0] = 0; // Not compressed
             System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(1), (uint)message.Length);
+
             await stream.WriteAsync(header, cancellationToken).ConfigureAwait(false);
             await stream.WriteAsync(message, cancellationToken).ConfigureAwait(false);
-        }
-
-        // After receiving all messages, the stream should have trailers
-        // Populate the HTTP response's trailing headers
-        if (_stream.Trailers != null)
-        {
-            var trailers = _stream.Trailers;
-            _trailingHeaders.TryAddWithoutValidation("grpc-status", ((int)trailers.GrpcStatusCode).ToString());
-            if (!string.IsNullOrEmpty(trailers.GrpcStatusMessage))
-            {
-                _trailingHeaders.TryAddWithoutValidation("grpc-message", Uri.EscapeDataString(trailers.GrpcStatusMessage));
-            }
-            if (trailers.Metadata != null)
-            {
-                foreach (var kv in trailers.Metadata)
-                {
-                    var values = kv.Values.Select(v => v is byte[] bytes
-                        ? Convert.ToBase64String(bytes)
-                        : v?.ToString() ?? "");
-                    _trailingHeaders.TryAddWithoutValidation(kv.Key, values);
-                }
-            }
         }
     }
 

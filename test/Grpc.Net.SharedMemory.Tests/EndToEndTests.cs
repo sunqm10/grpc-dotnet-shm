@@ -29,7 +29,6 @@ namespace Grpc.Net.SharedMemory.Tests;
 public class EndToEndTests
 {
     [Test]
-    [Platform("Win")]
     [Timeout(10000)]
     public async Task UnaryCall_SimpleRequestResponse_Works()
     {
@@ -89,7 +88,6 @@ public class EndToEndTests
     }
 
     [Test]
-    [Platform("Win")]
     [Timeout(10000)]
     public async Task ServerStreaming_MultipleMessages_Works()
     {
@@ -127,7 +125,6 @@ public class EndToEndTests
     }
 
     [Test]
-    [Platform("Win")]
     [Timeout(10000)]
     public async Task ClientStreaming_MultipleMessages_Works()
     {
@@ -168,7 +165,6 @@ public class EndToEndTests
     }
 
     [Test]
-    [Platform("Win")]
     [Timeout(10000)]
     public async Task BidirectionalStreaming_Works()
     {
@@ -212,7 +208,6 @@ public class EndToEndTests
     }
 
     [Test]
-    [Platform("Win")]
     [Timeout(10000)]
     public async Task ErrorResponse_ReturnsStatusCode()
     {
@@ -243,7 +238,6 @@ public class EndToEndTests
     }
 
     [Test]
-    [Platform("Win")]
     [Timeout(10000)]
     public async Task Cancellation_CancelsStream()
     {
@@ -262,7 +256,6 @@ public class EndToEndTests
     }
 
     [Test]
-    [Platform("Win")]
     [Timeout(10000)]
     public async Task Deadline_PropagatesInHeaders()
     {
@@ -283,7 +276,6 @@ public class EndToEndTests
     }
 
     [Test]
-    [Platform("Win")]
     [Timeout(10000)]
     public async Task Metadata_RoundTrips()
     {
@@ -308,7 +300,6 @@ public class EndToEndTests
     }
 
     [Test]
-    [Platform("Win")]
     [Timeout(10000)]
     public async Task LargeMessage_TransfersCorrectly()
     {
@@ -333,7 +324,6 @@ public class EndToEndTests
     }
 
     [Test]
-    [Platform("Win")]
     public void MultipleConnections_WorkIndependently()
     {
         // Arrange - two independent segments
