@@ -40,11 +40,11 @@ Last updated: 2026-02-06
 - **Current state**: ~~14 OTel counters/histograms/gauges + ActivitySource + `IShmStatsHandler` events defined (~500 lines) with **zero call sites** in the transport.~~ All 12 counters, 3 histograms, and 3 gauges now have live call sites in `ShmConnection` (connection lifecycle, ping/pong/RTT, window updates, BDP, errors) and `ShmGrpcStream` (stream start/close, message sent/received with compression info).
 - **Verification**: `ShmDiagnosticsTests`
 
-### P5: Parameterized Transport Test Runner
-- [ ] **P5a**: Refactor `TransportTestBase` to support both TCP and SHM transport parameterization (matching Go's `listTestEnv()`)
-- [ ] **P5b**: Port the core TCP functional test scenarios to run over both transports via `[TestCase]` or `[TestFixture]` parameterization
-- **Current state**: `TransportTestBase` is SHM-only. 327 SHM tests exist but are a separate codebase from the 107 TCP functional tests.
-- **Verification**: All parameterized tests pass on both transports
+### P5: Parameterized Transport Test Runner ✅ (framework)
+- [x] **P5a**: Refactor `TransportTestBase` to support both TCP and SHM transport parameterization (matching Go's `listTestEnv()`)
+- [ ] **P5b**: Port the core TCP functional test scenarios to run over both transports via `[TestCase]` or `[TestFixture]` parameterization *(blocked by P6)*
+- **Current state**: ~~`TransportTestBase` is SHM-only.~~ `TransportKind` enum (Shm, Tcp) added. `TransportTestBase` accepts transport parameter with backward-compatible default. TCP path stubs `NotSupportedException` pending P6 server integration. Framework ready for `[TestFixture(TransportKind.Tcp)]` annotation.
+- **Verification**: All parameterized tests pass on SHM; TCP await P6
 
 ### P6: Server-side ASP.NET Core Integration
 - [ ] **P6a**: Implement `IConnectionListenerFactory` or equivalent so `MapGrpcService<T>()` works over SHM
