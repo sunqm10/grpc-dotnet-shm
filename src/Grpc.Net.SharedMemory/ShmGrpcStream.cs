@@ -20,6 +20,7 @@ using System.Buffers;
 using System.Threading.Channels;
 using Grpc.Core;
 using Grpc.Net.SharedMemory.Compression;
+using Grpc.Net.SharedMemory.Telemetry;
 
 namespace Grpc.Net.SharedMemory;
 
@@ -138,6 +139,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         var payload = _requestHeaders.Encode();
         await SendFrameAsync(FrameType.Headers, HeadersFlags.Initial, payload);
+        ShmTelemetry.RecordStreamStarted(StreamId, method);
     }
 
     /// <summary>
@@ -209,6 +211,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(grpcPrefix.AsSpan(1, 4), (uint)wireData.Length);
 
         await SendFrameScatterAsync(FrameType.Message, 0, grpcPrefix, wireData, linkedCts.Token);
+        ShmTelemetry.RecordMessageSent(StreamId, wireData.Length, compressedFlag != 0, compressedFlag != 0 ? data.Length : null);
     }
 
     /// <summary>
@@ -231,6 +234,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         var payload = _trailers.Encode();
         await SendFrameAsync(FrameType.Trailers, TrailersFlags.EndStream, payload);
         _halfCloseSent = true;
+        ShmTelemetry.RecordStreamClosed(StreamId, (int)statusCode);
         
         // After sending trailers, the stream is complete - remove from connection
         _connection.RemoveStream(StreamId);
@@ -462,6 +466,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                             // (no pooling needed since Decompress allocates a new array)
                             previousPooledBuffer = null;
                             previousPooledLength = 0;
+                            ShmTelemetry.RecordMessageReceived(StreamId, decompressedData.Length, true);
                             yield return decompressedData;
                         }
                         else
@@ -470,6 +475,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                             // Defer returning the buffer until the next iteration when the caller is done.
                             previousPooledBuffer = framePayload;
                             previousPooledLength = framePayloadLength;
+                            ShmTelemetry.RecordMessageReceived(StreamId, (int)messageLength, false);
                             yield return framePayload.AsMemory(5, (int)messageLength);
                         }
                         break;
@@ -483,6 +489,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                         _trailers = TrailersV1.Decode(framePayload.AsSpan(0, framePayloadLength).ToArray());
                         ReturnPooledBuffer(framePayload, framePayloadLength);
                         _halfCloseReceived = true;
+                        ShmTelemetry.RecordStreamClosed(StreamId, (int)(_trailers.GrpcStatusCode));
                         yield break;
 
                     case FrameType.Cancel:

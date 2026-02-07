@@ -20,6 +20,7 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.Threading.Channels;
 using Grpc.Net.SharedMemory.Compression;
+using Grpc.Net.SharedMemory.Telemetry;
 
 namespace Grpc.Net.SharedMemory;
 
@@ -209,6 +210,8 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         {
             _keepaliveTask = Task.Run(KeepaliveLoopAsync);
         }
+
+        ShmTelemetry.RecordConnectionStarted(name, isClient);
     }
 
     /// <summary>
@@ -318,6 +321,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         ThrowIfDisposed();
         var pingData = BitConverter.GetBytes(Environment.TickCount64);
         FrameProtocol.WritePing(TxRing, 0, pingData, _disposeCts.Token);
+        ShmTelemetry.RecordPingSent();
     }
 
     internal void RemoveStream(uint streamId)
@@ -363,6 +367,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         {
             // Log error and close connection
             System.Diagnostics.Debug.WriteLine($"Frame reader error: {ex}");
+            ShmTelemetry.RecordError("frame_reader", ex.Message);
         }
         finally
         {
@@ -646,6 +651,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             var payload = new byte[4];
             System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(payload, increment);
             SendFrame(FrameType.WindowUpdate, 0, 0, payload);
+            ShmTelemetry.RecordWindowUpdateSent(0, increment);
         }
     }
 
@@ -664,6 +670,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 SendConnectionWindowUpdate(delta);
             }
         }
+        ShmTelemetry.UpdateBdpWindow(newBdp);
 
         // Also update stream-level windows
         foreach (var stream in _streams.Values)
@@ -720,6 +727,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                     if (DateTime.UtcNow - _lastPingSentAt > _keepaliveOptions.PingTimeout)
                     {
                         // Timeout - close connection
+                        ShmTelemetry.RecordError("keepalive", "keepalive timeout");
                         SendGoAway("keepalive timeout");
                         break;
                     }
@@ -731,6 +739,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 _lastPingSentAt = DateTime.UtcNow;
                 var pingData = BitConverter.GetBytes(DateTime.UtcNow.Ticks);
                 SendFrame(FrameType.Ping, 0, 0, pingData);
+                ShmTelemetry.RecordPingSent();
             }
         }
         catch (OperationCanceledException)
@@ -764,6 +773,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 _pingStrikes++;
                 if (_pingStrikes > _enforcementPolicy.MaxPingStrikes)
                 {
+                    ShmTelemetry.RecordError("ping_enforcement", "too many pings without streams");
                     SendGoAway("too many pings without streams");
                     return;
                 }
@@ -775,6 +785,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 _pingStrikes++;
                 if (_pingStrikes > _enforcementPolicy.MaxPingStrikes)
                 {
+                    ShmTelemetry.RecordError("ping_enforcement", "too many pings");
                     SendGoAway("too many pings");
                     return;
                 }
@@ -802,6 +813,11 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
         // Regular keepalive pong - clear pending ping
         _pendingPing = false;
+        if (_lastPingSentAt != DateTime.MinValue)
+        {
+            var rttMs = (DateTime.UtcNow - _lastPingSentAt).TotalMilliseconds;
+            ShmTelemetry.RecordPongReceived(rttMs);
+        }
     }
 
     #endregion
@@ -857,6 +873,8 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
             _segment.Dispose();
             _disposeCts.Dispose();
+
+            ShmTelemetry.RecordConnectionClosed(Name, _isClient, "disposed");
         }
     }
 
@@ -887,6 +905,8 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
             _segment.Dispose();
             _disposeCts.Dispose();
+
+            ShmTelemetry.RecordConnectionClosed(Name, _isClient, "disposed");
         }
     }
 }
