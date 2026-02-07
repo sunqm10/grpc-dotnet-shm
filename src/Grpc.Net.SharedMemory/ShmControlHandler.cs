@@ -44,6 +44,8 @@ public sealed class ShmControlHandler : HttpMessageHandler
     private ShmConnection? _connection;
     private readonly SemaphoreSlim _connectionLock;
     private readonly TimeSpan _connectTimeout;
+    private readonly ShmRetryPolicy? _retryPolicy;
+    private readonly ShmRetryThrottling? _retryThrottling;
     private bool _disposed;
 
     /// <summary>
@@ -52,11 +54,16 @@ public sealed class ShmControlHandler : HttpMessageHandler
     /// </summary>
     /// <param name="baseName">The base name of the shared memory segment (without _ctl suffix).</param>
     /// <param name="connectTimeout">Timeout for connection establishment (default: 30s).</param>
-    public ShmControlHandler(string baseName, TimeSpan? connectTimeout = null)
+    /// <param name="retryPolicy">Optional retry policy for transient failures.</param>
+    /// <param name="retryThrottling">Optional retry throttling to prevent overwhelming the server.</param>
+    public ShmControlHandler(string baseName, TimeSpan? connectTimeout = null,
+        ShmRetryPolicy? retryPolicy = null, ShmRetryThrottling? retryThrottling = null)
     {
         _baseName = baseName ?? throw new ArgumentNullException(nameof(baseName));
         _connectionLock = new SemaphoreSlim(1, 1);
         _connectTimeout = connectTimeout ?? TimeSpan.FromSeconds(30);
+        _retryPolicy = retryPolicy;
+        _retryThrottling = retryThrottling;
     }
 
     /// <summary>
@@ -69,6 +76,70 @@ public sealed class ShmControlHandler : HttpMessageHandler
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
+        // Without retry policy, execute single attempt directly
+        if (_retryPolicy == null)
+        {
+            return await SendSingleAttemptAsync(request, null, cancellationToken).ConfigureAwait(false);
+        }
+
+        // Buffer request content for potential retry replay
+        byte[]? requestBody = null;
+        if (request.Content != null)
+        {
+            requestBody = await request.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        var retryState = new ShmRetryState(_retryPolicy, _retryThrottling);
+
+        while (true)
+        {
+            retryState.IncrementAttempt();
+            var response = await SendSingleAttemptAsync(request, requestBody, cancellationToken).ConfigureAwait(false);
+
+            if (retryState.IsCommitted)
+            {
+                return response;
+            }
+
+            // For retry to work, we must read the full response to get trailers.
+            // Buffer the content so we can either return it or discard it on retry.
+            var contentBytes = await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
+
+            // Check grpc-status from trailing headers (populated after reading content)
+            if (response.TrailingHeaders.TryGetValues("grpc-status", out var statusValues))
+            {
+                var statusStr = statusValues.FirstOrDefault();
+                if (int.TryParse(statusStr, out var statusInt))
+                {
+                    var grpcStatus = (StatusCode)statusInt;
+                    if (grpcStatus == StatusCode.OK)
+                    {
+                        retryState.RecordSuccess();
+                        // Re-wrap the already-read content
+                        response.Content = new ByteArrayContent(contentBytes);
+                        response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/grpc");
+                        return response;
+                    }
+
+                    if (retryState.ShouldRetry(grpcStatus, out var backoff))
+                    {
+                        response.Dispose();
+                        await Task.Delay(backoff, cancellationToken).ConfigureAwait(false);
+                        continue;
+                    }
+                }
+            }
+
+            // Cannot retry — return response with buffered content
+            response.Content = new ByteArrayContent(contentBytes);
+            response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/grpc");
+            return response;
+        }
+    }
+
+    private async Task<HttpResponseMessage> SendSingleAttemptAsync(
+        HttpRequestMessage request, byte[]? requestBody, CancellationToken cancellationToken)
+    {
         // Ensure we have a connection
         var connection = await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
 
@@ -87,7 +158,12 @@ public sealed class ShmControlHandler : HttpMessageHandler
             await stream.SendRequestHeadersAsync(method, authority, metadata, deadline).ConfigureAwait(false);
 
             // Send request body if present
-            if (request.Content != null)
+            if (requestBody != null)
+            {
+                using var bodyStream = new MemoryStream(requestBody);
+                await SendMessagesAsync(stream, bodyStream, cancellationToken).ConfigureAwait(false);
+            }
+            else if (request.Content != null)
             {
                 var bodyStream = await request.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
                 await SendMessagesAsync(stream, bodyStream, cancellationToken).ConfigureAwait(false);
@@ -104,7 +180,7 @@ public sealed class ShmControlHandler : HttpMessageHandler
             {
                 Version = new Version(2, 0)
             };
-            
+
             // Set content with access to trailing headers
             response.Content = new ShmControlResponseContent(stream, response.TrailingHeaders);
 
