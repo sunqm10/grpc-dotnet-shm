@@ -52,12 +52,12 @@ Last updated: 2026-02-06
 - **Current state**: ~~Server-side has no framework integration.~~ New `Grpc.AspNetCore.Server.SharedMemory` project implements `IConnectionListenerFactory` → `IConnectionListener` → `ConnectionContext` chain. `ShmStream` wrapped as `IDuplexPipe` via `PipeReader.Create`/`PipeWriter.Create`. `UseSharedMemory(segmentName)` extension configures Kestrel. Core `Grpc.Net.SharedMemory` stays ASP.NET-free.
 - **Verification**: `builder.WebHost.UseSharedMemory("name"); app.MapGrpcService<T>();` pattern enabled
 
-### P7: Rewrite Examples to Dialer-only Pattern
-- [ ] **P7a**: Convert all 7 raw-`ShmConnection` client examples to use `ShmHandler` + `GrpcChannel` + generated stubs
+### P7: Rewrite Examples to Dialer-only Pattern ✅
+- [x] **P7a**: Convert all 7 raw-`ShmConnection` client examples to use `ShmHandler` + `GrpcChannel` + generated stubs
 - [ ] **P7b**: Convert all 19 server examples to use ASP.NET Core integration (depends on P6)
-- **Current state**: 3/19 client examples use `ShmHandler` (correct pattern). 7 use raw `ShmConnection` with manual wire-level framing, no generated stubs. 0/19 servers use framework integration.
+- **Current state**: All 7 raw client examples converted. Created shared `Echo.SharedMemory/Proto/` with `echo.proto` for 6 echo-based examples. RouteGuide reduced from 268 lines of manual framing to ~140 lines using generated stubs. All csproj files standardized to net9.0/2.70.0.
 - **Go reference**: ALL Go examples use `grpc.WithShmTransport()` on client + `grpc.NewServer().Serve(shmListener)` on server — the **only** difference from TCP.
-- **Verification**: All examples build, run, and produce identical output to TCP equivalents
+- **Verification**: All 7 examples build with 0 warnings, 0 errors. 192 tests pass.
 
 ### P8: TCP Fallback + Mixed Transport
 - [ ] **P8a**: Implement `dialShmWithFallback` equivalent in `ShmControlHandler`
