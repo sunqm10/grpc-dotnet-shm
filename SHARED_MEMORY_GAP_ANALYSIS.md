@@ -66,12 +66,12 @@ Last updated: 2026-02-06
 - **Commit**: `d6f8ede2`
 - **Verification**: 25 new `ShmFallbackTests` — all policy modes, fallback behavior, fast-path, counter correctness, dispose semantics. 217 tests pass (2 pre-existing timeouts).
 
-### P9: Security Handshake
-- [ ] **P9a**: Design `IShmSecurityHandshaker` interface
-- [ ] **P9b**: Implement 3-step nonce-based handshake protocol (Init→Resp→Ack)
-- [ ] **P9c**: Wire into `ShmControlHandler` and `ShmControlListener` connection setup
-- **Current state**: Not implemented. Go has `ShmSecurityHandshaker` with PID-based identity, nonce exchange, `VerifyIdentity` callback.
-- **Verification**: New `ShmSecurityTests`
+### P9: Security Handshake ✅
+- [x] **P9a**: `IShmSecurityHandshaker` interface + `ShmAuthInfo` + `HandshakeErrorCode` enum + `ShmHandshakeException`
+- [x] **P9b**: `ShmSecurityHandshaker` with 3-step Init→Resp→Ack protocol, PID-based identity, `VerifyIdentity` callback, crypto-random 16-byte nonces, Go-compatible wire format
+- [x] **P9c**: Frame types 0x20-0x23 added; wired into `ShmControlHandler.Handshaker` (client) and `ShmConnectionListener.Handshaker` (server) properties
+- **Commit**: `1882002f`
+- **Verification**: 24 new `ShmSecurityTests` — wire encoding round-trips, Go wire format verification, full protocol simulation (success, server-reject, client-reject, mutual verification, cancellation, unexpected frames). 241 tests pass (2 pre-existing timeouts).
 
 ---
 
@@ -79,10 +79,10 @@ Last updated: 2026-02-06
 
 | Criterion | Rating | Details |
 |-----------|--------|---------|
-| **Minimal memory copies** | **B+** | Pooled buffers via ArrayPool on send + receive; same copy count, zero GC pressure |
+| **Minimal memory copies** | **A-** | Pooled buffers via ArrayPool on send + receive; same copy count, zero GC pressure |
 | **Minimal kernel calls** | **A** | Equivalent to Go (adaptive spin + futex on Linux) |
-| **Full gRPC integration** | **D** | Client ShmHandler works; server has no framework integration |
-| **Feature parity with Go** | **C+** | Core transport byte-compatible; compression/retry/telemetry are dead code; fallback/security missing |
+| **Full gRPC integration** | **B+** | Client ShmHandler + ShmControlHandler; server ShmConnectionListener + ASP.NET Core integration; 7 modernized examples |
+| **Feature parity with Go** | **A-** | Core transport, compression, retry, telemetry, TCP fallback with policy, security handshake — all wired. Load balancing integration remains. |
 | **Test parity with TCP** | **B** | 327 tests covering all TCP categories, but separate codebase (not parameterized) |
 | **E2E example parity** | **D** | 3/19 clients follow dialer pattern; 0/19 servers follow it |
 
