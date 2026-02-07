@@ -28,10 +28,10 @@ Last updated: 2026-02-06
 - **Current state**: ~~Full `IShmCompressor` infra exists (`GzipCompressor`, `DeflateCompressor`, registry) but `SendMessageAsync` always sets `compressed=0` and receive throws on `compressed=1`.~~ Compression fully wired: `ShmCompressionOptions` threaded through all constructors, send path compresses when `ShouldCompress()`, receive path decompresses transparently. All 23 compression tests pass.
 - **Verification**: `ShmCompressionE2ETests`, `Compression.SharedMemory` example
 
-### P3: Wire Retry into Call Path
-- [ ] **P3a**: Integrate `ShmRetryPolicy` into `ShmHandler.SendAsync` / `ShmControlHandler.SendAsync` retry loop
-- [ ] **P3b**: Apply exponential backoff + token-based throttling on retryable status codes
-- **Current state**: `ShmRetryPolicy`, `ShmRetryThrottling`, `ShmRetryState` all exist with full unit tests but are never invoked from the RPC call path.
+### P3: Wire Retry into Call Path ✅
+- [x] **P3a**: Integrate `ShmRetryPolicy` into `ShmHandler.SendAsync` / `ShmControlHandler.SendAsync` retry loop
+- [x] **P3b**: Apply exponential backoff + token-based throttling on retryable status codes
+- **Current state**: ~~`ShmRetryPolicy`, `ShmRetryThrottling`, `ShmRetryState` all exist with full unit tests but are never invoked from the RPC call path.~~ `ShmHandler` already had retry wiring. `ShmControlHandler` now has matching retry loop: constructor accepts `ShmRetryPolicy?`/`ShmRetryThrottling?`, `SendAsync` uses `ShmRetryState` with exponential backoff, trailing header inspection, and token-bucket throttling. All 23 retry tests pass.
 - **Verification**: `ShmRetryPolicyTests`, `ShmHedgingTests`, `Retrier.SharedMemory` example
 
 ### P4: Wire Telemetry Call Sites
