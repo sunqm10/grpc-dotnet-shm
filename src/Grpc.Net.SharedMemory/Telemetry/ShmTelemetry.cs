@@ -248,6 +248,16 @@ public static class ShmTelemetry
     }
 
     /// <summary>
+    /// Records a transport selection decision (SHM vs TCP fallback).
+    /// </summary>
+    public static void RecordTransportSelected(string transport, string target)
+    {
+        _errorsCounter.Add(0,
+            new KeyValuePair<string, object?>("type", $"transport_selected_{transport}"),
+            new KeyValuePair<string, object?>("message", target));
+    }
+
+    /// <summary>
     /// Updates the current BDP window estimate.
     /// </summary>
     public static void UpdateBdpWindow(long windowSize)
