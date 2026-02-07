@@ -22,6 +22,23 @@ using Grpc.Net.SharedMemory.Compression;
 namespace Grpc.Net.SharedMemory.Tests;
 
 /// <summary>
+/// Transport types for parameterized tests.
+/// Matches grpc-go-shmem's listTestEnv() pattern.
+/// </summary>
+public enum TransportKind
+{
+    /// <summary>
+    /// Shared memory transport via ShmConnection.
+    /// </summary>
+    Shm,
+
+    /// <summary>
+    /// TCP/HTTP2 transport via Kestrel (requires P6: server-side integration).
+    /// </summary>
+    Tcp
+}
+
+/// <summary>
 /// Base class for transport-parameterized tests.
 /// Provides shared memory connection setup/teardown that works on both Windows and Linux.
 /// This enables Go-style test parameterization: running the same tests over different transports.
@@ -29,10 +46,38 @@ namespace Grpc.Net.SharedMemory.Tests;
 /// <remarks>
 /// Equivalent to grpc-go-shmem's listTestEnv() which runs all TCP tests over shared memory too.
 /// Tests inheriting from this class will automatically run on both Windows and Linux.
+///
+/// Usage with parameterization:
+/// <code>
+/// [TestFixture(TransportKind.Shm)]
+/// // [TestFixture(TransportKind.Tcp)] // Uncomment when P6 (server integration) lands
+/// public class MyTests : TransportTestBase
+/// {
+///     public MyTests(TransportKind transport) : base(transport) { }
+/// }
+/// </code>
 /// </remarks>
 public abstract class TransportTestBase
 {
     private readonly List<IDisposable> _disposables = new();
+
+    /// <summary>
+    /// The transport being used for this test fixture instance.
+    /// </summary>
+    protected TransportKind Transport { get; }
+
+    /// <summary>
+    /// Creates a new TransportTestBase with SHM transport (default for non-parameterized use).
+    /// </summary>
+    protected TransportTestBase() : this(TransportKind.Shm) { }
+
+    /// <summary>
+    /// Creates a new TransportTestBase with the specified transport.
+    /// </summary>
+    protected TransportTestBase(TransportKind transport)
+    {
+        Transport = transport;
+    }
 
     /// <summary>
     /// Creates a server/client connection pair for testing.
@@ -47,6 +92,13 @@ public abstract class TransportTestBase
         uint maxStreams = 100,
         ShmCompressionOptions? compressionOptions = null)
     {
+        if (Transport == TransportKind.Tcp)
+        {
+            throw new NotSupportedException(
+                "TCP transport requires P6 (server-side ASP.NET Core integration). " +
+                "Use TransportKind.Shm or implement IConnectionListenerFactory first.");
+        }
+
         var segmentName = $"test_{Guid.NewGuid():N}";
         var server = ShmConnection.CreateAsServer(segmentName, ringCapacity, maxStreams, compressionOptions: compressionOptions);
         _disposables.Add(server);
@@ -64,6 +116,12 @@ public abstract class TransportTestBase
         ulong ringCapacity = 4096,
         uint maxStreams = 100)
     {
+        if (Transport == TransportKind.Tcp)
+        {
+            throw new NotSupportedException(
+                "TCP transport requires P6 (server-side ASP.NET Core integration).");
+        }
+
         var segmentName = $"test_{Guid.NewGuid():N}";
         var server = ShmConnection.CreateAsServer(segmentName, ringCapacity, maxStreams);
         _disposables.Add(server);
@@ -81,6 +139,12 @@ public abstract class TransportTestBase
         ulong ringCapacity = 4096,
         uint maxStreams = 100)
     {
+        if (Transport == TransportKind.Tcp)
+        {
+            throw new NotSupportedException(
+                "TCP transport requires P6 (server-side ASP.NET Core integration).");
+        }
+
         var segmentName = $"test_{Guid.NewGuid():N}";
         var server = ShmConnection.CreateAsServer(segmentName, ringCapacity, maxStreams);
         _disposables.Add(server);
