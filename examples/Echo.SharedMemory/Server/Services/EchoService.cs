@@ -19,7 +19,7 @@
 using Echo;
 using Grpc.Core;
 
-namespace Server;
+namespace Server.Services;
 
 public class EchoService : Echo.Echo.EchoBase
 {
@@ -30,32 +30,10 @@ public class EchoService : Echo.Echo.EchoBase
         _logger = logger;
     }
 
-    public override async Task<EchoResponse> UnaryEcho(EchoRequest request, ServerCallContext context)
+    public override Task<EchoResponse> UnaryEcho(EchoRequest request, ServerCallContext context)
     {
         _logger.LogInformation("UnaryEcho: {Message}", request.Message);
-
-        // Messages containing "delay" simulate a slow operation that exceeds the deadline
-        if (request.Message.Contains("delay"))
-        {
-            _logger.LogInformation("Delaying response for 2 seconds...");
-            await Task.Delay(2000, context.CancellationToken);
-        }
-
-        // Messages containing "[propagate me]" simulate deadline propagation
-        if (request.Message.Contains("[propagate me]"))
-        {
-            var idx = request.Message.IndexOf("[propagate me]") + "[propagate me]".Length;
-            var remaining = request.Message.Substring(idx);
-            _logger.LogInformation("Propagating request: {Remaining}", remaining);
-
-            // Double propagation will exceed deadline
-            if (remaining.Contains("[propagate me]"))
-            {
-                await Task.Delay(1500, context.CancellationToken);
-            }
-        }
-
-        return new EchoResponse { Message = request.Message };
+        return Task.FromResult(new EchoResponse { Message = request.Message });
     }
 
     public override async Task BidirectionalStreamingEcho(
@@ -63,7 +41,7 @@ public class EchoService : Echo.Echo.EchoBase
         IServerStreamWriter<EchoResponse> responseStream,
         ServerCallContext context)
     {
-        await foreach (var req in requestStream.ReadAllAsync())
+        await foreach (var req in requestStream.ReadAllAsync(context.CancellationToken))
         {
             _logger.LogInformation("BidirectionalStreamingEcho: {Message}", req.Message);
             await responseStream.WriteAsync(new EchoResponse { Message = req.Message });

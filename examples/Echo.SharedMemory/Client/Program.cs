@@ -21,11 +21,11 @@ using Grpc.Core;
 using Grpc.Net.Client;
 using Grpc.Net.SharedMemory;
 
-Console.WriteLine("Cancellation Example - Shared Memory Client");
-Console.WriteLine("============================================");
+Console.WriteLine("Echo Client - Shared Memory Transport");
+Console.WriteLine("=====================================");
 Console.WriteLine();
 
-const string SegmentName = "cancellation_shm_example";
+const string SegmentName = "echo_shm_example";
 
 Console.WriteLine($"Connecting to shared memory segment: {SegmentName}");
 Console.WriteLine("(Make sure the server is running first!)");
@@ -42,42 +42,51 @@ try
 
     var client = new Echo.Echo.EchoClient(channel);
 
-    // Demonstrate cancellation with bidirectional streaming
-    using var cts = new CancellationTokenSource();
+    // Demo 1: Unary echo
+    Console.WriteLine("=== Unary Echo ===");
+    var reply = await client.UnaryEchoAsync(new EchoRequest { Message = "Hello, shared memory!" });
+    Console.WriteLine($"Response: {reply.Message}");
 
-    using var call = client.BidirectionalStreamingEcho(cancellationToken: cts.Token);
+    Console.WriteLine();
 
-    // Send a few messages
-    for (var i = 1; i <= 3; i++)
+    // Demo 2: Bidirectional streaming echo
+    Console.WriteLine("=== Bidirectional Streaming Echo ===");
+
+    using var call = client.BidirectionalStreamingEcho();
+
+    // Start receiving in background
+    var receiveTask = Task.Run(async () =>
     {
-        var message = $"message {i}";
-        Console.WriteLine($"Sending: {message}");
+        await foreach (var response in call.ResponseStream.ReadAllAsync())
+        {
+            Console.WriteLine($"  Received: {response.Message}");
+        }
+    });
+
+    // Send messages
+    var messages = new[] { "First", "Second", "Third" };
+    foreach (var message in messages)
+    {
+        Console.WriteLine($"  Sending: {message}");
         await call.RequestStream.WriteAsync(new EchoRequest { Message = message });
         await Task.Delay(200);
     }
 
-    // Cancel the stream
-    Console.WriteLine("cancelling context");
-    cts.Cancel();
+    await call.RequestStream.CompleteAsync();
+    await receiveTask;
 
-    Console.WriteLine("Stream cancelled successfully");
-}
-catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled)
-{
-    Console.WriteLine("Stream was cancelled as expected");
-}
-catch (OperationCanceledException)
-{
-    Console.WriteLine("Stream was cancelled as expected");
+    Console.WriteLine();
+    Console.WriteLine("Echo example completed successfully!");
 }
 catch (Exception ex)
 {
     Console.WriteLine($"Error: {ex.Message}");
     Console.WriteLine();
     Console.WriteLine("Make sure the server is running first:");
-    Console.WriteLine("  cd examples/Cancellation.SharedMemory/Server");
+    Console.WriteLine("  cd examples/Echo.SharedMemory/Server");
     Console.WriteLine("  dotnet run");
 }
 
 Console.WriteLine();
-Console.WriteLine("Cancellation example completed!");
+Console.WriteLine("Press any key to exit...");
+Console.ReadKey();

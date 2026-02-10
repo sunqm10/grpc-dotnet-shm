@@ -17,22 +17,13 @@
 #endregion
 
 using Grpc.AspNetCore.Server.SharedMemory;
-using Server;
-
-const string SegmentName = "deadline_shm";
-
-Console.WriteLine("Deadline Example - Shared Memory Server");
-Console.WriteLine($"Segment: {SegmentName}");
-Console.WriteLine();
+using Server.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddGrpc();
-builder.WebHost.UseSharedMemory(SegmentName);
+builder.WebHost.UseSharedMemory("echo_shm_example");
 
 var app = builder.Build();
 app.MapGrpcService<EchoService>();
-
-Console.WriteLine("Server listening on shared memory segment: " + SegmentName);
-Console.WriteLine("Press Ctrl+C to stop the server.");
 
 await app.RunAsync();

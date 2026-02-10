@@ -1,20 +1,27 @@
 # Cancellation Shared Memory Example
 
-This example demonstrates client-side cancellation of RPC calls over shared memory transport.
+This example demonstrates client-side cancellation of gRPC calls over shared memory transport using the idiomatic `UseSharedMemory()` / `ShmHttpHandler` integration.
 
 ## Design
 
 Mirrors the Go grpc-go-shmem `examples/shm/features/cancellation` example.
 
 The client:
-- Starts a bidirectional streaming RPC
+- Creates a `GrpcChannel` with `ShmHttpHandler` for shared memory transport
+- Starts a bidirectional streaming RPC using generated gRPC stubs
 - Sends a few messages
-- Cancels the context mid-stream
-- Observes cancellation propagated to server
+- Cancels the `CancellationTokenSource` mid-stream
+- Observes cancellation propagated to the server
 
 The server:
+- Uses `UseSharedMemory()` on the `WebHost` for shared memory transport
+- Maps the `EchoService` with standard `MapGrpcService<T>()`
 - Receives messages until cancellation
 - Logs when cancellation is detected
+
+## Prerequisites
+
+- .NET 9.0 SDK or later
 
 ## Running
 
@@ -25,7 +32,7 @@ cd Server
 dotnet run
 ```
 
-### Start the client
+### Start the client (in a separate terminal)
 
 ```bash
 cd Client
@@ -36,17 +43,16 @@ dotnet run
 
 **Client:**
 ```
-Sending message 1
-Sending message 2
-Sending message 3
-Cancelling context
+Sending: message 1
+Sending: message 2
+Sending: message 3
+cancelling context
 Stream cancelled successfully
 ```
 
 **Server:**
 ```
-Received: message 1
-Received: message 2
-Received: message 3
-Server: error receiving from stream: context canceled
+BidirectionalStreamingEcho: message 1
+BidirectionalStreamingEcho: message 2
+BidirectionalStreamingEcho: message 3
 ```

@@ -10,12 +10,16 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\Echo.SharedMemory\Proto\Proto.csproj" />
-    <ProjectReference Include="..\..\..\src\Grpc.AspNetCore.Server.SharedMemory\Grpc.AspNetCore.Server.SharedMemory.csproj" />
+    <ProjectReference Include="..\Proto\Proto.csproj" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Grpc.AspNetCore" Version="2.70.0" />
+    <PackageReference Include="Grpc.Tools" Version="2.70.0" PrivateAssets="All" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\src\Grpc.AspNetCore.Server.SharedMemory\Grpc.AspNetCore.Server.SharedMemory.csproj" />
   </ItemGroup>
 
 </Project>

@@ -35,11 +35,11 @@ Console.WriteLine();
 
 try
 {
-    // Create a channel using the shared memory handler
-    using var handler = new ShmHandler(SegmentName);
-    using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
+    // Create a channel using the shared memory HTTP handler (Kestrel-based dialer)
+    using var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
     {
-        HttpHandler = handler
+        HttpHandler = new ShmHttpHandler(SegmentName),
+        DisposeHttpClient = true
     });
 
     var client = new Greeter.GreeterClient(channel);

@@ -198,9 +198,8 @@ public sealed class Segment : IDisposable
         }
 
         // Create ring buffers operating directly on mapped memory (zero-copy)
-        // isOwner=isServer so only the server sets Closed flag in shared memory
-        RingA = new ShmRing(_memory, (int)ringAOffset, ringACapacity, syncA, isOwner: isServer);
-        RingB = new ShmRing(_memory, (int)ringBOffset, ringBCapacity, syncB, isOwner: isServer);
+        RingA = new ShmRing(_memory, (int)ringAOffset, ringACapacity, syncA);
+        RingB = new ShmRing(_memory, (int)ringBOffset, ringBCapacity, syncB);
     }
 
     /// <summary>
@@ -507,12 +506,24 @@ public sealed class Segment : IDisposable
     /// <summary>
     /// Sets the ClientReady flag and signals waiting servers.
     /// </summary>
-    public void SetClientReady(bool ready)
+    public unsafe void SetClientReady(bool ready)
     {
         var span = _memory.Span;
         var value = ready ? 1u : 0u;
         BinaryPrimitives.WriteUInt32LittleEndian(span[0x44..0x48], value);
         Flush();
+        
+        // Wake any server waiting on the client ready flag using futex
+        // The Go server uses futexWait on this address, expecting a wake signal
+#if NET8_0_OR_GREATER
+        if (OperatingSystem.IsLinux())
+        {
+            fixed (byte* ptr = span)
+            {
+                Synchronization.LinuxRingSync.WakeOne(ptr + 0x44);
+            }
+        }
+#endif
     }
 
     /// <summary>
@@ -609,20 +620,22 @@ public sealed class Segment : IDisposable
     }
 
     /// <summary>
-    /// Unmaps the shared memory region without closing / cleaning up the backing file.
-    /// Used by clients that need to release the mapping while the server retains ownership.
+    /// Unmaps the segment without closing/modifying the ring buffers.
+    /// Use this for control segments where we don't want to affect the server's state.
     /// </summary>
     public void UnmapWithoutClose()
     {
         if (_disposed) return;
         _disposed = true;
 
-        RingA.Dispose();
-        RingB.Dispose();
+        // Don't dispose rings - that would close them and affect the server
+        // Just dispose sync primitives without closing
+        RingA.DisposeWithoutClose();
+        RingB.DisposeWithoutClose();
+        
         _memoryManager.Dispose();
         _accessor.Dispose();
         _mappedFile.Dispose();
-        // Intentionally do NOT delete the backing file
     }
 
     public void Dispose()
