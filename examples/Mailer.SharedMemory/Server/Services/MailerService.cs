@@ -18,6 +18,7 @@
 
 using Grpc.Core;
 using Mail;
+using Microsoft.Extensions.Logging;
 
 namespace Server;
 

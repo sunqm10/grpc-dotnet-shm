@@ -16,15 +16,23 @@
 
 #endregion
 
-using Grpc.AspNetCore.Server.SharedMemory;
+using Count;
+using Google.Protobuf.WellKnownTypes;
+using Grpc.Net.SharedMemory;
 using Server.Services;
 
-var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddSingleton<IncrementingCounter>();
-builder.Services.AddGrpc();
-builder.WebHost.UseSharedMemory("counter_shm_example");
+// Create dependencies (same as TCP Counter example)
+var counter = new IncrementingCounter();
+var service = new CounterService(counter);
 
-var app = builder.Build();
-app.MapGrpcService<CounterService>();
+// Create SHM gRPC server — direct SHM transport per A73
+await using var server = new ShmGrpcServer("counter_shm_example");
 
-await app.RunAsync();
+server.MapUnary<Empty, CounterReply>(
+    "/count.Counter/IncrementCount", service.IncrementCount);
+server.MapClientStreaming<CounterRequest, CounterReply>(
+    "/count.Counter/AccumulateCount", service.AccumulateCount);
+server.MapServerStreaming<Empty, CounterReply>(
+    "/count.Counter/Countdown", service.Countdown);
+
+await server.RunAsync();

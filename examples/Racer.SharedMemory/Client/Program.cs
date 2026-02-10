@@ -38,7 +38,7 @@ try
 {
     using var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
     {
-        HttpHandler = new ShmHttpHandler(SegmentName),
+        HttpHandler = new ShmControlHandler(SegmentName),
         DisposeHttpClient = true
     });
 

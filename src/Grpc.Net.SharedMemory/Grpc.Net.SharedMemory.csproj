@@ -27,6 +27,7 @@
 
   <ItemGroup>
     <!-- Use package references for initial development, will switch to project references later -->
+    <PackageReference Include="Google.Protobuf" Version="3.28.0" />
     <PackageReference Include="Grpc.Net.Client" Version="2.70.0" />
     <PackageReference Include="Grpc.Core.Api" Version="2.70.0" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="8.0.0" />

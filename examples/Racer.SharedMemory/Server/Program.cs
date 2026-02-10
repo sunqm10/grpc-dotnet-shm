@@ -16,14 +16,17 @@
 
 #endregion
 
-using Grpc.AspNetCore.Server.SharedMemory;
+using Grpc.Net.SharedMemory;
+using Race;
 using Server;
 
-var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddGrpc();
-builder.WebHost.UseSharedMemory("racer_shm_example");
+// Create the service (same implementation as the TCP Racer example)
+var service = new RacerService();
 
-var app = builder.Build();
-app.MapGrpcService<RacerService>();
+// Create SHM gRPC server — direct SHM transport per A73
+await using var server = new ShmGrpcServer("racer_shm_example");
 
-await app.RunAsync();
+server.MapDuplexStreaming<RaceMessage, RaceMessage>(
+    "/race.Racer/ReadySetGo", service.ReadySetGo);
+
+await server.RunAsync();

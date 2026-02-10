@@ -16,14 +16,19 @@
 
 #endregion
 
-using Grpc.AspNetCore.Server.SharedMemory;
+using Google.Protobuf.WellKnownTypes;
+using Grpc.Net.SharedMemory;
+using Microsoft.Extensions.Logging.Abstractions;
+using Progress;
 using Server;
 
-var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddGrpc();
-builder.WebHost.UseSharedMemory("progressor_shm_example");
+// Create the service (same implementation as the TCP Progressor example)
+var service = new ProgressorService(NullLoggerFactory.Instance);
 
-var app = builder.Build();
-app.MapGrpcService<ProgressorService>();
+// Create SHM gRPC server — direct SHM transport per A73
+await using var server = new ShmGrpcServer("progressor_shm_example");
 
-await app.RunAsync();
+server.MapServerStreaming<Empty, HistoryResponse>(
+    "/progress.Progressor/RunHistory", service.RunHistory);
+
+await server.RunAsync();

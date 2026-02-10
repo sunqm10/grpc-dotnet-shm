@@ -310,10 +310,16 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// </summary>
     public async IAsyncEnumerable<byte[]> ReceiveMessagesAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        while (!_halfCloseReceived && !_cancelled)
+        // Don't check _halfCloseReceived upfront — the frame reader may have already
+        // set it, but MESSAGE frames could still be queued in the inbound channel
+        // ahead of the HALF_CLOSE entry. Read from the channel until we encounter
+        // a terminal frame (HalfClose, Trailers, Cancel) or the channel is completed.
+        while (true)
         {
+            if (_cancelled) yield break;
+
             var frame = await ReceiveFrameAsync(cancellationToken);
-            if (frame == null) break;
+            if (frame == null) yield break;
 
             switch (frame.Value.Type)
             {

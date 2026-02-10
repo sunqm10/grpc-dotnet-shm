@@ -16,14 +16,20 @@
 
 #endregion
 
-using Grpc.AspNetCore.Server.SharedMemory;
+using Greet;
+using Grpc.Net.SharedMemory;
+using Microsoft.Extensions.Logging.Abstractions;
 using Server;
 
-var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddGrpc();
-builder.WebHost.UseSharedMemory("greeter_shm_example");
+// Create the service (same implementation as the TCP Greeter example)
+var service = new GreeterService(NullLoggerFactory.Instance);
 
-var app = builder.Build();
-app.MapGrpcService<GreeterService>();
+// Create SHM gRPC server — the only difference from TCP is using ShmGrpcServer
+// instead of WebApplication with Kestrel. Per A73, SHM transport exposes gRPC
+// semantics directly (headers, messages, trailers) without HTTP/2 framing.
+await using var server = new ShmGrpcServer("greeter_shm_example");
 
-await app.RunAsync();
+server.MapUnary<HelloRequest, HelloReply>(
+    "/greet.Greeter/SayHello", service.SayHello);
+
+await server.RunAsync();

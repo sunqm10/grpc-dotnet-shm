@@ -16,15 +16,19 @@
 
 #endregion
 
-using Grpc.AspNetCore.Server.SharedMemory;
+using Grpc.Net.SharedMemory;
+using Mail;
+using Microsoft.Extensions.Logging.Abstractions;
 using Server;
 
-var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddGrpc();
-builder.Services.AddSingleton<MailQueueRepository>();
-builder.WebHost.UseSharedMemory("mailer_shm_example");
+// Create dependencies (same as TCP Mailer example)
+var repo = new MailQueueRepository();
+var service = new MailerService(NullLoggerFactory.Instance, repo);
 
-var app = builder.Build();
-app.MapGrpcService<MailerService>();
+// Create SHM gRPC server — direct SHM transport per A73
+await using var server = new ShmGrpcServer("mailer_shm_example");
 
-await app.RunAsync();
+server.MapDuplexStreaming<ForwardMailMessage, MailboxMessage>(
+    "/mail.Mailer/Mailbox", service.Mailbox);
+
+await server.RunAsync();

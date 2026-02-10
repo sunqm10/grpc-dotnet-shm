@@ -16,14 +16,20 @@
 
 #endregion
 
-using Grpc.AspNetCore.Server.SharedMemory;
+using DataChannel;
+using Grpc.Net.SharedMemory;
+using Microsoft.Extensions.Logging.Abstractions;
 using Server;
 
-var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddGrpc();
-builder.WebHost.UseSharedMemory("channeler_shm_example");
+// Create the service (same implementation as the TCP Channeler example)
+var service = new DataChannelerService(NullLoggerFactory.Instance);
 
-var app = builder.Build();
-app.MapGrpcService<DataChannelerService>();
+// Create SHM gRPC server — direct SHM transport per A73
+await using var server = new ShmGrpcServer("channeler_shm_example");
 
-await app.RunAsync();
+server.MapClientStreaming<DataRequest, DataResult>(
+    "/data_channel.DataChanneler/UploadData", service.UploadData);
+server.MapServerStreaming<DataRequest, DataResult>(
+    "/data_channel.DataChanneler/DownloadResults", service.DownloadResults);
+
+await server.RunAsync();

@@ -104,15 +104,16 @@ public sealed class ShmControlHandler : HttpMessageHandler
                 Content = new ShmControlResponseContent(stream),
                 Version = new Version(2, 0)
             };
+            ((ShmControlResponseContent)response.Content).SetTrailingHeaders(response.TrailingHeaders);
 
             // Add response headers
             if (responseHeaders.Metadata != null)
             {
                 foreach (var kv in responseHeaders.Metadata)
                 {
-                    var values = kv.Values.Select(v => v is byte[] bytes
-                        ? Convert.ToBase64String(bytes)
-                        : v?.ToString() ?? "");
+                    var values = kv.Key.EndsWith("-bin", StringComparison.OrdinalIgnoreCase)
+                        ? kv.Values.Select(Convert.ToBase64String)
+                        : kv.Values.Select(v => System.Text.Encoding.UTF8.GetString(v));
                     response.Headers.TryAddWithoutValidation(kv.Key, values);
                 }
             }
@@ -421,11 +422,17 @@ public sealed class ShmControlHandler : HttpMessageHandler
 internal sealed class ShmControlResponseContent : HttpContent
 {
     private readonly ShmGrpcStream _stream;
+    private HttpHeaders? _trailingHeaders;
 
     public ShmControlResponseContent(ShmGrpcStream stream)
     {
         _stream = stream;
         Headers.ContentType = new MediaTypeHeaderValue("application/grpc");
+    }
+
+    internal void SetTrailingHeaders(HttpHeaders trailingHeaders)
+    {
+        _trailingHeaders = trailingHeaders;
     }
 
     protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context)
@@ -445,6 +452,28 @@ internal sealed class ShmControlResponseContent : HttpContent
 
             await stream.WriteAsync(header, cancellationToken).ConfigureAwait(false);
             await stream.WriteAsync(message, cancellationToken).ConfigureAwait(false);
+        }
+
+        // Surface gRPC trailers as HTTP trailing headers.
+        // This is critical for grpc-dotnet to inspect grpc-status.
+        if (_stream.Trailers != null && _trailingHeaders != null)
+        {
+            var trailers = _stream.Trailers;
+            _trailingHeaders.TryAddWithoutValidation("grpc-status", ((int)trailers.GrpcStatusCode).ToString());
+            if (!string.IsNullOrEmpty(trailers.GrpcStatusMessage))
+            {
+                _trailingHeaders.TryAddWithoutValidation("grpc-message", Uri.EscapeDataString(trailers.GrpcStatusMessage));
+            }
+            if (trailers.Metadata != null)
+            {
+                foreach (var kv in trailers.Metadata)
+                {
+                    var values = kv.Key.EndsWith("-bin", StringComparison.OrdinalIgnoreCase)
+                        ? kv.Values.Select(Convert.ToBase64String)
+                        : kv.Values.Select(v => System.Text.Encoding.UTF8.GetString(v));
+                    _trailingHeaders.TryAddWithoutValidation(kv.Key, values);
+                }
+            }
         }
     }
 

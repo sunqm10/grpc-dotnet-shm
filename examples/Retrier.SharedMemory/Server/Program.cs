@@ -16,14 +16,17 @@
 
 #endregion
 
-using Grpc.AspNetCore.Server.SharedMemory;
+using Grpc.Net.SharedMemory;
+using Retry;
 using Server.Services;
 
-var builder = WebApplication.CreateBuilder(args);
-builder.Services.AddGrpc();
-builder.WebHost.UseSharedMemory("retrier_shm_example");
+// Create the service (same implementation as the TCP Retrier example)
+var service = new RetrierService();
 
-var app = builder.Build();
-app.MapGrpcService<RetrierService>();
+// Create SHM gRPC server — direct SHM transport per A73
+await using var server = new ShmGrpcServer("retrier_shm_example");
 
-await app.RunAsync();
+server.MapUnary<Package, Response>(
+    "/retry.Retrier/DeliverPackage", service.DeliverPackage);
+
+await server.RunAsync();
