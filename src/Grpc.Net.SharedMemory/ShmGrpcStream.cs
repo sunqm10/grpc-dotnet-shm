@@ -22,15 +22,51 @@ using Grpc.Core;
 namespace Grpc.Net.SharedMemory;
 
 /// <summary>
+/// Lightweight struct carried through the inbound Channel to avoid LOH allocations.
+/// The payload is backed by either a pooled buffer or a ring reservation and
+/// must be released after consumption.
+/// </summary>
+public readonly struct InboundFrame
+{
+    public readonly FrameType Type;
+    private readonly FramePayload _payload;
+
+    public InboundFrame(FrameType type, FramePayload payload)
+    {
+        Type = type;
+        _payload = payload;
+    }
+
+    /// <summary>Exact-length view into the buffer.</summary>
+    public ReadOnlyMemory<byte> Memory => _payload.Memory;
+
+    public int Length => _payload.Length;
+
+    /// <summary>Returns the buffer to the pool or commits the ring read.</summary>
+    public void ReturnToPool()
+    {
+        _payload.Release();
+    }
+
+    /// <summary>Backward-compatible tuple deconstruction.</summary>
+    public void Deconstruct(out FrameType type, out byte[] payload)
+    {
+        type = Type;
+        payload = Memory.ToArray();
+    }
+}
+
+/// <summary>
 /// Represents a single gRPC stream (call) over a shared memory connection.
 /// Handles frame routing, flow control, and message sequencing for one RPC.
 /// </summary>
 public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 {
     private readonly ShmConnection _connection;
-    private readonly Channel<(FrameType Type, byte[] Payload)> _inboundFrames;
+    private readonly Channel<InboundFrame> _inboundFrames;
     private readonly CancellationTokenSource _disposeCts;
     private readonly SemaphoreSlim _sendLock;
+    private readonly SemaphoreSlim _sendWindowSignal;
 
     private HeadersV1? _requestHeaders;
     private HeadersV1? _responseHeaders;
@@ -91,13 +127,14 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         StreamId = streamId;
         _connection = connection;
         IsServerStream = isServerStream;
-        _inboundFrames = Channel.CreateUnbounded<(FrameType, byte[])>(new UnboundedChannelOptions
+        _inboundFrames = Channel.CreateUnbounded<InboundFrame>(new UnboundedChannelOptions
         {
             SingleReader = true,
             SingleWriter = true
         });
         _disposeCts = new CancellationTokenSource();
         _sendLock = new SemaphoreSlim(1, 1);
+        _sendWindowSignal = new SemaphoreSlim(0, int.MaxValue);
         _sendWindow = ShmConstants.InitialWindowSize;
     }
 
@@ -173,11 +210,13 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         while (Interlocked.Read(ref _sendWindow) < data.Length)
         {
             linkedCts.Token.ThrowIfCancellationRequested();
-            await Task.Delay(1, linkedCts.Token); // Simple backpressure
+            await _sendWindowSignal.WaitAsync(linkedCts.Token);
         }
 
         Interlocked.Add(ref _sendWindow, -data.Length);
-        await SendFrameAsync(FrameType.Message, 0, data.ToArray(), linkedCts.Token);
+        // Pass ReadOnlyMemory<byte> directly — no .ToArray() copy.
+        // The previous .ToArray() allocated a new byte[] (LOH at ≥85KB) on every send.
+        await SendFrameAsync(FrameType.Message, 0, data, linkedCts.Token);
     }
 
     /// <summary>
@@ -234,8 +273,8 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// <summary>
     /// Receives the next frame from the stream.
     /// </summary>
-    /// <returns>The frame type and payload, or null if the stream is closed.</returns>
-    public async Task<(FrameType Type, byte[] Payload)?> ReceiveFrameAsync(CancellationToken cancellationToken = default)
+    /// <returns>The frame, or null if the stream is closed.</returns>
+    public async Task<InboundFrame?> ReceiveFrameAsync(CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
         using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
@@ -277,9 +316,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
             if (frame.Value.Type == FrameType.Headers)
             {
-                _requestHeaders = HeadersV1.Decode(frame.Value.Payload);
+                _requestHeaders = HeadersV1.Decode(frame.Value.Memory.Span);
+                frame.Value.ReturnToPool();
                 return _requestHeaders;
             }
+
+            frame.Value.ReturnToPool();
         }
     }
 
@@ -299,21 +341,21 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
             if (frame.Value.Type == FrameType.Headers)
             {
-                _responseHeaders = HeadersV1.Decode(frame.Value.Payload);
+                _responseHeaders = HeadersV1.Decode(frame.Value.Memory.Span);
+                frame.Value.ReturnToPool();
                 return _responseHeaders;
             }
+
+            frame.Value.ReturnToPool();
         }
     }
 
     /// <summary>
     /// Receives messages from the stream.
+    /// Each yielded <c>byte[]</c> is an owned, exact-size array safe to hold indefinitely.
     /// </summary>
     public async IAsyncEnumerable<byte[]> ReceiveMessagesAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        // Don't check _halfCloseReceived upfront — the frame reader may have already
-        // set it, but MESSAGE frames could still be queued in the inbound channel
-        // ahead of the HALF_CLOSE entry. Read from the channel until we encounter
-        // a terminal frame (HalfClose, Trailers, Cancel) or the channel is completed.
         while (true)
         {
             if (_cancelled) yield break;
@@ -321,59 +363,142 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             var frame = await ReceiveFrameAsync(cancellationToken);
             if (frame == null) yield break;
 
-            switch (frame.Value.Type)
+            var f = frame.Value;
+            switch (f.Type)
             {
                 case FrameType.Message:
                     // Send window update
-                    var increment = (uint)frame.Value.Payload.Length;
+                    var increment = (uint)f.Length;
                     if (increment > 0)
                     {
                         _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0,
                             BitConverter.GetBytes(increment));
                     }
-                    yield return frame.Value.Payload;
+
+                    // Yield an owned copy so payload buffers can be released safely.
+                    var owned = f.Memory.ToArray();
+                    f.ReturnToPool();
+                    yield return owned;
                     break;
 
                 case FrameType.HalfClose:
+                    f.ReturnToPool();
                     _halfCloseReceived = true;
                     yield break;
 
                 case FrameType.Trailers:
-                    _trailers = TrailersV1.Decode(frame.Value.Payload);
+                    _trailers = TrailersV1.Decode(f.Memory.Span);
+                    f.ReturnToPool();
                     _halfCloseReceived = true;
                     yield break;
 
                 case FrameType.Cancel:
+                    f.ReturnToPool();
                     _cancelled = true;
                     yield break;
+
+                default:
+                    f.ReturnToPool();
+                    break;
             }
         }
     }
 
-    internal void OnFrameReceived(FrameHeader header, byte[] payload)
+    /// <summary>
+    /// Internal high-performance message receiver that yields <see cref="ReadOnlyMemory{T}"/>
+    /// views backed by pooled buffers or borrowed ring memory. The memory is only
+    /// valid until the next <c>MoveNextAsync</c> call — callers must copy any data
+    /// they need to retain.
+    /// Used by <see cref="ShmGrpcResponseStream"/> to avoid LOH allocations.
+    /// </summary>
+    internal async IAsyncEnumerable<ReadOnlyMemory<byte>> ReceiveMessageBuffersAsync([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        InboundFrame previousFrame = default;
+        try
+        {
+            while (true)
+            {
+                if (_cancelled) yield break;
+
+                var frame = await ReceiveFrameAsync(cancellationToken);
+                if (frame == null)
+                {
+                    yield break;
+                }
+
+                var f = frame.Value;
+                switch (f.Type)
+                {
+                    case FrameType.Message:
+                        // Return the PREVIOUS payload now that the consumer
+                        // has advanced past it.
+                        previousFrame.ReturnToPool();
+
+                        // Send window update
+                        var increment = (uint)f.Length;
+                        if (increment > 0)
+                        {
+                            _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0,
+                                BitConverter.GetBytes(increment));
+                        }
+
+                        previousFrame = f;
+                        yield return f.Memory;
+                        break;
+
+                    case FrameType.HalfClose:
+                        f.ReturnToPool();
+                        _halfCloseReceived = true;
+                        yield break;
+
+                    case FrameType.Trailers:
+                        _trailers = TrailersV1.Decode(f.Memory.Span);
+                        f.ReturnToPool();
+                        _halfCloseReceived = true;
+                        yield break;
+
+                    case FrameType.Cancel:
+                        f.ReturnToPool();
+                        _cancelled = true;
+                        yield break;
+
+                    default:
+                        f.ReturnToPool();
+                        break;
+                }
+            }
+        }
+        finally
+        {
+            previousFrame.ReturnToPool();
+        }
+    }
+
+    internal void OnFrameReceived(InboundFrame frame)
     {
         if (_disposed || _cancelled) return;
 
-        switch (header.Type)
+        switch (frame.Type)
         {
             case FrameType.Cancel:
                 _cancelled = true;
+                frame.ReturnToPool();
                 _inboundFrames.Writer.TryComplete();
                 break;
 
             case FrameType.HalfClose:
                 _halfCloseReceived = true;
-                _inboundFrames.Writer.TryWrite((header.Type, payload));
+                _inboundFrames.Writer.TryWrite(frame);
                 break;
 
             case FrameType.Trailers:
                 _halfCloseReceived = true;
-                _inboundFrames.Writer.TryWrite((header.Type, payload));
+                _inboundFrames.Writer.TryWrite(frame);
                 _inboundFrames.Writer.TryComplete();
                 break;
 
             default:
-                _inboundFrames.Writer.TryWrite((header.Type, payload));
+                _inboundFrames.Writer.TryWrite(frame);
                 break;
         }
     }
@@ -381,6 +506,10 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     internal void OnWindowUpdate(uint increment)
     {
         Interlocked.Add(ref _sendWindow, increment);
+        if (increment > 0)
+        {
+            _sendWindowSignal.Release();
+        }
     }
 
     /// <summary>
@@ -397,12 +526,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         }
     }
 
-    private async Task SendFrameAsync(FrameType type, byte flags, byte[] payload, CancellationToken cancellationToken = default)
+    private async Task SendFrameAsync(FrameType type, byte flags, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
     {
         await _sendLock.WaitAsync(cancellationToken);
         try
         {
-            _connection.SendFrame(type, StreamId, flags, payload);
+            _connection.SendFrame(type, StreamId, flags, payload.Span);
         }
         finally
         {
@@ -435,6 +564,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             _inboundFrames.Writer.TryComplete();
             _connection.RemoveStream(StreamId);
             _sendLock.Dispose();
+            _sendWindowSignal.Dispose();
             _disposeCts.Dispose();
         }
     }

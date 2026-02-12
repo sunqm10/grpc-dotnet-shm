@@ -30,7 +30,7 @@ using Microsoft.Extensions.Logging;
 // ============================================================================
 
 // Ensure enough thread pool threads for in-process client+server operation
-ThreadPool.SetMinThreads(32, 32);
+ThreadPool.SetMinThreads(200, 200);
 
 string outDir = Path.Combine("benchmark-shm", "out");
 string? platformOverride = null;
@@ -69,30 +69,34 @@ foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartShmEnv }
     Console.WriteLine();
 
     Console.WriteLine("  Unary ping-pong:");
-    Console.WriteLine($"  {"Payload",-12} {"Iters",-8} {"Avg µs",-14} {"Throughput MB/s",-18}");
-    Console.WriteLine("  " + new string('-', 52));
+    Console.WriteLine($"  {"Payload",-12} {"Iters",-8} {"Avg µs",-14} {"Throughput MB/s",-18} {"Gen0",-6} {"Gen1",-6} {"Gen2",-6}");
+    Console.WriteLine("  " + new string('-', 76));
 
     foreach (var size in sizes)
     {
         int iters = IterationsForSize(size);
         Console.Error.WriteLine($"  [DBG] Starting unary {FormatSize(size)} x{iters}...");
         Console.Error.Flush();
+        int gc0Before = GC.CollectionCount(0), gc1Before = GC.CollectionCount(1), gc2Before = GC.CollectionCount(2);
         var (avgUs, throughputMBps) = await MeasureUnary(env.Client, size, iters);
+        int gc0 = GC.CollectionCount(0) - gc0Before, gc1 = GC.CollectionCount(1) - gc1Before, gc2 = GC.CollectionCount(2) - gc2Before;
         unaryResults.Add(new BenchResult(env.Transport, size, iters, avgUs, throughputMBps));
-        Console.WriteLine($"  {FormatSize(size),-12} {iters,-8} {avgUs,-14:F3} {throughputMBps,-18:F3}");
+        Console.WriteLine($"  {FormatSize(size),-12} {iters,-8} {avgUs,-14:F3} {throughputMBps,-18:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
     }
     Console.WriteLine();
 
     Console.WriteLine("  Streaming ping-pong:");
-    Console.WriteLine($"  {"Payload",-12} {"Iters",-8} {"Avg µs",-14} {"Throughput MB/s",-18}");
-    Console.WriteLine("  " + new string('-', 52));
+    Console.WriteLine($"  {"Payload",-12} {"Iters",-8} {"Avg µs",-14} {"Throughput MB/s",-18} {"Gen0",-6} {"Gen1",-6} {"Gen2",-6}");
+    Console.WriteLine("  " + new string('-', 76));
 
     foreach (var size in sizes)
     {
         int iters = IterationsForSize(size);
+        int gc0Before = GC.CollectionCount(0), gc1Before = GC.CollectionCount(1), gc2Before = GC.CollectionCount(2);
         var (avgUs, throughputMBps) = await MeasureStreaming(env.Client, size, iters);
+        int gc0 = GC.CollectionCount(0) - gc0Before, gc1 = GC.CollectionCount(1) - gc1Before, gc2 = GC.CollectionCount(2) - gc2Before;
         streamingResults.Add(new BenchResult(env.Transport, size, iters, avgUs, throughputMBps));
-        Console.WriteLine($"  {FormatSize(size),-12} {iters,-8} {avgUs,-14:F3} {throughputMBps,-18:F3}");
+        Console.WriteLine($"  {FormatSize(size),-12} {iters,-8} {avgUs,-14:F3} {throughputMBps,-18:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
     }
     Console.WriteLine();
 }

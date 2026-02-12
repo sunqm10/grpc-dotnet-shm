@@ -27,6 +27,56 @@ using System.Buffers;
 public static class FrameProtocol
 {
     /// <summary>
+    /// Reads a frame and returns a payload wrapper that can either borrow ring memory
+    /// (when contiguous and allowed) or use a pooled buffer fallback.
+    /// </summary>
+    public static (FrameHeader Header, FramePayload Payload) ReadFramePayload(
+        ShmRing ring,
+        bool allowBorrowed,
+        CancellationToken cancellationToken = default)
+    {
+        while (true)
+        {
+            // Read frame header
+            var headerReservation = ring.ReserveRead(ShmConstants.FrameHeaderSize, cancellationToken);
+
+            Span<byte> headerBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
+            CopyFromReservation(headerReservation, headerBytes);
+            ring.CommitRead(headerReservation, ShmConstants.FrameHeaderSize);
+
+            var header = FrameHeader.DecodeFrom(headerBytes);
+
+            // Skip PAD frames
+            if (header.Type == FrameType.Pad)
+            {
+                if (header.Length > 0)
+                {
+                    var padReservation = ring.ReserveRead((int)header.Length, cancellationToken);
+                    ring.CommitRead(padReservation, (int)header.Length);
+                }
+                continue;
+            }
+
+            if (header.Length == 0)
+            {
+                return (header, FramePayload.Empty);
+            }
+
+            var payloadLength = (int)header.Length;
+            var payloadReservation = ring.ReserveRead(payloadLength, cancellationToken);
+
+            if (allowBorrowed && payloadReservation.Second.IsEmpty)
+            {
+                return (header, FramePayload.FromReservation(payloadReservation, payloadLength));
+            }
+
+            var payload = ArrayPool<byte>.Shared.Rent(payloadLength);
+            CopyFromReservation(payloadReservation, payload.AsSpan(0, payloadLength));
+            ring.CommitRead(payloadReservation, payloadLength);
+            return (header, FramePayload.FromPooled(payload, payloadLength));
+        }
+    }
+    /// <summary>
     /// Writes a frame (header + payload) to the ring buffer atomically.
     /// Blocks until space is available.
     /// </summary>

@@ -85,17 +85,36 @@ public sealed class ShmControlHandler : HttpMessageHandler
             // Send request headers
             await stream.SendRequestHeadersAsync(method, authority, metadata, deadline).ConfigureAwait(false);
 
-            // Send request body if present
+            // Send request body via a write-through stream that forwards each
+            // gRPC frame directly to SHM.  CopyToAsync must run in the background
+            // because PushStreamContent.SerializeToStreamAsync awaits CompleteTcs
+            // for streaming calls (it blocks until the client closes the request
+            // stream).  A single Task.Run + direct writes replaces the previous
+            // Pipe + 2×Task.Run approach, eliminating resource accumulation.
             if (request.Content != null)
             {
-                var bodyStream = await request.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-                await SendMessagesAsync(stream, bodyStream, cancellationToken).ConfigureAwait(false);
+                var writeStream = new ShmGrpcRequestStream(stream);
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await request.Content.CopyToAsync(writeStream, cancellationToken).ConfigureAwait(false);
+                        await stream.SendHalfCloseAsync().ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) { /* Normal cancellation */ }
+                    catch (ObjectDisposedException) { /* Call disposed */ }
+                    catch (Exception ex)
+                    {
+                        System.Diagnostics.Debug.WriteLine($"ShmControlHandler body send error: {ex.Message}");
+                    }
+                }, cancellationToken);
+            }
+            else
+            {
+                await stream.SendHalfCloseAsync().ConfigureAwait(false);
             }
 
-            // Signal end of request
-            await stream.SendHalfCloseAsync().ConfigureAwait(false);
-
-            // Wait for response headers
+            // Wait for response headers (server sends these before processing messages)
             var responseHeaders = await stream.ReceiveResponseHeadersAsync(cancellationToken).ConfigureAwait(false);
 
             // Create response with streaming content
@@ -284,47 +303,6 @@ public sealed class ShmControlHandler : HttpMessageHandler
         return (header, payload);
     }
 
-    private static async Task SendMessagesAsync(ShmGrpcStream stream, Stream bodyStream, CancellationToken cancellationToken)
-    {
-        // gRPC message format: [compressed:1][length:4][data:length]
-        var headerBuffer = new byte[5];
-
-        while (true)
-        {
-            // Read message header
-            var headerBytesRead = await ReadExactlyAsync(bodyStream, headerBuffer, cancellationToken).ConfigureAwait(false);
-            if (headerBytesRead == 0) break; // End of stream
-            if (headerBytesRead < 5) throw new InvalidDataException("Incomplete gRPC message header");
-
-            var compressed = headerBuffer[0] != 0;
-            var length = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(headerBuffer.AsSpan(1));
-
-            if (compressed)
-            {
-                throw new NotSupportedException("Compression not yet supported");
-            }
-
-            // Read message body
-            var messageBuffer = new byte[length];
-            var messageBytesRead = await ReadExactlyAsync(bodyStream, messageBuffer, cancellationToken).ConfigureAwait(false);
-            if (messageBytesRead < length) throw new InvalidDataException("Incomplete gRPC message body");
-
-            await stream.SendMessageAsync(messageBuffer, cancellationToken).ConfigureAwait(false);
-        }
-    }
-
-    private static async Task<int> ReadExactlyAsync(Stream stream, byte[] buffer, CancellationToken cancellationToken)
-    {
-        var totalRead = 0;
-        while (totalRead < buffer.Length)
-        {
-            var bytesRead = await stream.ReadAsync(buffer.AsMemory(totalRead), cancellationToken).ConfigureAwait(false);
-            if (bytesRead == 0) return totalRead;
-            totalRead += bytesRead;
-        }
-        return totalRead;
-    }
-
     private static Metadata? ExtractMetadata(HttpRequestHeaders headers)
     {
         var metadata = new Metadata();
@@ -417,14 +395,71 @@ public sealed class ShmControlHandler : HttpMessageHandler
 }
 
 /// <summary>
+/// Write-through stream that forwards each gRPC-framed message written by
+/// grpc-dotnet directly to ShmGrpcStream.SendMessageAsync — no intermediate
+/// Pipe or buffer copy.  grpc-dotnet always writes each gRPC message as a
+/// single WriteAsync call: [compressed:1][length:4][data].
+/// </summary>
+internal sealed class ShmGrpcRequestStream : Stream
+{
+    private readonly ShmGrpcStream _shmStream;
+
+    public ShmGrpcRequestStream(ShmGrpcStream shmStream)
+    {
+        _shmStream = shmStream;
+    }
+
+    public override bool CanRead => false;
+    public override bool CanSeek => false;
+    public override bool CanWrite => true;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+
+    public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        if (buffer.Length < 5) return; // ignore empty/partial writes
+
+        // Parse gRPC frame header
+        var span = buffer.Span;
+        var compressed = span[0] != 0;
+        if (compressed) throw new NotSupportedException("Compression not yet supported");
+
+        var length = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(span.Slice(1));
+
+        // Pass message body directly as a memory slice — no copy.
+        // The previous .ToArray() allocated a new byte[] (LOH at ≥85KB) on every send.
+        await _shmStream.SendMessageAsync(buffer.Slice(5, length), cancellationToken).ConfigureAwait(false);
+    }
+
+    public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        await WriteAsync(buffer.AsMemory(offset, count), cancellationToken).ConfigureAwait(false);
+    }
+
+    public override void Write(byte[] buffer, int offset, int count) =>
+        throw new NotSupportedException("Use WriteAsync.");
+
+    public override Task FlushAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+    public override void Flush() { }
+    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+}
+
+/// <summary>
 /// HttpContent implementation that reads response messages from a ShmGrpcStream.
+/// grpc-dotnet calls ReadAsStreamAsync (→ CreateContentReadStreamAsync) to get a
+/// stream it can incrementally read gRPC-framed messages from.  We return a
+/// lightweight wrapper that reads from ShmGrpcStream.ReceiveMessagesAsync()
+/// directly on the caller's thread — no Pipe, no Task.Run, no resource
+/// accumulation across thousands of calls.
 /// </summary>
 internal sealed class ShmControlResponseContent : HttpContent
 {
     private readonly ShmGrpcStream _stream;
     private HttpHeaders? _trailingHeaders;
 
-    public ShmControlResponseContent(ShmGrpcStream stream)
+    public ShmControlResponseContent(ShmGrpcStream stream, Task? bodySendTask = null)
     {
         _stream = stream;
         Headers.ContentType = new MediaTypeHeaderValue("application/grpc");
@@ -435,6 +470,11 @@ internal sealed class ShmControlResponseContent : HttpContent
         _trailingHeaders = trailingHeaders;
     }
 
+    protected override Task<Stream> CreateContentReadStreamAsync()
+    {
+        return Task.FromResult<Stream>(new ShmGrpcResponseStream(_stream, this));
+    }
+
     protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context)
     {
         await SerializeToStreamAsync(stream, context, CancellationToken.None).ConfigureAwait(false);
@@ -442,20 +482,20 @@ internal sealed class ShmControlResponseContent : HttpContent
 
     protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context, CancellationToken cancellationToken)
     {
-        // Write gRPC-format messages to the output stream
         await foreach (var message in _stream.ReceiveMessagesAsync(cancellationToken))
         {
-            // gRPC message format: [compressed:1][length:4][data]
             var header = new byte[5];
-            header[0] = 0; // Not compressed
+            header[0] = 0;
             System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(header.AsSpan(1), (uint)message.Length);
-
             await stream.WriteAsync(header, cancellationToken).ConfigureAwait(false);
             await stream.WriteAsync(message, cancellationToken).ConfigureAwait(false);
         }
 
-        // Surface gRPC trailers as HTTP trailing headers.
-        // This is critical for grpc-dotnet to inspect grpc-status.
+        ApplyTrailers();
+    }
+
+    internal void ApplyTrailers()
+    {
         if (_stream.Trailers != null && _trailingHeaders != null)
         {
             var trailers = _stream.Trailers;
@@ -480,7 +520,7 @@ internal sealed class ShmControlResponseContent : HttpContent
     protected override bool TryComputeLength(out long length)
     {
         length = -1;
-        return false; // Streaming content, length unknown
+        return false;
     }
 
     protected override void Dispose(bool disposing)
@@ -488,6 +528,130 @@ internal sealed class ShmControlResponseContent : HttpContent
         if (disposing)
         {
             _stream.Dispose();
+        }
+        base.Dispose(disposing);
+    }
+}
+
+/// <summary>
+/// A read-only stream that yields gRPC-framed messages from a ShmGrpcStream
+/// on the caller's thread (no background pump, no Pipe).  Each ReadAsync call
+/// writes the gRPC 5-byte header + message data directly into the caller's
+/// buffer — zero intermediate allocations on the hot path.
+///
+/// Previous implementation allocated <c>new byte[5 + message.Length]</c> per
+/// message, causing LOH allocations (and Gen2 GC pressure) at ≥85 KB payloads.
+/// </summary>
+internal sealed class ShmGrpcResponseStream : Stream
+{
+    private readonly IAsyncEnumerator<ReadOnlyMemory<byte>> _enumerator;
+    private readonly ShmControlResponseContent _content;
+    // Current message being served (raw payload from SHM ring, pooled buffer).
+    private ReadOnlyMemory<byte> _message;
+    private int _messageLength;
+    // How many bytes of the *logical* gRPC frame (5-byte header + message) have been served.
+    private int _frameOffset;
+    private bool _hasMessage;
+    private bool _completed;
+
+    public ShmGrpcResponseStream(ShmGrpcStream shmStream, ShmControlResponseContent content)
+    {
+        _enumerator = shmStream.ReceiveMessageBuffersAsync(CancellationToken.None).GetAsyncEnumerator();
+        _content = content;
+    }
+
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        if (buffer.Length == 0) return 0;
+        if (_completed) return 0;
+
+        // If we're mid-message, continue serving it.
+        if (_hasMessage && _frameOffset < 5 + _messageLength)
+        {
+            return ServeCurrentMessage(buffer.Span);
+        }
+
+        // Advance to the next message (previous pooled buffer is returned by the enumerator).
+        if (!await _enumerator.MoveNextAsync().ConfigureAwait(false))
+        {
+            _completed = true;
+            _content.ApplyTrailers();
+            return 0;
+        }
+
+        _message = _enumerator.Current;
+        _messageLength = _message.Length;
+        _frameOffset = 0;
+        _hasMessage = true;
+
+        return ServeCurrentMessage(buffer.Span);
+    }
+
+    /// <summary>
+    /// Writes portions of the logical gRPC frame [compressed:1][length:4][data]
+    /// directly into <paramref name="dest"/> without any intermediate allocation.
+    /// </summary>
+    private int ServeCurrentMessage(Span<byte> dest)
+    {
+        var totalFrameLen = 5 + _messageLength;
+        int written = 0;
+
+        // --- Serve the 5-byte gRPC header ---
+        if (_frameOffset < 5)
+        {
+            Span<byte> hdr = stackalloc byte[5];
+            hdr[0] = 0; // not compressed
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(hdr.Slice(1), (uint)_messageLength);
+
+            int hdrStart = _frameOffset;
+            int hdrRemaining = 5 - hdrStart;
+            int hdrToCopy = Math.Min(hdrRemaining, dest.Length);
+            hdr.Slice(hdrStart, hdrToCopy).CopyTo(dest);
+            written += hdrToCopy;
+            _frameOffset += hdrToCopy;
+
+            if (written >= dest.Length)
+                return written;
+        }
+
+        // --- Serve message data ---
+        if (_frameOffset >= 5 && _frameOffset < totalFrameLen)
+        {
+            int msgStart = _frameOffset - 5;
+            int msgRemaining = _messageLength - msgStart;
+            int toCopy = Math.Min(msgRemaining, dest.Length - written);
+            _message.Span.Slice(msgStart, toCopy).CopyTo(dest.Slice(written));
+            written += toCopy;
+            _frameOffset += toCopy;
+        }
+
+        return written;
+    }
+
+    public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        return await ReadAsync(buffer.AsMemory(offset, count), cancellationToken).ConfigureAwait(false);
+    }
+
+    public override int Read(byte[] buffer, int offset, int count) =>
+        throw new NotSupportedException("Use ReadAsync.");
+
+    public override void Flush() { }
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _enumerator.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
         base.Dispose(disposing);
     }
