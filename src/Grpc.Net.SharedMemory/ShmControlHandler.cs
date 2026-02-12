@@ -236,7 +236,7 @@ public sealed class ShmControlHandler : HttpMessageHandler
         }
     }
 
-    private static async Task WriteControlFrameAsync(ShmRing ring, FrameType type, byte[] payload, CancellationToken ct)
+    private static Task WriteControlFrameAsync(ShmRing ring, FrameType type, byte[] payload, CancellationToken ct)
     {
         var header = new FrameHeader
         {
@@ -247,38 +247,21 @@ public sealed class ShmControlHandler : HttpMessageHandler
         };
 
         var headerBytes = header.ToBytes();
-        var totalLength = headerBytes.Length + payload.Length;
-
-        // Wait for space
-        while (!ring.CanWrite(totalLength))
-        {
-            ct.ThrowIfCancellationRequested();
-            await Task.Delay(1, ct).ConfigureAwait(false);
-        }
-
-        // Write header and payload
+        // Write header and payload (ring.Write blocks until space is available)
         ring.Write(headerBytes, ct);
         if (payload.Length > 0)
         {
             ring.Write(payload, ct);
         }
+
+        return Task.CompletedTask;
     }
 
-    private static async Task<(FrameHeader header, Memory<byte> payload)> ReadControlFrameAsync(ShmRing ring, CancellationToken ct)
+    private static Task<(FrameHeader header, Memory<byte> payload)> ReadControlFrameAsync(ShmRing ring, CancellationToken ct)
     {
-        // Wait for header data
-        while (!ring.TryPeek(ShmConstants.FrameHeaderSize, out _))
-        {
-            ct.ThrowIfCancellationRequested();
-            await Task.Delay(1, ct).ConfigureAwait(false);
-        }
-
         // Read frame header
         var headerBuffer = new byte[ShmConstants.FrameHeaderSize];
-        if (!ring.TryRead(headerBuffer))
-        {
-            throw new InvalidOperationException("Failed to read frame header");
-        }
+        ReadExact(ring, headerBuffer, ct);
 
         var header = FrameHeader.Parse(headerBuffer);
 
@@ -286,21 +269,21 @@ public sealed class ShmControlHandler : HttpMessageHandler
         Memory<byte> payload = Memory<byte>.Empty;
         if (header.Length > 0)
         {
-            while (!ring.TryPeek((int)header.Length, out _))
-            {
-                ct.ThrowIfCancellationRequested();
-                await Task.Delay(1, ct).ConfigureAwait(false);
-            }
-
             var payloadBuffer = new byte[header.Length];
-            if (!ring.TryRead(payloadBuffer))
-            {
-                throw new InvalidOperationException("Failed to read frame payload");
-            }
+            ReadExact(ring, payloadBuffer, ct);
             payload = payloadBuffer;
         }
 
-        return (header, payload);
+        return Task.FromResult((header, payload));
+    }
+
+    private static void ReadExact(ShmRing ring, Span<byte> buffer, CancellationToken ct)
+    {
+        var read = 0;
+        while (read < buffer.Length)
+        {
+            read += ring.Read(buffer[read..], ct);
+        }
     }
 
     private static Metadata? ExtractMetadata(HttpRequestHeaders headers)

@@ -178,21 +178,11 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
         }
     }
 
-    private async Task<(FrameHeader header, Memory<byte> payload)> ReadControlFrameAsync(CancellationToken ct)
+    private Task<(FrameHeader header, Memory<byte> payload)> ReadControlFrameAsync(CancellationToken ct)
     {
-        // Wait for data to be available
-        while (!_controlRx.TryPeek(ShmConstants.FrameHeaderSize, out _))
-        {
-            ct.ThrowIfCancellationRequested();
-            await Task.Delay(1, ct).ConfigureAwait(false);
-        }
-
         // Read frame header
         var headerBuffer = new byte[ShmConstants.FrameHeaderSize];
-        if (!_controlRx.TryRead(headerBuffer))
-        {
-            throw new InvalidOperationException("Failed to read frame header");
-        }
+        ReadExact(_controlRx, headerBuffer, ct);
 
         var header = FrameHeader.Parse(headerBuffer);
 
@@ -200,24 +190,15 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
         Memory<byte> payload = Memory<byte>.Empty;
         if (header.Length > 0)
         {
-            while (!_controlRx.TryPeek((int)header.Length, out _))
-            {
-                ct.ThrowIfCancellationRequested();
-                await Task.Delay(1, ct).ConfigureAwait(false);
-            }
-
             var payloadBuffer = new byte[header.Length];
-            if (!_controlRx.TryRead(payloadBuffer))
-            {
-                throw new InvalidOperationException("Failed to read frame payload");
-            }
+            ReadExact(_controlRx, payloadBuffer, ct);
             payload = payloadBuffer;
         }
 
-        return (header, payload);
+        return Task.FromResult((header, payload));
     }
 
-    private async Task WriteControlFrameAsync(FrameType type, byte[] payload, CancellationToken ct)
+    private Task WriteControlFrameAsync(FrameType type, byte[] payload, CancellationToken ct)
     {
         var header = new FrameHeader
         {
@@ -228,20 +209,22 @@ public sealed class ShmControlListener : IDisposable, IAsyncDisposable
         };
 
         var headerBytes = header.ToBytes();
-        var totalLength = headerBytes.Length + payload.Length;
-
-        // Wait for space
-        while (!_controlTx.CanWrite(totalLength))
-        {
-            ct.ThrowIfCancellationRequested();
-            await Task.Delay(1, ct).ConfigureAwait(false);
-        }
-
-        // Write header and payload
+        // Write header and payload (ring.Write blocks until space is available)
         _controlTx.Write(headerBytes);
         if (payload.Length > 0)
         {
             _controlTx.Write(payload);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static void ReadExact(ShmRing ring, Span<byte> buffer, CancellationToken ct)
+    {
+        var read = 0;
+        while (read < buffer.Length)
+        {
+            read += ring.Read(buffer[read..], ct);
         }
     }
 
