@@ -372,13 +372,52 @@ public static class FrameProtocol
     }
 
     /// <summary>
-    /// Writes a MESSAGE frame.
+    /// Writes a MESSAGE frame, automatically chunking if the payload exceeds
+    /// the ring capacity. Matches grpc-go-shmem's writeFrameBuffersChunked.
     /// </summary>
     public static void WriteMessage(ShmRing ring, uint streamId, ReadOnlySpan<byte> data, bool isLast, CancellationToken cancellationToken = default)
     {
         var flags = isLast ? (byte)0 : MessageFlags.More;
-        var header = new FrameHeader(FrameType.Message, streamId, (uint)data.Length, flags);
-        WriteFrame(ring, header, data, cancellationToken);
+
+        // Calculate max payload per frame: half of ring capacity minus header, min 1KB
+        var cap = (int)ring.Capacity;
+        var maxFramePayload = cap / 2 - ShmConstants.FrameHeaderSize;
+        if (maxFramePayload < 1024)
+        {
+            maxFramePayload = 1024;
+        }
+
+        // Fast path: payload fits in a single frame
+        if (data.Length <= maxFramePayload)
+        {
+            var header = new FrameHeader(FrameType.Message, streamId, (uint)data.Length, flags);
+            WriteFrame(ring, header, data, cancellationToken);
+            return;
+        }
+
+        // Slow path: chunk the payload into multiple frames with MORE flag
+        var remaining = data;
+        while (remaining.Length > 0)
+        {
+            var chunkSize = Math.Min(maxFramePayload, remaining.Length);
+            var chunk = remaining[..chunkSize];
+            remaining = remaining[chunkSize..];
+
+            byte chunkFlags;
+            if (remaining.Length > 0)
+            {
+                // More chunks follow
+                chunkFlags = MessageFlags.More;
+            }
+            else
+            {
+                // Last chunk - use the original flags
+                chunkFlags = flags;
+            }
+
+            var header = new FrameHeader(FrameType.Message, streamId, (uint)chunkSize, chunkFlags);
+            WriteFrame(ring, header, chunk, cancellationToken);
+        }
     }
 
     /// <summary>

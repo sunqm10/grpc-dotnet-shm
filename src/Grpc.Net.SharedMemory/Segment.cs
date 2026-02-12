@@ -118,7 +118,7 @@ public struct SegmentHeader
 /// This implementation uses zero-copy memory access through <see cref="MappedMemoryManager"/>
 /// to operate directly on the memory-mapped region without intermediate buffer copies.
 /// </summary>
-public sealed class Segment : IDisposable
+public sealed partial class Segment : IDisposable
 {
     private const int ServerReadyOffset = 0x40;
     private const int ClientReadyOffset = 0x44;
@@ -645,6 +645,7 @@ public sealed class Segment : IDisposable
 
 #if WINDOWS
     [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static unsafe partial bool WaitOnAddress(void* address, void* compareAddress, IntPtr addressSize, uint milliseconds);
 
     [LibraryImport("kernel32.dll")]

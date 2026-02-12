@@ -332,6 +332,15 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     internal void SendFrame(FrameType type, uint streamId, byte flags, ReadOnlySpan<byte> payload)
     {
         ThrowIfDisposed();
+
+        // MESSAGE frames may exceed ring capacity and need chunking
+        if (type == FrameType.Message)
+        {
+            var isLast = (flags & MessageFlags.More) == 0;
+            FrameProtocol.WriteMessage(TxRing, streamId, payload, isLast, _disposeCts.Token);
+            return;
+        }
+
         var header = new FrameHeader(type, streamId, (uint)payload.Length, flags);
         FrameProtocol.WriteFrame(TxRing, header, payload, _disposeCts.Token);
     }

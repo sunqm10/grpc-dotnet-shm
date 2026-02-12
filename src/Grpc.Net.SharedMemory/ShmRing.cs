@@ -293,7 +293,14 @@ public sealed class ShmRing : IDisposable
                 // Signal space availability
                 if (bytesRead > 0)
                 {
+                    // Contiguity: always bump after any positive read (matches Go's ReadBlocking)
                     Interlocked.Increment(ref header.ContigSeq);
+                    if (Volatile.Read(ref header.ContigWaiters) > 0)
+                    {
+                        _sync?.SignalContig();
+                    }
+
+                    // Space: wake waiters if any are waiting
                     if (Volatile.Read(ref header.SpaceWaiters) > 0)
                     {
                         Interlocked.Increment(ref header.SpaceSeq);
@@ -524,7 +531,14 @@ public sealed class ShmRing : IDisposable
         // Signal space availability
         if (bytesConsumed > 0)
         {
+            // Contiguity: always bump after any positive read commit (matches Go's ReadCommit.Commit)
             Interlocked.Increment(ref header.ContigSeq);
+            if (Volatile.Read(ref header.ContigWaiters) > 0)
+            {
+                _sync?.SignalContig();
+            }
+
+            // Space: wake waiters if any are waiting
             if (Volatile.Read(ref header.SpaceWaiters) > 0)
             {
                 Interlocked.Increment(ref header.SpaceSeq);
@@ -613,37 +627,74 @@ public sealed class ShmRing : IDisposable
         var reducedCutoff = (7 * spinLimit + ShmConstants.SpinIterationsMin) / 8;
         Volatile.Write(ref _spaceSpinCutoff, Math.Max(ShmConstants.SpinIterationsMin, reducedCutoff));
 
-        // Block on sync primitive
-        Interlocked.Increment(ref header.SpaceWaiters);
-        try
-        {
-            var seq = Volatile.Read(ref header.SpaceSeq);
+        // Distinguish full vs partial: if ring is completely full, wait on spaceSeq
+        // (bumped only when transitioning from full to not-full). If ring has some
+        // space but not enough, wait on contigSeq (bumped on every read commit),
+        // matching grpc-go-shmem's ReserveWrite behavior.
+        var writeIdx2 = Volatile.Read(ref header.WriteIdx);
+        var readIdx2 = Volatile.Read(ref header.ReadIdx);
+        var free = _capacity - (writeIdx2 - readIdx2);
 
-            // Re-check before blocking
-            var writeIdx = Volatile.Read(ref header.WriteIdx);
-            var readIdx = Volatile.Read(ref header.ReadIdx);
-            if (_capacity - (writeIdx - readIdx) >= needed)
+        if (free == 0)
+        {
+            // Ring is completely full - wait on spaceSeq
+            Interlocked.Increment(ref header.SpaceWaiters);
+            try
             {
-                return;
-            }
+                var seq = Volatile.Read(ref header.SpaceSeq);
 
-            _sync?.WaitForSpace(seq, TimeSpan.FromMilliseconds(100), cancellationToken);
+                // Re-check before blocking
+                var wi = Volatile.Read(ref header.WriteIdx);
+                var ri = Volatile.Read(ref header.ReadIdx);
+                if (_capacity - (wi - ri) >= needed)
+                {
+                    return;
+                }
+
+                _sync?.WaitForSpace(seq, TimeSpan.FromMilliseconds(100), cancellationToken);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref header.SpaceWaiters);
+            }
         }
-        finally
+        else
         {
-            Interlocked.Decrement(ref header.SpaceWaiters);
+            // Ring has some space but not enough - wait on contigSeq
+            // (contiguity-improving reads may free enough space)
+            Interlocked.Increment(ref header.ContigWaiters);
+            try
+            {
+                var seq = Volatile.Read(ref header.ContigSeq);
+
+                // Re-check before blocking
+                var wi = Volatile.Read(ref header.WriteIdx);
+                var ri = Volatile.Read(ref header.ReadIdx);
+                if (_capacity - (wi - ri) >= needed)
+                {
+                    return;
+                }
+
+                _sync?.WaitForContig(seq, TimeSpan.FromMilliseconds(100), cancellationToken);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref header.ContigWaiters);
+            }
         }
     }
 
     private void WaitForData(ref RingHeader header, CancellationToken cancellationToken)
     {
-        // Adaptive spin before blocking
+        // Use pendingReadIdx (not shared readIdx) for availability checks.
+        // This matches grpc-go-shmem's ReadSlices which uses pendingReadIdx to
+        // avoid false positives when borrowed payloads hold readIdx behind.
         var spinLimit = Volatile.Read(ref _dataSpinCutoff);
         for (var i = 0; i < spinLimit; i++)
         {
             var writeIdx = Volatile.Read(ref header.WriteIdx);
-            var readIdx = Volatile.Read(ref header.ReadIdx);
-            if (writeIdx > readIdx)
+            var pendingIdx = Volatile.Read(ref _pendingReadIdx);
+            if (writeIdx > pendingIdx)
             {
                 // Success - adapt spin limit upward
                 if (i > 0)
@@ -672,12 +723,18 @@ public sealed class ShmRing : IDisposable
         {
             var seq = Volatile.Read(ref header.DataSeq);
 
-            // Re-check before blocking
+            // Re-check using pendingReadIdx before blocking
             var writeIdx = Volatile.Read(ref header.WriteIdx);
-            var readIdx = Volatile.Read(ref header.ReadIdx);
-            if (writeIdx > readIdx)
+            var pendingIdx = Volatile.Read(ref _pendingReadIdx);
+            if (writeIdx > pendingIdx)
             {
                 return;
+            }
+
+            // Also check if closed to avoid missing close that happened between checks
+            if (header.Closed != 0 || _localClosed)
+            {
+                throw new RingClosedException();
             }
 
             _sync?.WaitForData(seq, TimeSpan.FromMilliseconds(100), cancellationToken);
@@ -807,6 +864,10 @@ public sealed class ShmRing : IDisposable
         if (buffer.Length > 0)
         {
             Interlocked.Increment(ref header.ContigSeq);
+            if (Volatile.Read(ref header.ContigWaiters) > 0)
+            {
+                _sync?.SignalContig();
+            }
             if (Volatile.Read(ref header.SpaceWaiters) > 0)
             {
                 Interlocked.Increment(ref header.SpaceSeq);

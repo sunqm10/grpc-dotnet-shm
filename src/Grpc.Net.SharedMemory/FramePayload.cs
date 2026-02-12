@@ -24,7 +24,7 @@ namespace Grpc.Net.SharedMemory;
 /// Frame payload wrapper that either owns a pooled buffer or a ring reservation.
 /// Call <see cref="Release"/> to return buffers or commit the ring read.
 /// </summary>
-internal readonly struct FramePayload
+public readonly struct FramePayload
 {
     public static readonly FramePayload Empty = new(ReadOnlyMemory<byte>.Empty, null, default, false);
 

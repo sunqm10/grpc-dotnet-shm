@@ -29,7 +29,7 @@ namespace Grpc.Net.SharedMemory.Synchronization;
 /// Uses auto-reset events for cross-process signaling.
 /// </summary>
 [SupportedOSPlatform("windows")]
-internal sealed partial class WindowsRingSync : IRingSync
+internal sealed unsafe partial class WindowsRingSync : IRingSync
 {
     private const int DataSeqOffset = 0x18;
     private const int SpaceSeqOffset = 0x1C;
@@ -41,9 +41,9 @@ internal sealed partial class WindowsRingSync : IRingSync
     private readonly EventWaitHandle _dataWaitHandle;
     private readonly EventWaitHandle _spaceWaitHandle;
     private readonly EventWaitHandle _contigWaitHandle;
-    private readonly unsafe uint* _dataSeqPtr;
-    private readonly unsafe uint* _spaceSeqPtr;
-    private readonly unsafe uint* _contigSeqPtr;
+    private readonly uint* _dataSeqPtr;
+    private readonly uint* _spaceSeqPtr;
+    private readonly uint* _contigSeqPtr;
     private readonly bool _useWaitOnAddress;
     private bool _disposed;
 
@@ -149,10 +149,7 @@ internal sealed partial class WindowsRingSync : IRingSync
     {
         if (_useWaitOnAddress)
         {
-            unsafe
-            {
-                WakeByAddressSingle(_dataSeqPtr);
-            }
+            WakeByAddressSingle(_dataSeqPtr);
             return;
         }
 
@@ -163,10 +160,7 @@ internal sealed partial class WindowsRingSync : IRingSync
     {
         if (_useWaitOnAddress)
         {
-            unsafe
-            {
-                WakeByAddressSingle(_spaceSeqPtr);
-            }
+            WakeByAddressSingle(_spaceSeqPtr);
             return;
         }
 
@@ -177,10 +171,7 @@ internal sealed partial class WindowsRingSync : IRingSync
     {
         if (_useWaitOnAddress)
         {
-            unsafe
-            {
-                WakeByAddressSingle(_contigSeqPtr);
-            }
+            WakeByAddressSingle(_contigSeqPtr);
             return;
         }
 
@@ -256,11 +247,11 @@ internal sealed partial class WindowsRingSync : IRingSync
     }
 
     [LibraryImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static unsafe partial bool WaitOnAddress(void* address, void* compareAddress, IntPtr addressSize, uint milliseconds);
 
     [LibraryImport("kernel32.dll")]
     private static unsafe partial void WakeByAddressSingle(void* address);
-    }
 }
 
 #endif
