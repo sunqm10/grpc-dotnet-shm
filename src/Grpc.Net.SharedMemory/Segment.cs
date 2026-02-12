@@ -120,6 +120,9 @@ public struct SegmentHeader
 /// </summary>
 public sealed class Segment : IDisposable
 {
+    private const int ServerReadyOffset = 0x40;
+    private const int ClientReadyOffset = 0x44;
+
     private readonly MemoryMappedFile _mappedFile;
     private readonly MemoryMappedViewAccessor _accessor;
     private readonly MappedMemoryManager _memoryManager;
@@ -500,8 +503,12 @@ public sealed class Segment : IDisposable
     {
         var span = _memory.Span;
         var value = ready ? 1u : 0u;
-        BinaryPrimitives.WriteUInt32LittleEndian(span[0x40..0x44], value);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[ServerReadyOffset..(ServerReadyOffset + sizeof(uint))], value);
         Flush();
+        if (ready)
+        {
+            SignalHeaderFlagWaiters(ServerReadyOffset);
+        }
     }
 
     /// <summary>
@@ -511,8 +518,12 @@ public sealed class Segment : IDisposable
     {
         var span = _memory.Span;
         var value = ready ? 1u : 0u;
-        BinaryPrimitives.WriteUInt32LittleEndian(span[0x44..0x48], value);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[ClientReadyOffset..(ClientReadyOffset + sizeof(uint))], value);
         Flush();
+        if (ready)
+        {
+            SignalHeaderFlagWaiters(ClientReadyOffset);
+        }
     }
 
     /// <summary>
@@ -521,7 +532,7 @@ public sealed class Segment : IDisposable
     public bool IsServerReady()
     {
         var span = _memory.Span;
-        return BinaryPrimitives.ReadUInt32LittleEndian(span[0x40..0x44]) != 0;
+        return BinaryPrimitives.ReadUInt32LittleEndian(span[ServerReadyOffset..(ServerReadyOffset + sizeof(uint))]) != 0;
     }
 
     /// <summary>
@@ -530,7 +541,7 @@ public sealed class Segment : IDisposable
     public bool IsClientReady()
     {
         var span = _memory.Span;
-        return BinaryPrimitives.ReadUInt32LittleEndian(span[0x44..0x48]) != 0;
+        return BinaryPrimitives.ReadUInt32LittleEndian(span[ClientReadyOffset..(ClientReadyOffset + sizeof(uint))]) != 0;
     }
 
     /// <summary>
@@ -538,11 +549,7 @@ public sealed class Segment : IDisposable
     /// </summary>
     public async Task WaitForServerAsync(CancellationToken cancellationToken = default)
     {
-        while (!IsServerReady())
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            await Task.Delay(1, cancellationToken).ConfigureAwait(false);
-        }
+        await WaitForHeaderFlagAsync(ServerReadyOffset, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -550,12 +557,139 @@ public sealed class Segment : IDisposable
     /// </summary>
     public async Task WaitForClientAsync(CancellationToken cancellationToken = default)
     {
-        while (!IsClientReady())
+        await WaitForHeaderFlagAsync(ClientReadyOffset, cancellationToken).ConfigureAwait(false);
+    }
+
+    private Task WaitForHeaderFlagAsync(int offset, CancellationToken cancellationToken)
+    {
+        if (IsHeaderFlagSet(offset))
+        {
+            return Task.CompletedTask;
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            return Task.Run(() => WaitHeaderFlagWindows(offset, cancellationToken), cancellationToken);
+        }
+
+        if (OperatingSystem.IsLinux())
+        {
+            return Task.Run(() => WaitHeaderFlagLinux(offset, cancellationToken), cancellationToken);
+        }
+
+        return WaitHeaderFlagPollingAsync(offset, cancellationToken);
+    }
+
+    private bool IsHeaderFlagSet(int offset)
+    {
+        var span = _memory.Span;
+        return BinaryPrimitives.ReadUInt32LittleEndian(span[offset..(offset + sizeof(uint))]) != 0;
+    }
+
+    private async Task WaitHeaderFlagPollingAsync(int offset, CancellationToken cancellationToken)
+    {
+        while (!IsHeaderFlagSet(offset))
         {
             cancellationToken.ThrowIfCancellationRequested();
             await Task.Delay(1, cancellationToken).ConfigureAwait(false);
         }
     }
+
+    private unsafe void WaitHeaderFlagWindows(int offset, CancellationToken cancellationToken)
+    {
+#if WINDOWS
+        var flagPtr = _memoryManager.GetUInt32Pointer(offset);
+        while (Volatile.Read(ref *flagPtr) == 0)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var compare = 0u;
+            WaitOnAddress(flagPtr, &compare, (IntPtr)sizeof(uint), 100);
+        }
+#else
+        throw new PlatformNotSupportedException("Windows readiness wait is not available on this platform.");
+#endif
+    }
+
+    private unsafe void WaitHeaderFlagLinux(int offset, CancellationToken cancellationToken)
+    {
+#if LINUX
+        var flagPtr = _memoryManager.GetUInt32Pointer(offset);
+        while (Volatile.Read(ref *flagPtr) == 0)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            FutexWait(flagPtr, 0, 100);
+        }
+#else
+        throw new PlatformNotSupportedException("Linux readiness wait is not available on this platform.");
+#endif
+    }
+
+    private unsafe void SignalHeaderFlagWaiters(int offset)
+    {
+        var flagPtr = _memoryManager.GetUInt32Pointer(offset);
+#if WINDOWS
+        if (OperatingSystem.IsWindows())
+        {
+            WakeByAddressSingle(flagPtr);
+            return;
+        }
+#endif
+
+#if LINUX
+        if (OperatingSystem.IsLinux())
+        {
+            FutexWake(flagPtr);
+        }
+#endif
+    }
+
+#if WINDOWS
+    [LibraryImport("kernel32.dll", SetLastError = true)]
+    private static unsafe partial bool WaitOnAddress(void* address, void* compareAddress, IntPtr addressSize, uint milliseconds);
+
+    [LibraryImport("kernel32.dll")]
+    private static unsafe partial void WakeByAddressSingle(void* address);
+#endif
+
+#if LINUX
+    private const int FutexWaitOp = 0;
+    private const int FutexWakeOp = 1;
+    private const int SysFutex = 202;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Timespec
+    {
+        public long tv_sec;
+        public long tv_nsec;
+    }
+
+    [LibraryImport("libc", SetLastError = true)]
+    private static unsafe partial long syscall(long number, uint* uaddr, int futex_op, uint val, Timespec* timeout, uint* uaddr2, uint val3);
+
+    private static unsafe void FutexWait(uint* address, uint expected, int timeoutMs)
+    {
+        Timespec ts;
+        if (timeoutMs <= 0)
+        {
+            ts = default;
+        }
+        else
+        {
+            ts = new Timespec
+            {
+                tv_sec = timeoutMs / 1000,
+                tv_nsec = (timeoutMs % 1000) * 1_000_000
+            };
+        }
+
+        syscall(SysFutex, address, FutexWaitOp, expected, timeoutMs <= 0 ? null : &ts, null, 0);
+    }
+
+    private static unsafe void FutexWake(uint* address)
+    {
+        syscall(SysFutex, address, FutexWakeOp, 1, null, null, 0);
+    }
+#endif
 
     /// <summary>
     /// Tries to delete a segment file if it exists.
