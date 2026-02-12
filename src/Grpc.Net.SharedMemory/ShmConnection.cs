@@ -464,6 +464,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         }
     }
 
+
     /// <summary>
     /// Handles an incoming HEADERS frame.
     /// For server: creates a new stream from client request.
