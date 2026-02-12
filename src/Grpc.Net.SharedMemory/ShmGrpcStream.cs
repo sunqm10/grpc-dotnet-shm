@@ -476,7 +476,11 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
     internal void OnFrameReceived(InboundFrame frame)
     {
-        if (_disposed || _cancelled) return;
+        if (_disposed || _cancelled)
+        {
+            frame.ReturnToPool();
+            return;
+        }
 
         switch (frame.Type)
         {
@@ -484,6 +488,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 _cancelled = true;
                 frame.ReturnToPool();
                 _inboundFrames.Writer.TryComplete();
+                _connection.RemoveStream(StreamId);
                 break;
 
             case FrameType.HalfClose:
@@ -495,6 +500,10 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 _halfCloseReceived = true;
                 _inboundFrames.Writer.TryWrite(frame);
                 _inboundFrames.Writer.TryComplete();
+                // Auto-remove from connection to prevent accumulation when
+                // callers don't dispose the stream (e.g., undisposed AsyncUnaryCall).
+                // No more frames will arrive after TRAILERS.
+                _connection.RemoveStream(StreamId);
                 break;
 
             default:

@@ -75,6 +75,7 @@ var unaryResults = new List<BenchResult>();
 var streamingResults = new List<BenchResult>();
 
 // Run each transport independently to avoid idle-spin stack buildup in SHM frame reader
+#pragma warning disable CS8321
 foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartShmEnv })
 {
     BenchEnv env;
@@ -101,8 +102,6 @@ foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartShmEnv }
     foreach (var size in sizes)
     {
         int iters = IterationsForSize(size);
-        Console.Error.WriteLine($"  [DBG] Starting unary {FormatSize(size)} x{iters}...");
-        Console.Error.Flush();
         int gc0Before = GC.CollectionCount(0), gc1Before = GC.CollectionCount(1), gc2Before = GC.CollectionCount(2);
         var (avgUs, throughputMBps) = await MeasureUnary(env.Client, size, iters);
         int gc0 = GC.CollectionCount(0) - gc0Before, gc1 = GC.CollectionCount(1) - gc1Before, gc2 = GC.CollectionCount(2) - gc2Before;
@@ -253,7 +252,10 @@ async Task<BenchEnv> StartShmEnv()
     var cts = new CancellationTokenSource();
     Console.Error.WriteLine("[DIAG] Starting SHM server...");
     Console.Error.Flush();
-    var serverTask = server.RunAsync(cts.Token);
+    // RunAsync blocks synchronously inside ring.Read() waiting for a client
+    // CONNECT frame — offload to a thread pool thread so the caller can proceed
+    // to create the client channel and initiate the connection.
+    var serverTask = Task.Run(() => server.RunAsync(cts.Token));
 
     // Give server time to set up control segment
     await Task.Delay(500);
@@ -319,19 +321,13 @@ static async Task<(double avgUs, double throughputMBps)> MeasureUnary(
     var req = new SimpleRequest { ResponseSize = payloadSize, Payload = payload };
 
     // Warmup
-    Console.Error.Write($"    warmup...");
-    Console.Error.Flush();
     for (int i = 0; i < Math.Min(10, iterations / 10 + 1); i++)
         await client.UnaryCallAsync(req);
-    Console.Error.Write($"timed({iterations})...");
-    Console.Error.Flush();
 
     var sw = Stopwatch.StartNew();
     for (int i = 0; i < iterations; i++)
         await client.UnaryCallAsync(req);
     sw.Stop();
-    Console.Error.WriteLine("done");
-    Console.Error.Flush();
 
     double totalUs = sw.Elapsed.TotalMicroseconds;
     double avgUs = totalUs / iterations;

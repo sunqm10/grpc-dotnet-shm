@@ -47,6 +47,10 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     private uint _connInFlowLimit;
     private uint _connInFlowUnacked;
     private readonly object _flowControlLock = new();
+
+    // Write lock: the SPSC ring buffer requires single-producer semantics.
+    // All writes to TxRing must be serialized through this lock.
+    private readonly object _txLock = new();
     private readonly SemaphoreSlim _quotaSignal = new(0);
 
     // BDP estimation (A73 RFC Phase 5)
@@ -306,7 +310,10 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
         try
         {
-            FrameProtocol.WriteGoAway(TxRing, GoAwayFlags.Draining, message, _disposeCts.Token);
+            lock (_txLock)
+            {
+                FrameProtocol.WriteGoAway(TxRing, GoAwayFlags.Draining, message, _disposeCts.Token);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -321,7 +328,10 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     {
         ThrowIfDisposed();
         var pingData = BitConverter.GetBytes(Environment.TickCount64);
-        FrameProtocol.WritePing(TxRing, 0, pingData, _disposeCts.Token);
+        lock (_txLock)
+        {
+            FrameProtocol.WritePing(TxRing, 0, pingData, _disposeCts.Token);
+        }
     }
 
     internal void RemoveStream(uint streamId)
@@ -333,16 +343,19 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     {
         ThrowIfDisposed();
 
-        // MESSAGE frames may exceed ring capacity and need chunking
-        if (type == FrameType.Message)
+        lock (_txLock)
         {
-            var isLast = (flags & MessageFlags.More) == 0;
-            FrameProtocol.WriteMessage(TxRing, streamId, payload, isLast, _disposeCts.Token);
-            return;
-        }
+            // MESSAGE frames may exceed ring capacity and need chunking
+            if (type == FrameType.Message)
+            {
+                var isLast = (flags & MessageFlags.More) == 0;
+                FrameProtocol.WriteMessage(TxRing, streamId, payload, isLast, _disposeCts.Token);
+                return;
+            }
 
-        var header = new FrameHeader(type, streamId, (uint)payload.Length, flags);
-        FrameProtocol.WriteFrame(TxRing, header, payload, _disposeCts.Token);
+            var header = new FrameHeader(type, streamId, (uint)payload.Length, flags);
+            FrameProtocol.WriteFrame(TxRing, header, payload, _disposeCts.Token);
+        }
     }
 
     private async Task FrameReaderLoopAsync()

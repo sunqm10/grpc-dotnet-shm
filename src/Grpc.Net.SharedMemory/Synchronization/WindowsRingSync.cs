@@ -83,7 +83,14 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
     {
         ArgumentNullException.ThrowIfNull(memoryManager);
 
-        _useWaitOnAddress = true;
+        // WaitOnAddress/WakeByAddressSingle match on virtual addresses.
+        // When client and server use separate memory mappings of the same
+        // shared memory segment (different MemoryMappedViewAccessor instances),
+        // their virtual addresses differ, so wakes never reach the waiters.
+        // This applies to both in-process and cross-process scenarios.
+        // Named events (used when _useWaitOnAddress is false) work correctly
+        // across any process/mapping boundary.
+        _useWaitOnAddress = false;
         _dataSeqPtr = memoryManager.GetUInt32Pointer(ringHeaderOffset + DataSeqOffset);
         _spaceSeqPtr = memoryManager.GetUInt32Pointer(ringHeaderOffset + SpaceSeqOffset);
         _contigSeqPtr = memoryManager.GetUInt32Pointer(ringHeaderOffset + ContigSeqOffset);
