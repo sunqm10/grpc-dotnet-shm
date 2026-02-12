@@ -246,11 +246,11 @@ internal sealed unsafe partial class WindowsRingSync : IRingSync
         return (int)Math.Min(remaining.Value.TotalMilliseconds, 100);
     }
 
-    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [LibraryImport("api-ms-win-core-synch-l1-2-0.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static unsafe partial bool WaitOnAddress(void* address, void* compareAddress, IntPtr addressSize, uint milliseconds);
 
-    [LibraryImport("kernel32.dll")]
+    [LibraryImport("api-ms-win-core-synch-l1-2-0.dll")]
     private static unsafe partial void WakeByAddressSingle(void* address);
 }
 

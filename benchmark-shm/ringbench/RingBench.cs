@@ -29,6 +29,20 @@ using Microsoft.Extensions.Logging;
 // Main
 // ============================================================================
 
+// Catch unhandled exceptions from background threads
+AppDomain.CurrentDomain.UnhandledException += (sender, e) =>
+{
+    Console.Error.WriteLine($"[DIAG] UNHANDLED EXCEPTION (IsTerminating={e.IsTerminating}): {e.ExceptionObject}");
+    Console.Error.Flush();
+};
+
+TaskScheduler.UnobservedTaskException += (sender, e) =>
+{
+    Console.Error.WriteLine($"[DIAG] UNOBSERVED TASK EXCEPTION: {e.Exception}");
+    Console.Error.Flush();
+    e.SetObserved();
+};
+
 // Ensure enough thread pool threads for in-process client+server operation
 ThreadPool.SetMinThreads(200, 200);
 
@@ -63,7 +77,19 @@ var streamingResults = new List<BenchResult>();
 // Run each transport independently to avoid idle-spin stack buildup in SHM frame reader
 foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartShmEnv })
 {
-    await using var env = await startEnv();
+    BenchEnv env;
+    try
+    {
+        env = await startEnv();
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"[DIAG] Transport setup FAILED: {ex.GetType().Name}: {ex.Message}");
+        Console.Error.WriteLine(ex.ToString());
+        Console.Error.Flush();
+        continue;
+    }
+    await using var envDisposable = env;
 
     Console.WriteLine($"=== {env.Transport.ToUpper()} Transport ===");
     Console.WriteLine();
@@ -225,11 +251,24 @@ async Task<BenchEnv> StartShmEnv()
         });
 
     var cts = new CancellationTokenSource();
+    Console.Error.WriteLine("[DIAG] Starting SHM server...");
+    Console.Error.Flush();
     var serverTask = server.RunAsync(cts.Token);
 
     // Give server time to set up control segment
-    await Task.Delay(200);
+    await Task.Delay(500);
+    Console.Error.WriteLine("[DIAG] Delay done, checking serverTask...");
+    Console.Error.Flush();
 
+    if (serverTask.IsFaulted)
+    {
+        Console.Error.WriteLine($"[DIAG] Server task FAULTED: {serverTask.Exception?.GetBaseException().Message}");
+        Console.Error.Flush();
+        throw serverTask.Exception!.GetBaseException();
+    }
+
+    Console.Error.WriteLine("[DIAG] Creating channel...");
+    Console.Error.Flush();
     var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
     {
         HttpHandler = new ShmControlHandler(segmentName),
@@ -239,18 +278,21 @@ async Task<BenchEnv> StartShmEnv()
     var client = new BenchmarkService.BenchmarkServiceClient(channel);
 
     // Smoke-test: verify a single SHM unary call completes
-    Console.Error.Write("SHM smoke test...");
+    Console.Error.Write("[DIAG] SHM smoke test...");
     Console.Error.Flush();
     var smokeReq = new SimpleRequest { ResponseSize = 0 };
     using var smokeCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
     try
     {
-        await client.UnaryCallAsync(smokeReq, cancellationToken: smokeCts.Token);
-        Console.Error.WriteLine("OK");
+        var smokeResult = await client.UnaryCallAsync(smokeReq, cancellationToken: smokeCts.Token);
+        Console.Error.WriteLine($"OK (resp size={smokeResult.Payload?.Body?.Length ?? 0})");
+        Console.Error.Flush();
     }
     catch (Exception ex)
     {
         Console.Error.WriteLine($"FAILED: {ex.GetType().Name}: {ex.Message}");
+        Console.Error.WriteLine(ex.ToString());
+        Console.Error.Flush();
         throw;
     }
 

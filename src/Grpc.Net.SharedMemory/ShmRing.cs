@@ -686,15 +686,17 @@ public sealed class ShmRing : IDisposable
 
     private void WaitForData(ref RingHeader header, CancellationToken cancellationToken)
     {
-        // Use pendingReadIdx (not shared readIdx) for availability checks.
-        // This matches grpc-go-shmem's ReadSlices which uses pendingReadIdx to
-        // avoid false positives when borrowed payloads hold readIdx behind.
+        // Matches grpc-go-shmem's readWait: spin/block until writeIdx > readIdx.
+        // Uses shared readIdx (not _pendingReadIdx) because readWait must detect
+        // any unconsumed data in the ring, including data already borrowed but
+        // not yet committed. The caller (Read or ReserveRead) re-checks with
+        // its own index after WaitForData returns.
         var spinLimit = Volatile.Read(ref _dataSpinCutoff);
         for (var i = 0; i < spinLimit; i++)
         {
             var writeIdx = Volatile.Read(ref header.WriteIdx);
-            var pendingIdx = Volatile.Read(ref _pendingReadIdx);
-            if (writeIdx > pendingIdx)
+            var readIdx = Volatile.Read(ref header.ReadIdx);
+            if (writeIdx > readIdx)
             {
                 // Success - adapt spin limit upward
                 if (i > 0)
@@ -723,10 +725,10 @@ public sealed class ShmRing : IDisposable
         {
             var seq = Volatile.Read(ref header.DataSeq);
 
-            // Re-check using pendingReadIdx before blocking
+            // Re-check before blocking
             var writeIdx = Volatile.Read(ref header.WriteIdx);
-            var pendingIdx = Volatile.Read(ref _pendingReadIdx);
-            if (writeIdx > pendingIdx)
+            var readIdx = Volatile.Read(ref header.ReadIdx);
+            if (writeIdx > readIdx)
             {
                 return;
             }
