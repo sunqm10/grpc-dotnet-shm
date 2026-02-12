@@ -240,8 +240,8 @@ def generate_plots(data: dict):
     # ================================================================
     fig, axes = plt.subplots(3, 2, figsize=(14, 14))
     fig.suptitle(
-        f'gRPC .NET Shared Memory Transport - Communication Pattern Benchmarks\n'
-        f'{runtime} \u2022 {cpu[:40]}',
+        f'gRPC Shared Memory Transport - Communication Pattern Benchmarks\n'
+        f'512 MiB Ring Buffers \u2022 {cpu[:40]}',
         fontsize=14, fontweight='bold')
 
     # --- Row 1: Unary (Roundtrip) ---
@@ -373,7 +373,7 @@ def generate_plots(data: dict):
     # Plot 2: Summary Comparison
     # ================================================================
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle(f'gRPC .NET Transport Performance Summary\n{timestamp}', fontsize=14, fontweight='bold')
+    fig.suptitle(f'gRPC Transport Performance Summary\n{timestamp}', fontsize=14, fontweight='bold')
 
     idx_1k = 1  # 1KB index in rt_sizes
 
@@ -481,7 +481,7 @@ KEY RESULTS (1KB messages):
     if shm_large_tp and any(v is not None for v in shm_large_tp):
         fig, axes_lp = plt.subplots(1, 2, figsize=(14, 6))
         fig.suptitle(
-            f'Large Payload Performance - SHM vs TCP ({runtime})\n{cpu[:40]}',
+            f'Large Payload Performance - All Transports (512 MiB Ring Buffer)\n{cpu[:40]}',
             fontsize=14, fontweight='bold')
 
         valid_idx = [i for i, v in enumerate(shm_large_tp) if v is not None]
@@ -550,7 +550,7 @@ def generate_consolidated_plot(data: dict):
 
     colors = {'shm': '#00cc6a', 'tcp': '#ff5555'}
 
-    cpu = data.get("cpu", "")[:40]
+    cpu = data.get("cpu", "")
     runtime = data.get("runtime", "")
     timestamp = data.get("timestamp", "")[:10]
 
@@ -559,11 +559,13 @@ def generate_consolidated_plot(data: dict):
                           height_ratios=[1, 1, 1, 1, 1, 1, 0.6])
 
     fig.suptitle(
-        f'gRPC .NET Shared Memory Transport - Complete Benchmark Results\n'
-        f'{runtime} \u2022 {cpu} \u2022 {timestamp}',
+        f'gRPC Shared Memory Transport - Complete Benchmark Results\n'
+        f'512 MiB Ring Buffers \u2022 {cpu} \u2022 {timestamp}',
         fontsize=16, fontweight='bold', y=0.98)
 
     width = 0.35  # 2-transport
+
+    panel_status = []  # track which panels rendered data vs 'No data'
 
     # ============================================================
     # ROW 1: Unary RPC (Roundtrip) -- Small Payloads
@@ -932,7 +934,7 @@ def generate_consolidated_plot(data: dict):
         bar_colors = [colors['shm'], colors['tcp']]
         bars = ax.bar(transports, min_lat, color=bar_colors, edgecolor='black', linewidth=0.5)
         ax.set_ylabel('Latency (ns)')
-        ax.set_title('Minimum Latency (Small Payload)\n(lower is better)', fontweight='bold')
+        ax.set_title('Minimum Latency (1B)\n(lower is better)', fontweight='bold')
         for bar, val in zip(bars, min_lat):
             label = f'{val / 1000:.1f} \u00b5s' if val >= 1000 else f'{val:.0f} ns'
             ax.annotate(label, xy=(bar.get_x() + bar.get_width() / 2, val),
@@ -996,7 +998,7 @@ def generate_consolidated_plot(data: dict):
     cpu_full = data.get("cpu", "")
     summary_lines = [
         "\u2550" * 120,
-        "BENCHMARK SUMMARY \u2014 .NET gRPC Shared Memory Transport \u2014 Streaming vs Unary RPC across all payload sizes",
+        "BENCHMARK SUMMARY  -  Streaming vs Unary RPC across all payload sizes",
         "\u2550" * 120,
         "",
     ]
@@ -1030,7 +1032,7 @@ def generate_consolidated_plot(data: dict):
         summary_lines.append(
             f"UNARY RPC (16MB):        SHM: {shm_v:.1f} GB/s    TCP: {tcp_v:.2f} GB/s")
 
-    summary_lines.extend(["", f"CPU: {cpu_full}    Runtime: {runtime}", "\u2550" * 120])
+    summary_lines.extend(["", f"CPU: {cpu_full}    Runtime: {runtime}    Ring Buffer: 512 MiB", "\u2550" * 120])
 
     summary_text = "\n".join(summary_lines)
     ax.text(0.5, 0.5, summary_text, transform=ax.transAxes, fontsize=10,
