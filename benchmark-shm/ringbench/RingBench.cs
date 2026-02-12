@@ -180,7 +180,7 @@ async Task<BenchEnv> StartTcpEnv()
     });
     builder.WebHost.ConfigureKestrel(k =>
     {
-        k.Limits.MaxRequestBodySize = 512 * 1024 * 1024;
+        k.Limits.MaxRequestBodySize = 64 * 1024 * 1024;
         k.Listen(IPAddress.Loopback, 0, lo =>
         {
             lo.Protocols = HttpProtocols.Http2;
@@ -216,7 +216,7 @@ async Task<BenchEnv> StartShmEnv()
     Segment.TryRemoveSegment(segmentName);
     Segment.TryRemoveSegment(segmentName + "_ctl");
 
-    var server = new ShmGrpcServer(segmentName, ringCapacity: 512 * 1024 * 1024);
+    var server = new ShmGrpcServer(segmentName, ringCapacity: 64 * 1024 * 1024);
 
     server.MapUnary<SimpleRequest, SimpleResponse>(
         "/grpc.testing.BenchmarkService/UnaryCall",

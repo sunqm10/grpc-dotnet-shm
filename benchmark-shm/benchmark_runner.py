@@ -1,7 +1,7 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 Benchmark runner and plotter for .NET gRPC SHM vs TCP transport.
-Matches grpc-go-shmem/benchmark/shmemtcp/benchmark_runner.py — same plot
+Matches grpc-go-shmem/benchmark/shmemtcp/benchmark_runner.py â€” same plot
 structure adapted for 2 transports (SHM, TCP) instead of 3.
 
 Usage:
@@ -23,7 +23,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Directory setup — matches Go's out/<platform>/ convention
+# Directory setup â€” matches Go's out/<platform>/ convention
 SCRIPT_DIR = Path(__file__).parent.absolute()
 OUT_ROOT = SCRIPT_DIR / "out"
 PLATFORM_NAME = "windows" if os.name == "nt" else ("linux" if sys.platform.startswith("linux") else sys.platform)
@@ -241,7 +241,7 @@ def generate_plots(data: dict):
     fig, axes = plt.subplots(3, 2, figsize=(14, 14))
     fig.suptitle(
         f'gRPC Shared Memory Transport - Communication Pattern Benchmarks\n'
-        f'512 MiB Ring Buffers \u2022 {cpu[:40]}',
+        f'64 MiB Ring Buffers \u2022 {cpu[:40]}',
         fontsize=14, fontweight='bold')
 
     # --- Row 1: Unary (Roundtrip) ---
@@ -481,7 +481,7 @@ KEY RESULTS (1KB messages):
     if shm_large_tp and any(v is not None for v in shm_large_tp):
         fig, axes_lp = plt.subplots(1, 2, figsize=(14, 6))
         fig.suptitle(
-            f'Large Payload Performance - All Transports (512 MiB Ring Buffer)\n{cpu[:40]}',
+            f'Large Payload Performance - All Transports (64 MiB Ring Buffer)\n{cpu[:40]}',
             fontsize=14, fontweight='bold')
 
         valid_idx = [i for i, v in enumerate(shm_large_tp) if v is not None]
@@ -560,7 +560,7 @@ def generate_consolidated_plot(data: dict):
 
     fig.suptitle(
         f'gRPC Shared Memory Transport - Complete Benchmark Results\n'
-        f'512 MiB Ring Buffers \u2022 {cpu} \u2022 {timestamp}',
+        f'64 MiB Ring Buffers \u2022 {cpu} \u2022 {timestamp}',
         fontsize=16, fontweight='bold', y=0.98)
 
     width = 0.35  # 2-transport
@@ -1032,7 +1032,7 @@ def generate_consolidated_plot(data: dict):
         summary_lines.append(
             f"UNARY RPC (16MB):        SHM: {shm_v:.1f} GB/s    TCP: {tcp_v:.2f} GB/s")
 
-    summary_lines.extend(["", f"CPU: {cpu_full}    Runtime: {runtime}    Ring Buffer: 512 MiB", "\u2550" * 120])
+    summary_lines.extend(["", f"CPU: {cpu_full}    Runtime: {runtime}    Ring Buffer: 64 MiB", "\u2550" * 120])
 
     summary_text = "\n".join(summary_lines)
     ax.text(0.5, 0.5, summary_text, transform=ax.transAxes, fontsize=10,
