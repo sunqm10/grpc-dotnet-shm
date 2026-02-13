@@ -16,6 +16,7 @@
 
 #endregion
 
+using System.Buffers;
 using System.Runtime.Versioning;
 using Google.Protobuf;
 using Grpc.Core;
@@ -238,6 +239,37 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Serialises a protobuf message into a pooled buffer and sends it over the
+    /// stream.  Avoids the per-message heap allocation (and LOH pressure for
+    /// payloads &ge; 85 KB) that <c>IMessage.ToByteArray()</c> causes.
+    /// </summary>
+    private static async Task SendProtobufMessageAsync(
+        ShmGrpcStream stream, IMessage message, CancellationToken ct)
+    {
+        var size = message.CalculateSize();
+        if (size == 0)
+        {
+            await stream.SendMessageAsync(ReadOnlyMemory<byte>.Empty, ct);
+            return;
+        }
+
+        var buffer = ArrayPool<byte>.Shared.Rent(size);
+        try
+        {
+            // Serialize directly into the rented buffer — no intermediate byte[].
+            using (var cos = new CodedOutputStream(buffer))
+            {
+                message.WriteTo(cos);
+            }
+            await stream.SendMessageAsync(buffer.AsMemory(0, size), ct);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
     /// <inheritdoc/>
     public async ValueTask DisposeAsync()
     {
@@ -282,8 +314,8 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             // Call handler
             var response = await _handler(request, context);
 
-            // Send response message
-            await stream.SendMessageAsync(response.ToByteArray(), ct);
+            // Send response using pooled buffer (avoids LOH allocation)
+            await SendProtobufMessageAsync(stream, response, ct);
 
             // Send trailers
             await stream.SendTrailersAsync(
@@ -337,8 +369,8 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             var reader = new ShmAsyncStreamReader<TReq>(stream);
             var response = await _handler(reader, context);
 
-            // Send response message
-            await stream.SendMessageAsync(response.ToByteArray(), ct);
+            // Send response using pooled buffer (avoids LOH allocation)
+            await SendProtobufMessageAsync(stream, response, ct);
 
             // Send trailers
             await stream.SendTrailersAsync(
@@ -380,17 +412,15 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         ShmGrpcStream stream, MessageParser<TReq> parser, CancellationToken ct)
         where TReq : class, IMessage<TReq>, new()
     {
-        byte[]? messageBytes = null;
-        await foreach (var msg in stream.ReceiveMessagesAsync(ct))
+        // Use ReceiveMessageBuffersAsync to avoid the extra byte[] allocation
+        // that ReceiveMessagesAsync performs via ToArray().  The buffer is
+        // valid until the next MoveNextAsync — parsing completes before that.
+        await foreach (var msg in stream.ReceiveMessageBuffersAsync(ct))
         {
-            messageBytes = msg;
-            break;
+            return parser.ParseFrom(new ReadOnlySequence<byte>(msg));
         }
 
-        if (messageBytes == null)
-            throw new RpcException(new Status(StatusCode.Internal, "No request message received"));
-
-        return parser.ParseFrom(messageBytes);
+        throw new RpcException(new Status(StatusCode.Internal, "No request message received"));
     }
 
     /// <summary>
@@ -401,7 +431,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     {
         private readonly ShmGrpcStream _stream;
         private readonly MessageParser<T> _parser = new(() => new T());
-        private IAsyncEnumerator<byte[]>? _enumerator;
+        private IAsyncEnumerator<ReadOnlyMemory<byte>>? _enumerator;
         private T? _current;
 
         public ShmAsyncStreamReader(ShmGrpcStream stream) => _stream = stream;
@@ -410,11 +440,15 @@ public sealed class ShmGrpcServer : IAsyncDisposable
 
         public async Task<bool> MoveNext(CancellationToken cancellationToken)
         {
-            _enumerator ??= _stream.ReceiveMessagesAsync(cancellationToken).GetAsyncEnumerator(cancellationToken);
+            // Use ReceiveMessageBuffersAsync to skip the per-message ToArray()
+            // copy.  The buffer is valid until the next MoveNextAsync;
+            // ParseFrom copies into managed protobuf objects, so the pooled
+            // buffer can be safely returned afterward.
+            _enumerator ??= _stream.ReceiveMessageBuffersAsync(cancellationToken).GetAsyncEnumerator(cancellationToken);
 
             if (await _enumerator.MoveNextAsync().ConfigureAwait(false))
             {
-                _current = _parser.ParseFrom(_enumerator.Current);
+                _current = _parser.ParseFrom(new ReadOnlySequence<byte>(_enumerator.Current));
                 return true;
             }
 
@@ -443,7 +477,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         public async Task WriteAsync(T message)
         {
             await _context.EnsureResponseHeadersSentAsync();
-            await _stream.SendMessageAsync(message.ToByteArray());
+            await SendProtobufMessageAsync(_stream, message, default);
         }
     }
 

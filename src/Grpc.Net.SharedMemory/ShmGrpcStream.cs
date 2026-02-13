@@ -75,6 +75,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     private HeadersV1? _responseHeaders;
     private TrailersV1? _trailers;
     private long _sendWindow;
+    private uint _pendingWindowUpdate;
     private bool _halfCloseSent;
     private bool _halfCloseReceived;
     private bool _cancelled;
@@ -212,13 +213,11 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         if (_halfCloseSent)
             throw new InvalidOperationException("Cannot send after half-close");
 
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
-
         // Fast path: zero-length message (e.g. empty protobuf) — send a single
         // empty MESSAGE frame so the receiver sees the message boundary.
         if (data.Length == 0)
         {
-            await SendFrameAsync(FrameType.Message, 0, data, linkedCts.Token);
+            await SendFrameAsync(FrameType.Message, 0, data, cancellationToken);
             return;
         }
 
@@ -229,7 +228,11 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             long window;
             while ((window = Interlocked.Read(ref _sendWindow)) <= 0)
             {
-                linkedCts.Token.ThrowIfCancellationRequested();
+                cancellationToken.ThrowIfCancellationRequested();
+                if (_disposed) throw new ObjectDisposedException(nameof(ShmGrpcStream));
+                // Defer LinkedCTS creation to this slow path (flow-control block).
+                // The common case (window > 0) avoids the allocation entirely.
+                using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
                 await _sendWindowSignal.WaitAsync(linkedCts.Token);
             }
 
@@ -242,7 +245,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
             // Set MORE flag on all chunks except the final one
             byte flags = remaining.Length > 0 ? MessageFlags.More : (byte)0;
-            await SendFrameAsync(FrameType.Message, flags, chunk, linkedCts.Token);
+            await SendFrameAsync(FrameType.Message, flags, chunk, cancellationToken);
         }
     }
 
@@ -398,13 +401,14 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 switch (f.Type)
                 {
                     case FrameType.Message:
-                        // Send window update so remote sender can continue
-                        var increment = (uint)f.Length;
-                        if (increment > 0)
+                        // Batch stream-level window updates to reduce lock
+                        // acquisitions on the TX ring.  Flushed when the
+                        // accumulated increment exceeds the threshold or
+                        // the stream completes.
+                        _pendingWindowUpdate += (uint)f.Length;
+                        if (_pendingWindowUpdate >= ShmConstants.WindowUpdateBatchThreshold)
                         {
-                            Span<byte> windowUpdate = stackalloc byte[4];
-                            BinaryPrimitives.WriteUInt32LittleEndian(windowUpdate, increment);
-                            _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0, windowUpdate);
+                            FlushWindowUpdate();
                         }
 
                         if ((f.Flags & MessageFlags.More) != 0)
@@ -433,11 +437,13 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                         break;
 
                     case FrameType.HalfClose:
+                        FlushWindowUpdate();
                         f.ReturnToPool();
                         _halfCloseReceived = true;
                         yield break;
 
                     case FrameType.Trailers:
+                        FlushWindowUpdate();
                         _trailers = TrailersV1.Decode(f.Memory.Span);
                         f.ReturnToPool();
                         _halfCloseReceived = true;
@@ -491,13 +497,11 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 switch (f.Type)
                 {
                     case FrameType.Message:
-                        // Send window update so remote sender can continue
-                        var increment = (uint)f.Length;
-                        if (increment > 0)
+                        // Batch stream-level window updates (same as ReceiveMessagesAsync)
+                        _pendingWindowUpdate += (uint)f.Length;
+                        if (_pendingWindowUpdate >= ShmConstants.WindowUpdateBatchThreshold)
                         {
-                            Span<byte> windowUpdate = stackalloc byte[4];
-                            BinaryPrimitives.WriteUInt32LittleEndian(windowUpdate, increment);
-                            _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0, windowUpdate);
+                            FlushWindowUpdate();
                         }
 
                         if ((f.Flags & MessageFlags.More) != 0)
@@ -531,11 +535,13 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                         break;
 
                     case FrameType.HalfClose:
+                        FlushWindowUpdate();
                         f.ReturnToPool();
                         _halfCloseReceived = true;
                         yield break;
 
                     case FrameType.Trailers:
+                        FlushWindowUpdate();
                         _trailers = TrailersV1.Decode(f.Memory.Span);
                         f.ReturnToPool();
                         _halfCloseReceived = true;
@@ -648,6 +654,24 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         }
 
         return items;
+    }
+
+    /// <summary>
+    /// Flushes any pending stream-level WINDOW_UPDATE to the connection.
+    /// Called when the batched increment exceeds the threshold, and on
+    /// stream completion (HalfClose / Trailers) so the sender is never
+    /// permanently stalled.
+    /// </summary>
+    private void FlushWindowUpdate()
+    {
+        var pending = _pendingWindowUpdate;
+        if (pending > 0)
+        {
+            _pendingWindowUpdate = 0;
+            Span<byte> buf = stackalloc byte[4];
+            BinaryPrimitives.WriteUInt32LittleEndian(buf, pending);
+            _connection.SendFrame(FrameType.WindowUpdate, StreamId, 0, buf);
+        }
     }
 
     private void ThrowIfDisposed()

@@ -164,14 +164,23 @@ public static class ShmConstants
     /// <summary>
     /// Initial flow-control window size.
     /// HTTP/2 over TCP uses 65 535, but shared memory is a local, high-bandwidth
-    /// transport so we use 16 MiB. Messages larger than the window are
+    /// transport so we use 32 MiB. Messages larger than the window are
     /// automatically chunked by the flow-control layer in ShmGrpcStream,
     /// so the window does not limit the maximum message size.
     /// </summary>
-    public const int InitialWindowSize = 16 * 1024 * 1024;
+    public const int InitialWindowSize = 32 * 1024 * 1024;
 
     /// <summary>Maximum window size.</summary>
     public const int MaxWindowSize = int.MaxValue;
+
+    /// <summary>
+    /// Threshold for batching stream-level WINDOW_UPDATE frames.
+    /// Updates are accumulated and flushed when the pending bytes exceed
+    /// this value, or when the stream receives HalfClose / Trailers.
+    /// Set to InitialWindowSize / 4 so the sender's window is replenished
+    /// well before it is exhausted.
+    /// </summary>
+    public const uint WindowUpdateBatchThreshold = (uint)(InitialWindowSize / 4);
 
     /// <summary>Maximum stream ID for client (odd numbers).</summary>
     public const uint MaxStreamId = uint.MaxValue - 1;

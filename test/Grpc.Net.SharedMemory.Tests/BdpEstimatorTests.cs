@@ -154,7 +154,7 @@ public class BdpEstimatorTests
     [Test]
     public void BdpLimit_Is16MB()
     {
-        Assert.That(ShmBdpEstimator.BdpLimit, Is.EqualTo((1 << 20) * 16));
+        Assert.That(ShmBdpEstimator.BdpLimit, Is.EqualTo((1 << 20) * 32));
     }
 
     [Test]

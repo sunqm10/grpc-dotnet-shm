@@ -32,7 +32,7 @@ public class FlowControlTests
     [Platform("Win")]
     public void InitialWindowSize_IsCorrect()
     {
-        Assert.That(ShmConstants.InitialWindowSize, Is.EqualTo(16 * 1024 * 1024));
+        Assert.That(ShmConstants.InitialWindowSize, Is.EqualTo(32 * 1024 * 1024));
     }
 
     [Test]
@@ -144,7 +144,7 @@ public class FlowControlTests
     [Platform("Win")]
     public void BdpEstimator_BdpLimit_Is16MB()
     {
-        Assert.That(ShmBdpEstimator.BdpLimit, Is.EqualTo(16 * 1024 * 1024));
+        Assert.That(ShmBdpEstimator.BdpLimit, Is.EqualTo(32 * 1024 * 1024));
     }
 
     [Test]
@@ -152,7 +152,7 @@ public class FlowControlTests
     public void FlowControl_Constants_AreValid()
     {
         // Verify constants are appropriate for shared memory transport
-        Assert.That(ShmConstants.InitialWindowSize, Is.EqualTo(16 * 1024 * 1024), "Initial window should be 16 MiB for SHM");
+        Assert.That(ShmConstants.InitialWindowSize, Is.EqualTo(32 * 1024 * 1024), "Initial window should be 32 MiB for SHM");
         Assert.That(ShmConstants.MaxWindowSize, Is.EqualTo(int.MaxValue), "Max window should be 2^31-1");
     }
 }
