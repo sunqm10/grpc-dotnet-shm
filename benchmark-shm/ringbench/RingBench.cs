@@ -48,6 +48,8 @@ TaskScheduler.UnobservedTaskException += (sender, e) =>
 // Ensure enough thread pool threads for benchmark operations
 ThreadPool.SetMinThreads(200, 200);
 
+var measurementTimeout = TimeSpan.FromMinutes(15);
+
 string outDir = Path.Combine("benchmark-shm", "out");
 string? platformOverride = null;
 bool serverMode = false;
@@ -130,8 +132,9 @@ foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartShmEnv }
     foreach (var size in sizes)
     {
         int iters = IterationsForSize(size);
+        Console.WriteLine($"  -> running {FormatSize(size),-8} ({iters} iters)...");
         int gc0Before = GC.CollectionCount(0), gc1Before = GC.CollectionCount(1), gc2Before = GC.CollectionCount(2);
-        var (avgUs, throughputMBps) = await MeasureUnary(env.Client, size, iters);
+        var (avgUs, throughputMBps) = await MeasureUnary(env.Client, size, iters, measurementTimeout);
         int gc0 = GC.CollectionCount(0) - gc0Before, gc1 = GC.CollectionCount(1) - gc1Before, gc2 = GC.CollectionCount(2) - gc2Before;
         unaryResults.Add(new BenchResult(env.Transport, size, iters, avgUs, throughputMBps));
         Console.WriteLine($"  {FormatSize(size),-12} {iters,-8} {avgUs,-14:F3} {throughputMBps,-18:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
@@ -145,8 +148,9 @@ foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartShmEnv }
     foreach (var size in sizes)
     {
         int iters = IterationsForSize(size);
+        Console.WriteLine($"  -> running {FormatSize(size),-8} ({iters} iters)...");
         int gc0Before = GC.CollectionCount(0), gc1Before = GC.CollectionCount(1), gc2Before = GC.CollectionCount(2);
-        var (avgUs, throughputMBps) = await MeasureStreaming(env.Client, size, iters);
+        var (avgUs, throughputMBps) = await MeasureStreaming(env.Client, size, iters, measurementTimeout);
         int gc0 = GC.CollectionCount(0) - gc0Before, gc1 = GC.CollectionCount(1) - gc1Before, gc2 = GC.CollectionCount(2) - gc2Before;
         streamingResults.Add(new BenchResult(env.Transport, size, iters, avgUs, throughputMBps));
         Console.WriteLine($"  {FormatSize(size),-12} {iters,-8} {avgUs,-14:F3} {throughputMBps,-18:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
@@ -383,7 +387,14 @@ static async Task WaitForServerReadyAsync(BenchmarkService.BenchmarkServiceClien
         using var attemptCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
         try
         {
-            await client.UnaryCallAsync(new SimpleRequest { ResponseSize = 0 }, cancellationToken: attemptCts.Token);
+            using var call = client.UnaryCallAsync(new SimpleRequest { ResponseSize = 0 }, cancellationToken: attemptCts.Token);
+            var completed = await Task.WhenAny(call.ResponseAsync, Task.Delay(TimeSpan.FromSeconds(2), attemptCts.Token)).ConfigureAwait(false);
+            if (completed != call.ResponseAsync)
+            {
+                throw new TimeoutException("Server readiness probe timed out.");
+            }
+
+            await call.ResponseAsync.ConfigureAwait(false);
             return;
         }
         catch (Exception ex)
@@ -524,18 +535,27 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
 // ============================================================================
 
 static async Task<(double avgUs, double throughputMBps)> MeasureUnary(
-    BenchmarkService.BenchmarkServiceClient client, int payloadSize, int iterations)
+    BenchmarkService.BenchmarkServiceClient client, int payloadSize, int iterations, TimeSpan timeout)
 {
     var payload = MakePayload(payloadSize);
     var req = new SimpleRequest { ResponseSize = payloadSize, Payload = payload };
+    var stepTimeout = TimeSpan.FromSeconds(120);
+    var started = Stopwatch.StartNew();
 
     // Warmup
     for (int i = 0; i < Math.Min(10, iterations / 10 + 1); i++)
-        await client.UnaryCallAsync(req);
+        await UnaryCallWithHardTimeoutAsync(client, req, stepTimeout).ConfigureAwait(false);
 
     var sw = Stopwatch.StartNew();
     for (int i = 0; i < iterations; i++)
-        await client.UnaryCallAsync(req);
+    {
+        if (started.Elapsed > timeout)
+        {
+            throw new TimeoutException($"Unary measurement exceeded timeout of {timeout.TotalSeconds:F0}s.");
+        }
+
+        await UnaryCallWithHardTimeoutAsync(client, req, stepTimeout).ConfigureAwait(false);
+    }
     sw.Stop();
 
     double totalUs = sw.Elapsed.TotalMicroseconds;
@@ -549,29 +569,36 @@ static async Task<(double avgUs, double throughputMBps)> MeasureUnary(
 }
 
 static async Task<(double avgUs, double throughputMBps)> MeasureStreaming(
-    BenchmarkService.BenchmarkServiceClient client, int payloadSize, int iterations)
+    BenchmarkService.BenchmarkServiceClient client, int payloadSize, int iterations, TimeSpan timeout)
 {
     var payload = MakePayload(payloadSize);
     var req = new SimpleRequest { ResponseSize = payloadSize, Payload = payload };
+    var stepTimeout = TimeSpan.FromSeconds(120);
+    var started = Stopwatch.StartNew();
 
     using var call = client.StreamingCall();
 
     // Warmup
     for (int i = 0; i < Math.Min(10, iterations / 10 + 1); i++)
     {
-        await call.RequestStream.WriteAsync(req);
-        await call.ResponseStream.MoveNext(CancellationToken.None);
+        await call.RequestStream.WriteAsync(req).WaitAsync(stepTimeout).ConfigureAwait(false);
+        await call.ResponseStream.MoveNext(CancellationToken.None).WaitAsync(stepTimeout).ConfigureAwait(false);
     }
 
     var sw = Stopwatch.StartNew();
     for (int i = 0; i < iterations; i++)
     {
-        await call.RequestStream.WriteAsync(req);
-        await call.ResponseStream.MoveNext(CancellationToken.None);
+        if (started.Elapsed > timeout)
+        {
+            throw new TimeoutException($"Streaming measurement exceeded timeout of {timeout.TotalSeconds:F0}s.");
+        }
+
+        await call.RequestStream.WriteAsync(req).WaitAsync(stepTimeout).ConfigureAwait(false);
+        await call.ResponseStream.MoveNext(CancellationToken.None).WaitAsync(stepTimeout).ConfigureAwait(false);
     }
     sw.Stop();
 
-    await call.RequestStream.CompleteAsync();
+    await call.RequestStream.CompleteAsync().WaitAsync(stepTimeout).ConfigureAwait(false);
 
     double totalUs = sw.Elapsed.TotalMicroseconds;
     double avgUs = totalUs / iterations;
@@ -583,21 +610,46 @@ static async Task<(double avgUs, double throughputMBps)> MeasureStreaming(
     return (avgUs, throughputMBps);
 }
 
+static async Task UnaryCallWithHardTimeoutAsync(
+    BenchmarkService.BenchmarkServiceClient client,
+    SimpleRequest request,
+    TimeSpan timeout)
+{
+    using var call = client.UnaryCallAsync(request, cancellationToken: CancellationToken.None);
+    var completed = await Task.WhenAny(call.ResponseAsync, Task.Delay(timeout)).ConfigureAwait(false);
+    if (completed != call.ResponseAsync)
+    {
+        call.Dispose();
+        throw new TimeoutException($"Unary gRPC call exceeded timeout of {timeout.TotalSeconds:F0}s.");
+    }
+
+    await call.ResponseAsync.ConfigureAwait(false);
+}
+
 // ============================================================================
-// Iteration count — matches Go's iterationsForSize exactly
+// Iteration count — preserves Go-style weighting, scaled up for run stability.
 // ============================================================================
 
-static int IterationsForSize(int size) => size switch
+const int IterationMultiplier = 3;
+const int LargePayloadIterationMultiplier = 2;
+
+static int IterationsForSize(int size)
 {
-    <= 0 => 2000,
-    <= 1024 => 2000,
-    <= 16384 => 1200,
-    <= 65536 => 800,
-    <= 262144 => 400,
-    <= 524288 => 250,
-    <= 1048576 => 150,
-    _ => 80
-};
+    int baseline = size switch
+    {
+        <= 0 => 2000,
+        <= 1024 => 2000,
+        <= 16384 => 1200,
+        <= 65536 => 800,
+        <= 262144 => 400,
+        <= 524288 => 250,
+        <= 1048576 => 150,
+        _ => 80
+    };
+
+    int multiplier = size >= 524288 ? LargePayloadIterationMultiplier : IterationMultiplier;
+    return baseline * multiplier;
+}
 
 // ============================================================================
 // Output helpers
