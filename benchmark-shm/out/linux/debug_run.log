@@ -1,0 +1,329 @@
+CPU: AMD EPYC 7763 64-Core Processor
+Runtime: .NET 9.0.12
+
+[SRV] [SERVER] TCP ready on 127.0.0.1:41011
+=== TCP Transport ===
+
+  Unary ping-pong:
+  Payload      Iters    Avg µs         Throughput MB/s    Gen0   Gen1   Gen2  
+  ----------------------------------------------------------------------------
+  -> running 0B       (6000 iters)...
+  0B           6000     360.801        0.000              13     1      0     
+  -> running 1B       (6000 iters)...
+  1B           6000     198.072        0.010              5      0      0     
+  -> running 1KB      (6000 iters)...
+  1KB          6000     129.187        15.119             4      0      0     
+  -> running 4KB      (3600 iters)...
+  4KB          3600     161.621        48.339             3      0      0     
+  -> running 16KB     (3600 iters)...
+  16KB         3600     195.235        160.063            10     1      1     
+  -> running 64KB     (2400 iters)...
+  64KB         2400     534.839        233.715            28     0      0     
+  -> running 256KB    (1200 iters)...
+  256KB        1200     2061.841       242.502            45     44     44    
+  -> running 512KB    (500 iters)...
+  512KB        500      3477.484       287.564            30     28     28    
+  -> running 1MB      (300 iters)...
+  1MB          300      6669.420       299.876            28     27     27    
+  -> running 2MB      (160 iters)...
+  2MB          160      11963.094      334.362            15     14     14    
+
+  Streaming ping-pong:
+  Payload      Iters    Avg µs         Throughput MB/s    Gen0   Gen1   Gen2  
+  ----------------------------------------------------------------------------
+  -> running 0B       (6000 iters)...
+  0B           6000     98.651         0.000              3      1      1     
+  -> running 1B       (6000 iters)...
+  1B           6000     79.191         0.024              3      0      0     
+  -> running 1KB      (6000 iters)...
+  1KB          6000     90.824         21.504             5      1      1     
+  -> running 4KB      (3600 iters)...
+  4KB          3600     122.633        63.706             5      0      0     
+  -> running 16KB     (3600 iters)...
+  16KB         3600     183.064        170.705            11     0      0     
+  -> running 64KB     (2400 iters)...
+  64KB         2400     399.497        312.893            52     0      0     
+  -> running 256KB    (1200 iters)...
+  256KB        1200     1798.232       278.051            17     13     13    
+  -> running 512KB    (500 iters)...
+  512KB        500      3190.530       313.428            14     11     11    
+  -> running 1MB      (300 iters)...
+  1MB          300      6229.113       321.073            16     13     13    
+  -> running 2MB      (160 iters)...
+  2MB          160      11197.434      357.225            16     13     13    
+
+[DIAG] Client: Ensuring connection...
+[SRV] [SERVER] SHM ready on segment: bench_shm_4734_fb571eb6c9944229940286160f641978
+[SRV] SHM gRPC server listening on segment: bench_shm_4734_fb571eb6c9944229940286160f641978
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 1
+[DIAG] Client: Sending request headers for stream 1
+[DIAG] Client: Request headers sent for stream 1
+[DIAG] Client: Waiting for response headers for stream 1...
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 1
+[SRV] [DIAG] Request message read for stream 1
+[SRV] [DIAG] Response headers sent for stream 1
+[SRV] [DIAG] Handler completed for stream 1
+[SRV] [DIAG] Response message sent for stream 1
+[SRV] [DIAG] Trailers sent for stream 1
+[DIAG] Client: Response headers received for stream 1
+=== SHM Transport ===
+
+  Unary ping-pong:
+  Payload      Iters    Avg µs         Throughput MB/s    Gen0   Gen1   Gen2  
+  ----------------------------------------------------------------------------
+  -> running 0B       (6000 iters)...
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 3
+[DIAG] Client: Sending request headers for stream 3
+[DIAG] Client: Request headers sent for stream 3
+[DIAG] Client: Waiting for response headers for stream 3...
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 3
+[SRV] [DIAG] Request message read for stream 3
+[SRV] [DIAG] Response headers sent for stream 3
+[SRV] [DIAG] Handler completed for stream 3
+[DIAG] Client: Response headers received for stream 3
+[SRV] [DIAG] Response message sent for stream 3
+[SRV] [DIAG] Trailers sent for stream 3
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 5
+[DIAG] Client: Sending request headers for stream 5
+[DIAG] Client: Request headers sent for stream 5
+[DIAG] Client: Waiting for response headers for stream 5...
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 5
+[SRV] [DIAG] Request message read for stream 5
+[DIAG] Client: Response headers received for stream 5
+[SRV] [DIAG] Response headers sent for stream 5
+[SRV] [DIAG] Handler completed for stream 5
+[SRV] [DIAG] Response message sent for stream 5
+[SRV] [DIAG] Trailers sent for stream 5
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 7
+[DIAG] Client: Sending request headers for stream 7
+[DIAG] Client: Request headers sent for stream 7
+[DIAG] Client: Waiting for response headers for stream 7...
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 7
+[DIAG] Client: Response headers received for stream 7
+[DIAG] Client: Ensuring connection...
+[SRV] [DIAG] Request message read for stream 7
+[DIAG] Client: Connection established
+[SRV] [DIAG] Response headers sent for stream 7
+[SRV] [DIAG] Handler completed for stream 7
+[DIAG] Client: Created stream 9
+[SRV] [DIAG] Response message sent for stream 7
+[DIAG] Client: Sending request headers for stream 9
+[SRV] [DIAG] Trailers sent for stream 7
+[DIAG] Client: Request headers sent for stream 9
+[DIAG] Client: Waiting for response headers for stream 9...
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 9
+[SRV] [DIAG] Request message read for stream 9
+[SRV] [DIAG] Response headers sent for stream 9
+[SRV] [DIAG] Handler completed for stream 9
+[SRV] [DIAG] Response message sent for stream 9
+[SRV] [DIAG] Trailers sent for stream 9
+[DIAG] Client: Response headers received for stream 9
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 11
+[DIAG] Client: Sending request headers for stream 11
+[DIAG] Client: Request headers sent for stream 11
+[DIAG] Client: Waiting for response headers for stream 11...
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 11
+[SRV] [DIAG] Request message read for stream 11
+[SRV] [DIAG] Response headers sent for stream 11
+[DIAG] Client: Response headers received for stream 11
+[SRV] [DIAG] Handler completed for stream 11
+[SRV] [DIAG] Response message sent for stream 11
+[SRV] [DIAG] Trailers sent for stream 11
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 13
+[DIAG] Client: Sending request headers for stream 13
+[DIAG] Client: Request headers sent for stream 13
+[DIAG] Client: Waiting for response headers for stream 13...
+[DIAG] Client: Response headers received for stream 13
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 13
+[SRV] [DIAG] Request message read for stream 13
+[SRV] [DIAG] Response headers sent for stream 13
+[SRV] [DIAG] Handler completed for stream 13
+[SRV] [DIAG] Response message sent for stream 13
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 15
+[DIAG] Client: Sending request headers for stream 15
+[DIAG] Client: Request headers sent for stream 15
+[DIAG] Client: Waiting for response headers for stream 15...
+[SRV] [DIAG] Trailers sent for stream 13
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 15
+[SRV] [DIAG] Request message read for stream 15
+[DIAG] Client: Response headers received for stream 15
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 17
+[DIAG] Client: Sending request headers for stream 17
+[DIAG] Client: Request headers sent for stream 17
+[SRV] [DIAG] Response headers sent for stream 15
+[SRV] [DIAG] Handler completed for stream 15
+[SRV] [DIAG] Response message sent for stream 15
+[SRV] [DIAG] Trailers sent for stream 15
+[DIAG] Client: Waiting for response headers for stream 17...
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 17
+[SRV] [DIAG] Request message read for stream 17
+[SRV] [DIAG] Response headers sent for stream 17
+[SRV] [DIAG] Handler completed for stream 17
+[SRV] [DIAG] Response message sent for stream 17
+[SRV] [DIAG] Trailers sent for stream 17
+[DIAG] Client: Response headers received for stream 17
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 19
+[DIAG] Client: Sending request headers for stream 19
+[DIAG] Client: Request headers sent for stream 19
+[DIAG] Client: Waiting for response headers for stream 19...
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 19
+[SRV] [DIAG] Request message read for stream 19
+[SRV] [DIAG] Response headers sent for stream 19
+[SRV] [DIAG] Handler completed for stream 19
+[SRV] [DIAG] Response message sent for stream 19
+[SRV] [DIAG] Trailers sent for stream 19
+[DIAG] Client: Response headers received for stream 19
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 21
+[DIAG] Client: Sending request headers for stream 21
+[DIAG] Client: Request headers sent for stream 21
+[DIAG] Client: Waiting for response headers for stream 21...
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 21
+[SRV] [DIAG] Request message read for stream 21
+[DIAG] Client: Response headers received for stream 21
+[SRV] [DIAG] Response headers sent for stream 21
+[SRV] [DIAG] Handler completed for stream 21
+[SRV] [DIAG] Response message sent for stream 21
+[SRV] [DIAG] Trailers sent for stream 21
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 23
+[DIAG] Client: Sending request headers for stream 23
+[DIAG] Client: Request headers sent for stream 23
+[DIAG] Client: Waiting for response headers for stream 23...
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 23
+[SRV] [DIAG] Request message read for stream 23
+[SRV] [DIAG] Response headers sent for stream 23
+[SRV] [DIAG] Handler completed for stream 23
+[DIAG] Client: Response headers received for stream 23
+[SRV] [DIAG] Response message sent for stream 23
+[SRV] [DIAG] Trailers sent for stream 23
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 25
+[DIAG] Client: Sending request headers for stream 25
+[DIAG] Client: Request headers sent for stream 25
+[DIAG] Client: Waiting for response headers for stream 25...
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 25
+[SRV] [DIAG] Request message read for stream 25
+[DIAG] Client: Response headers received for stream 25
+[SRV] [DIAG] Response headers sent for stream 25
+[SRV] [DIAG] Handler completed for stream 25
+[SRV] [DIAG] Response message sent for stream 25
+[SRV] [DIAG] Trailers sent for stream 25
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 27
+[DIAG] Client: Sending request headers for stream 27
+[DIAG] Client: Request headers sent for stream 27
+[DIAG] Client: Waiting for response headers for stream 27...
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 27
+[SRV] [DIAG] Request message read for stream 27
+[SRV] [DIAG] Response headers sent for stream 27
+[SRV] [DIAG] Handler completed for stream 27
+[SRV] [DIAG] Response message sent for stream 27
+[SRV] [DIAG] Trailers sent for stream 27
+[DIAG] Client: Response headers received for stream 27
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 29
+[DIAG] Client: Sending request headers for stream 29
+[DIAG] Client: Request headers sent for stream 29
+[DIAG] Client: Waiting for response headers for stream 29...
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 29
+[SRV] [DIAG] Request message read for stream 29
+[DIAG] Client: Response headers received for stream 29
+[SRV] [DIAG] Response headers sent for stream 29
+[SRV] [DIAG] Handler completed for stream 29
+[SRV] [DIAG] Response message sent for stream 29
+[SRV] [DIAG] Trailers sent for stream 29
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 31
+[DIAG] Client: Sending request headers for stream 31
+[DIAG] Client: Request headers sent for stream 31
+[DIAG] Client: Waiting for response headers for stream 31...
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 31
+[SRV] [DIAG] Request message read for stream 31
+[SRV] [DIAG] Response headers sent for stream 31
+[DIAG] Client: Response headers received for stream 31
+[SRV] [DIAG] Handler completed for stream 31
+[SRV] [DIAG] Response message sent for stream 31
+[SRV] [DIAG] Trailers sent for stream 31
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 33
+[DIAG] Client: Sending request headers for stream 33
+[DIAG] Client: Request headers sent for stream 33
+[DIAG] Client: Waiting for response headers for stream 33...
+[DIAG] Client: Response headers received for stream 33
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 35
+[DIAG] Client: Sending request headers for stream 35
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 33
+[SRV] [DIAG] Request message read for stream 33
+[SRV] [DIAG] Response headers sent for stream 33
+[SRV] [DIAG] Handler completed for stream 33
+[SRV] [DIAG] Response message sent for stream 33
+[SRV] [DIAG] Trailers sent for stream 33
+[DIAG] Client: Request headers sent for stream 35
+[DIAG] Client: Waiting for response headers for stream 35...
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 35
+[SRV] [DIAG] Request message read for stream 35
+[DIAG] Client: Response headers received for stream 35
+[SRV] [DIAG] Response headers sent for stream 35
+[SRV] [DIAG] Handler completed for stream 35
+[SRV] [DIAG] Response message sent for stream 35
+[SRV] [DIAG] Trailers sent for stream 35
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 37
+[DIAG] Client: Sending request headers for stream 37
+[DIAG] Client: Request headers sent for stream 37
+[DIAG] Client: Waiting for response headers for stream 37...
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 37
+[SRV] [DIAG] Request message read for stream 37
+[SRV] [DIAG] Response headers sent for stream 37
+[SRV] [DIAG] Handler completed for stream 37
+[SRV] [DIAG] Response message sent for stream 37
+[SRV] [DIAG] Trailers sent for stream 37
+[DIAG] Client: Response headers received for stream 37
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 39
+[DIAG] Client: Sending request headers for stream 39
+[DIAG] Client: Request headers sent for stream 39
+[DIAG] Client: Waiting for response headers for stream 39...
+[SRV] [DIAG] UnaryHandler.HandleAsync started for stream 39
+[SRV] [DIAG] Request message read for stream 39
+[DIAG] Client: Response headers received for stream 39
+[SRV] [DIAG] Response headers sent for stream 39
+[SRV] [DIAG] Handler completed for stream 39
+[SRV] [DIAG] Response message sent for stream 39
+[SRV] [DIAG] Trailers sent for stream 39
+[DIAG] Client: Ensuring connection...
+[DIAG] Client: Connection established
+[DIAG] Client: Created stream 41
+[DIAG] Client: Sending request headers for stream 41
+[DIAG] Client: Request headers sent for stream 41
+[DIAG] Client: Waiting for response headers for stream 41...
