@@ -86,28 +86,15 @@ public sealed class ShmControlHandler : HttpMessageHandler
             await stream.SendRequestHeadersAsync(method, authority, metadata, deadline).ConfigureAwait(false);
 
             // Send request body via a write-through stream that forwards each
-            // gRPC frame directly to SHM.  CopyToAsync must run in the background
-            // because PushStreamContent.SerializeToStreamAsync awaits CompleteTcs
-            // for streaming calls (it blocks until the client closes the request
-            // stream).  A single Task.Run + direct writes replaces the previous
-            // Pipe + 2×Task.Run approach, eliminating resource accumulation.
+            // gRPC frame directly to SHM.  The body send runs on a thread pool
+            // thread (Task.Run) because grpc-dotnet's CopyToAsync can yield
+            // internally (e.g. PushStreamContent awaits CompleteTcs), and if it
+            // yields on the caller's thread, the subsequent
+            // ReceiveResponseHeadersAsync blocks the same thread — deadlock.
             if (request.Content != null)
             {
                 var writeStream = new ShmGrpcRequestStream(stream);
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        await request.Content.CopyToAsync(writeStream, cancellationToken).ConfigureAwait(false);
-                        await stream.SendHalfCloseAsync().ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException) { /* Normal cancellation */ }
-                    catch (ObjectDisposedException) { /* Call disposed */ }
-                    catch (Exception ex)
-                    {
-                        System.Diagnostics.Debug.WriteLine($"ShmControlHandler body send error: {ex.Message}");
-                    }
-                }, cancellationToken);
+                _ = Task.Run(() => SendBodyAsync(request.Content, writeStream, stream, cancellationToken), cancellationToken);
             }
             else
             {
@@ -144,6 +131,17 @@ public sealed class ShmControlHandler : HttpMessageHandler
             await stream.CancelAsync().ConfigureAwait(false);
             throw;
         }
+    }
+
+    private static async Task SendBodyAsync(HttpContent content, ShmGrpcRequestStream writeStream, ShmGrpcStream stream, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await content.CopyToAsync(writeStream, cancellationToken).ConfigureAwait(false);
+            await stream.SendHalfCloseAsync().ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { /* Normal cancellation */ }
+        catch (ObjectDisposedException) { /* Call disposed */ }
     }
 
     private async Task<ShmConnection> EnsureConnectedAsync(CancellationToken cancellationToken)
@@ -375,6 +373,7 @@ public sealed class ShmControlHandler : HttpMessageHandler
         }
         base.Dispose(disposing);
     }
+
 }
 
 /// <summary>
@@ -386,6 +385,9 @@ public sealed class ShmControlHandler : HttpMessageHandler
 internal sealed class ShmGrpcRequestStream : Stream
 {
     private readonly ShmGrpcStream _shmStream;
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private byte[] _pending = new byte[8192];
+    private int _pendingCount;
 
     public ShmGrpcRequestStream(ShmGrpcStream shmStream)
     {
@@ -400,18 +402,65 @@ internal sealed class ShmGrpcRequestStream : Stream
 
     public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
     {
-        if (buffer.Length < 5) return; // ignore empty/partial writes
+        if (buffer.Length == 0)
+        {
+            return;
+        }
 
-        // Parse gRPC frame header
-        var span = buffer.Span;
-        var compressed = span[0] != 0;
-        if (compressed) throw new NotSupportedException("Compression not yet supported");
+        await _writeLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            EnsureCapacity(_pendingCount + buffer.Length);
+            buffer.CopyTo(_pending.AsMemory(_pendingCount));
+            _pendingCount += buffer.Length;
 
-        var length = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(span.Slice(1));
+            while (_pendingCount >= 5)
+            {
+                var header = _pending.AsSpan(0, 5);
+                var compressed = header[0] != 0;
+                if (compressed)
+                {
+                    throw new NotSupportedException("Compression not yet supported");
+                }
 
-        // Pass message body directly as a memory slice — no copy.
-        // The previous .ToArray() allocated a new byte[] (LOH at ≥85KB) on every send.
-        await _shmStream.SendMessageAsync(buffer.Slice(5, length), cancellationToken).ConfigureAwait(false);
+                var length = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(header.Slice(1));
+                var frameLength = 5 + length;
+                if (_pendingCount < frameLength)
+                {
+                    break;
+                }
+
+                var message = _pending.AsMemory(5, length).ToArray();
+                await _shmStream.SendMessageAsync(message, cancellationToken).ConfigureAwait(false);
+
+                var remaining = _pendingCount - frameLength;
+                if (remaining > 0)
+                {
+                    Buffer.BlockCopy(_pending, frameLength, _pending, 0, remaining);
+                }
+                _pendingCount = remaining;
+            }
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    private void EnsureCapacity(int required)
+    {
+        if (required <= _pending.Length)
+        {
+            return;
+        }
+
+        var newLength = _pending.Length;
+        while (newLength < required)
+        {
+            newLength *= 2;
+        }
+
+        Array.Resize(ref _pending, newLength);
     }
 
     public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
@@ -427,6 +476,15 @@ internal sealed class ShmGrpcRequestStream : Stream
     public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
     public override void SetLength(long value) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _writeLock.Dispose();
+        }
+        base.Dispose(disposing);
+    }
 }
 
 /// <summary>

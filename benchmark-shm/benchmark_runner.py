@@ -134,7 +134,7 @@ def extract_data(results: dict) -> dict:
     rt_labels = [format_size(s) for s in rt_sizes]
 
     # Large payload sizes  (Go: 1MB-256MB; .NET: 1MB-128MB)
-    large_sizes = [1048576, 2097152, 4194304, 16777216, 33554432, 134217728]
+    large_sizes = [1048576, 2097152, 4194304, 16777216]
     large_size_labels = [format_size(s) for s in large_sizes]
 
     # --- Helpers ---

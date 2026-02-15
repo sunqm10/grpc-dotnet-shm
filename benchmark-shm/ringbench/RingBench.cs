@@ -90,8 +90,8 @@ string platform = platformOverride
 outDir = Path.Combine(outDir, platform);
 Directory.CreateDirectory(outDir);
 
-// Go benchmark sizes: 0, 1, 1K, 4K, 16K, 64K, 256K, 512K, 1M, 2M
-int[] sizes = { 0, 1, 1024, 4096, 16384, 65536, 262144, 524288, 1048576, 2097152 };
+// Go benchmark sizes: 0, 1, 1K, 4K, 16K, 64K, 256K, 512K, 1M, 2M, 4M, 16M
+int[] sizes = { 0, 1, 1024, 4096, 16384, 65536, 262144, 524288, 1048576, 2097152, 4194304, 16777216 };
 
 string cpu = GetCpuInfo();
 string runtime = RuntimeInformation.FrameworkDescription;
@@ -131,10 +131,19 @@ foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartShmEnv }
     {
         int iters = IterationsForSize(size);
         int gc0Before = GC.CollectionCount(0), gc1Before = GC.CollectionCount(1), gc2Before = GC.CollectionCount(2);
-        var (avgUs, throughputMBps) = await MeasureUnary(env.Client, size, iters);
-        int gc0 = GC.CollectionCount(0) - gc0Before, gc1 = GC.CollectionCount(1) - gc1Before, gc2 = GC.CollectionCount(2) - gc2Before;
-        unaryResults.Add(new BenchResult(env.Transport, size, iters, avgUs, throughputMBps));
-        Console.WriteLine($"  {FormatSize(size),-12} {iters,-8} {avgUs,-14:F3} {throughputMBps,-18:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+            var task = MeasureUnary(env.Client, size, iters);
+            var (avgUs, throughputMBps) = await task.WaitAsync(cts.Token);
+            int gc0 = GC.CollectionCount(0) - gc0Before, gc1 = GC.CollectionCount(1) - gc1Before, gc2 = GC.CollectionCount(2) - gc2Before;
+            unaryResults.Add(new BenchResult(env.Transport, size, iters, avgUs, throughputMBps));
+            Console.WriteLine($"  {FormatSize(size),-12} {iters,-8} {avgUs,-14:F3} {throughputMBps,-18:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  {FormatSize(size),-12} FAILED: {ex.GetType().Name}: {ex.Message}");
+        }
     }
     Console.WriteLine();
 
@@ -146,10 +155,19 @@ foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartShmEnv }
     {
         int iters = IterationsForSize(size);
         int gc0Before = GC.CollectionCount(0), gc1Before = GC.CollectionCount(1), gc2Before = GC.CollectionCount(2);
-        var (avgUs, throughputMBps) = await MeasureStreaming(env.Client, size, iters);
-        int gc0 = GC.CollectionCount(0) - gc0Before, gc1 = GC.CollectionCount(1) - gc1Before, gc2 = GC.CollectionCount(2) - gc2Before;
-        streamingResults.Add(new BenchResult(env.Transport, size, iters, avgUs, throughputMBps));
-        Console.WriteLine($"  {FormatSize(size),-12} {iters,-8} {avgUs,-14:F3} {throughputMBps,-18:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(5));
+            var task = MeasureStreaming(env.Client, size, iters);
+            var (avgUs, throughputMBps) = await task.WaitAsync(cts.Token);
+            int gc0 = GC.CollectionCount(0) - gc0Before, gc1 = GC.CollectionCount(1) - gc1Before, gc2 = GC.CollectionCount(2) - gc2Before;
+            streamingResults.Add(new BenchResult(env.Transport, size, iters, avgUs, throughputMBps));
+            Console.WriteLine($"  {FormatSize(size),-12} {iters,-8} {avgUs,-14:F3} {throughputMBps,-18:F3} {gc0,-6} {gc1,-6} {gc2,-6}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  {FormatSize(size),-12} FAILED: {ex.GetType().Name}: {ex.Message}");
+        }
     }
     Console.WriteLine();
 }
@@ -228,7 +246,11 @@ async Task<BenchEnv> StartTcpEnv()
 
     try
     {
-        var channel = GrpcChannel.ForAddress($"http://127.0.0.1:{port}");
+        var channel = GrpcChannel.ForAddress($"http://127.0.0.1:{port}", new GrpcChannelOptions
+        {
+            MaxReceiveMessageSize = 256 * 1024 * 1024,
+            MaxSendMessageSize = 256 * 1024 * 1024
+        });
         var client = new BenchmarkService.BenchmarkServiceClient(channel);
 
         await WaitForServerReadyAsync(client, TimeSpan.FromSeconds(20));
@@ -260,7 +282,9 @@ async Task<BenchEnv> StartShmEnv()
         var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
         {
             HttpHandler = new ShmControlHandler(segmentName),
-            DisposeHttpClient = true
+            DisposeHttpClient = true,
+            MaxReceiveMessageSize = 256 * 1024 * 1024,
+            MaxSendMessageSize = 256 * 1024 * 1024
         });
 
         var client = new BenchmarkService.BenchmarkServiceClient(channel);
@@ -383,7 +407,8 @@ static async Task WaitForServerReadyAsync(BenchmarkService.BenchmarkServiceClien
         using var attemptCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
         try
         {
-            await client.UnaryCallAsync(new SimpleRequest { ResponseSize = 0 }, cancellationToken: attemptCts.Token);
+            using var readyCall = client.UnaryCallAsync(new SimpleRequest { ResponseSize = 0 }, cancellationToken: attemptCts.Token);
+            await readyCall;
             return;
         }
         catch (Exception ex)
@@ -447,9 +472,14 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
 
         var builder = WebApplication.CreateBuilder(Array.Empty<string>());
         builder.Logging.ClearProviders();
-        builder.Services.AddGrpc();
+        builder.Services.AddGrpc(o =>
+        {
+            o.MaxReceiveMessageSize = 256 * 1024 * 1024;
+            o.MaxSendMessageSize = 256 * 1024 * 1024;
+        });
         builder.WebHost.ConfigureKestrel(k =>
         {
+            k.Limits.MaxRequestBodySize = null; // unlimited
             k.Listen(IPAddress.Loopback, port, lo => lo.Protocols = HttpProtocols.Http2);
         });
 
@@ -531,11 +561,17 @@ static async Task<(double avgUs, double throughputMBps)> MeasureUnary(
 
     // Warmup
     for (int i = 0; i < Math.Min(10, iterations / 10 + 1); i++)
-        await client.UnaryCallAsync(req);
+    {
+        using var warmup = client.UnaryCallAsync(req);
+        await warmup;
+    }
 
     var sw = Stopwatch.StartNew();
     for (int i = 0; i < iterations; i++)
-        await client.UnaryCallAsync(req);
+    {
+        using var c = client.UnaryCallAsync(req);
+        await c;
+    }
     sw.Stop();
 
     double totalUs = sw.Elapsed.TotalMicroseconds;
@@ -596,7 +632,11 @@ static int IterationsForSize(int size) => size switch
     <= 262144 => 400,
     <= 524288 => 250,
     <= 1048576 => 150,
-    _ => 80
+    <= 2097152 => 80,
+    <= 4194304 => 40,
+    <= 16777216 => 20,
+    <= 33554432 => 10,
+    _ => 5
 };
 
 // ============================================================================

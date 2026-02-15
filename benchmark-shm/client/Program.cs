@@ -142,7 +142,9 @@ public class BenchmarkRunner
             channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
             {
                 HttpHandler = shmHandler,
-                DisposeHttpClient = true
+                DisposeHttpClient = true,
+                MaxReceiveMessageSize = 256 * 1024 * 1024,
+                MaxSendMessageSize = 256 * 1024 * 1024
             });
         }
         else
@@ -152,9 +154,12 @@ public class BenchmarkRunner
                 HttpHandler = new SocketsHttpHandler
                 {
                     EnableMultipleHttp2Connections = true,
-                    PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5)
+                    PooledConnectionIdleTimeout = TimeSpan.FromMinutes(5),
+                    InitialHttp2StreamWindowSize = 16 * 1024 * 1024
                 },
-                DisposeHttpClient = true
+                DisposeHttpClient = true,
+                MaxReceiveMessageSize = 256 * 1024 * 1024,
+                MaxSendMessageSize = 256 * 1024 * 1024
             });
         }
 

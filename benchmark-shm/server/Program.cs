@@ -152,7 +152,11 @@ public class Program
     {
         var builder = WebApplication.CreateBuilder();
         
-        builder.Services.AddGrpc();
+        builder.Services.AddGrpc(options =>
+        {
+            options.MaxReceiveMessageSize = 256 * 1024 * 1024; // 256 MB
+            options.MaxSendMessageSize = 256 * 1024 * 1024;
+        });
 
         builder.WebHost.ConfigureKestrel(options =>
         {
@@ -160,6 +164,8 @@ public class Program
             {
                 listenOptions.Protocols = HttpProtocols.Http2;
             });
+            options.Limits.Http2.InitialStreamWindowSize = 16 * 1024 * 1024;
+            options.Limits.Http2.InitialConnectionWindowSize = 16 * 1024 * 1024;
         });
 
         var app = builder.Build();
@@ -172,7 +178,7 @@ public class Program
 
     private static async Task StartShmServerAsync(string segmentName, CancellationToken ct)
     {
-        using var listener = new ShmControlListener(segmentName, ringCapacity: 2 * 1024 * 1024, maxStreams: 100);
+        using var listener = new ShmControlListener(segmentName, ringCapacity: 64 * 1024 * 1024, maxStreams: 100);
         Console.WriteLine($"SHM endpoint: shm://{segmentName}");
 
         await foreach (var connection in listener.AcceptConnectionsAsync(ct).ConfigureAwait(false))
@@ -193,14 +199,14 @@ public class Program
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Connection error: {ex.Message}");
+            Console.Error.WriteLine($"Connection error: {ex}");
         }
     }
 
     private static async Task HandleStreamAsync(ShmGrpcStream stream, CancellationToken ct)
     {
         var method = stream.RequestHeaders?.Method ?? "";
-        
+
         try
         {
             if (method == "/grpc.testing.BenchmarkService/UnaryCall")
@@ -213,13 +219,12 @@ public class Program
             }
             else
             {
-                // Unknown method - send not implemented
                 await stream.SendTrailersAsync(StatusCode.Unimplemented, $"Method not found: {method}").ConfigureAwait(false);
             }
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Stream error: {ex.Message}");
+            Console.Error.WriteLine($"Stream error (method='{method}'): {ex}");
         }
     }
 
@@ -269,7 +274,7 @@ public class Program
         // Read and respond to each message
         await foreach (var requestData in stream.ReceiveMessagesAsync(ct).ConfigureAwait(false))
         {
-            var request = SimpleRequest.Parser.ParseFrom(requestData.Span);
+            var request = SimpleRequest.Parser.ParseFrom(requestData.AsSpan());
             var responseSize = request.ResponseSize;
             var payload = BenchmarkServiceImpl.GetOrCreatePayload(responseSize);
 

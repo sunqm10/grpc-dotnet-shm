@@ -195,9 +195,10 @@ public sealed partial class Segment : IDisposable
                 syncB = RingSyncFactory.Create(name, "B", isServer, memoryManager, (int)ringBOffset);
             }
         }
-        catch
+        catch (Exception ex)
         {
             // Sync primitives are optional - fall back to polling if not available
+            System.Diagnostics.Debug.WriteLine($"Sync creation failed (name={name}, isServer={isServer}): {ex.Message}");
         }
 
         // Create ring buffers operating directly on mapped memory (zero-copy)

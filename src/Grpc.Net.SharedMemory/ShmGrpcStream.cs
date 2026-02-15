@@ -242,6 +242,10 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         var payload = _trailers.Encode();
         await SendFrameAsync(FrameType.Trailers, TrailersFlags.EndStream, payload);
         _halfCloseSent = true;
+
+        // Auto-remove from connection so the stream slot is freed.
+        // Mirrors the client-side cleanup in OnFrameReceived(Trailers).
+        _connection.RemoveStream(StreamId);
     }
 
     /// <summary>
@@ -559,10 +563,19 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
     internal void OnWindowUpdate(uint increment)
     {
+        if (_disposed) return;
         Interlocked.Add(ref _sendWindow, increment);
         if (increment > 0)
         {
-            _sendWindowSignal.Release();
+            try
+            {
+                _sendWindowSignal.Release();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Stream was disposed between TryGetValue and OnWindowUpdate
+                // in the frame reader — benign race.
+            }
         }
     }
 
