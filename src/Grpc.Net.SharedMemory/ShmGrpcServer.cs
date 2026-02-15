@@ -115,6 +115,34 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     }
 
     /// <summary>
+    /// Registers a unary RPC method handler that works with raw serialized bytes,
+    /// bypassing protobuf deserialization/serialization for maximum performance.
+    /// The handler receives the raw serialized request bytes and must return
+    /// pre-serialized response bytes.
+    /// </summary>
+    public ShmGrpcServer MapUnaryRaw(
+        string method,
+        Func<ReadOnlyMemory<byte>, ServerCallContext, Task<ReadOnlyMemory<byte>>> handler)
+    {
+        _methods[method] = new RawUnaryHandler(handler);
+        return this;
+    }
+
+    /// <summary>
+    /// Registers a bidirectional-streaming RPC handler that works with raw
+    /// serialized bytes per message, bypassing protobuf deserialization/serialization.
+    /// The callback receives each incoming message as raw bytes and must return
+    /// the raw serialized response message.
+    /// </summary>
+    public ShmGrpcServer MapDuplexStreamingRaw(
+        string method,
+        Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask<ReadOnlyMemory<byte>>> messageHandler)
+    {
+        _methods[method] = new RawDuplexStreamingHandler(messageHandler);
+        return this;
+    }
+
+    /// <summary>
     /// Starts the server and blocks until cancellation is requested.
     /// </summary>
     /// <param name="cancellationToken">Token to trigger graceful shutdown.</param>
@@ -413,6 +441,59 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             await _handler(reader, writer, context);
 
             // Send trailers
+            await stream.SendTrailersAsync(
+                context.Status.StatusCode,
+                context.Status.Detail);
+        }
+    }
+
+    private sealed class RawUnaryHandler : IMethodHandler
+    {
+        private readonly Func<ReadOnlyMemory<byte>, ServerCallContext, Task<ReadOnlyMemory<byte>>> _handler;
+
+        public RawUnaryHandler(Func<ReadOnlyMemory<byte>, ServerCallContext, Task<ReadOnlyMemory<byte>>> handler) => _handler = handler;
+
+        public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, CancellationToken ct)
+        {
+            // Read raw request and call handler inline.
+            // The memory from ReceiveMessageBuffersAsync is valid until the
+            // enumerator advances, so we call the handler before breaking.
+            ReadOnlyMemory<byte> rawResponse = ReadOnlyMemory<byte>.Empty;
+
+            await foreach (var msg in stream.ReceiveMessageBuffersAsync(ct))
+            {
+                rawResponse = await _handler(msg, context);
+                break;
+            }
+
+            // Batch response: headers + raw message bytes + trailers
+            var responseHeadersV1 = new HeadersV1 { Version = 1, HeaderType = 1 };
+            var headersPayload = responseHeadersV1.Encode();
+
+            stream.SendUnaryResponseBatch(
+                headersPayload,
+                rawResponse.Span,
+                context.Status.StatusCode,
+                context.Status.Detail);
+        }
+    }
+
+    private sealed class RawDuplexStreamingHandler : IMethodHandler
+    {
+        private readonly Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask<ReadOnlyMemory<byte>>> _onMessage;
+
+        public RawDuplexStreamingHandler(Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask<ReadOnlyMemory<byte>>> onMessage) => _onMessage = onMessage;
+
+        public async Task HandleAsync(ShmGrpcStream stream, ShmServerCallContext context, CancellationToken ct)
+        {
+            await context.EnsureResponseHeadersSentAsync();
+
+            await foreach (var msg in stream.ReceiveMessageBuffersAsync(ct))
+            {
+                var rawResponse = await _onMessage(msg, ct);
+                await stream.SendMessageAsync(rawResponse, ct);
+            }
+
             await stream.SendTrailersAsync(
                 context.Status.StatusCode,
                 context.Status.Detail);

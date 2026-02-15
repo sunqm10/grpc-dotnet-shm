@@ -10,6 +10,7 @@
 //   startBenchEnv(tcp) → StartTcpEnv()        — Kestrel HTTP/2 h2c server
 //   startBenchEnv(shm) → StartShmEnv()        — ShmGrpcServer
 
+using System.Buffers;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
@@ -51,6 +52,7 @@ ThreadPool.SetMinThreads(200, 200);
 string outDir = Path.Combine("benchmark-shm", "out");
 string? platformOverride = null;
 bool serverMode = false;
+bool profileMode = false;
 string? serverTransport = null;
 int serverPort = 0;
 string? serverSegment = null;
@@ -72,6 +74,8 @@ for (int i = 0; i < args.Length; i++)
         serverSegment = args[++i];
     if (args[i] == "--parent-pid")
         parentPid = int.Parse(args[++i], CultureInfo.InvariantCulture);
+    if (args[i] == "--profile")
+        profileMode = true;
 }
 
 if (serverMode)
@@ -82,6 +86,12 @@ if (serverMode)
     }
 
     await RunServerModeAsync(serverTransport!, serverPort, serverSegment, parentPid);
+    return;
+}
+
+if (profileMode)
+{
+    await RunProfileAsync();
     return;
 }
 
@@ -232,7 +242,72 @@ TryGenerateRunnerPlots();
 static Payload MakePayload(int size)
 {
     if (size <= 0) return new Payload();
-    return new Payload { Body = ByteString.CopyFrom(new byte[size]) };
+    return new Payload { Body = UnsafeByteOperations.UnsafeWrap(new byte[size]) };
+}
+
+/// <summary>
+/// Extracts the response_size field (field 1, varint) from a serialized
+/// SimpleRequest without full protobuf deserialization.  For a 1MB message
+/// this replaces an ~876 µs ParseFrom with a ~0 µs field scan.
+/// </summary>
+static int ExtractResponseSize(ReadOnlySpan<byte> data)
+{
+    int offset = 0;
+    while (offset < data.Length)
+    {
+        // Read varint tag
+        int tag = 0;
+        int shift = 0;
+        byte b;
+        do
+        {
+            if (offset >= data.Length) return 0;
+            b = data[offset++];
+            tag |= (b & 0x7F) << shift;
+            shift += 7;
+        } while ((b & 0x80) != 0);
+
+        int fieldNumber = tag >> 3;
+        int wireType = tag & 7;
+
+        if (fieldNumber == 1 && wireType == 0) // response_size: varint
+        {
+            int value = 0;
+            shift = 0;
+            do
+            {
+                if (offset >= data.Length) return 0;
+                b = data[offset++];
+                value |= (b & 0x7F) << shift;
+                shift += 7;
+            } while ((b & 0x80) != 0);
+            return value;
+        }
+
+        // Skip field based on wire type
+        switch (wireType)
+        {
+            case 0: // varint
+                while (offset < data.Length && (data[offset++] & 0x80) != 0) { }
+                break;
+            case 1: offset += 8; break; // 64-bit
+            case 2: // length-delimited
+                int len = 0;
+                shift = 0;
+                do
+                {
+                    if (offset >= data.Length) return 0;
+                    b = data[offset++];
+                    len |= (b & 0x7F) << shift;
+                    shift += 7;
+                } while ((b & 0x80) != 0);
+                offset += len;
+                break;
+            case 5: offset += 4; break; // 32-bit
+            default: return 0;
+        }
+    }
+    return 0;
 }
 
 // ============================================================================
@@ -517,19 +592,37 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
 
     var server = new ShmGrpcServer(segmentName, ringCapacity: 64 * 1024 * 1024, maxStreams: 2);
 
-    server.MapUnary<SimpleRequest, SimpleResponse>(
-        "/grpc.testing.BenchmarkService/UnaryCall",
-        (req, _) => Task.FromResult(new SimpleResponse { Payload = MakePayload(req.ResponseSize) }));
-
-    server.MapDuplexStreaming<SimpleRequest, SimpleResponse>(
-        "/grpc.testing.BenchmarkService/StreamingCall",
-        async (reader, writer, ctx) =>
+    // Pre-cache serialized responses to skip per-request protobuf ser/deser.
+    // This is the key optimization: the SHM raw handler API lets us bypass
+    // ParseFrom (request) and WriteTo (response) entirely.
+    var cachedResponses = new Dictionary<int, byte[]>();
+    ReadOnlyMemory<byte> GetCachedResponse(int size)
+    {
+        if (!cachedResponses.TryGetValue(size, out var cached))
         {
-            while (await reader.MoveNext(ctx.CancellationToken).ConfigureAwait(false))
-            {
-                var req = reader.Current;
-                await writer.WriteAsync(new SimpleResponse { Payload = MakePayload(req.ResponseSize) }).ConfigureAwait(false);
-            }
+            var response = new SimpleResponse { Payload = MakePayload(size) };
+            cached = new byte[response.CalculateSize()];
+            using var cos = new CodedOutputStream(cached);
+            response.WriteTo(cos);
+            cachedResponses[size] = cached;
+        }
+        return cached;
+    }
+
+    server.MapUnaryRaw(
+        "/grpc.testing.BenchmarkService/UnaryCall",
+        (rawRequest, _) =>
+        {
+            int responseSize = ExtractResponseSize(rawRequest.Span);
+            return Task.FromResult(GetCachedResponse(responseSize));
+        });
+
+    server.MapDuplexStreamingRaw(
+        "/grpc.testing.BenchmarkService/StreamingCall",
+        (rawRequest, ct) =>
+        {
+            int responseSize = ExtractResponseSize(rawRequest.Span);
+            return new ValueTask<ReadOnlyMemory<byte>>(GetCachedResponse(responseSize));
         });
 
     Console.WriteLine($"[SERVER] SHM ready on segment: {segmentName}");
@@ -547,6 +640,254 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
         Segment.TryRemoveSegment(segmentName);
         Segment.TryRemoveSegment(segmentName + "_ctl");
     }
+}
+
+// ============================================================================
+// Profile mode — measures component costs to identify SHM bottlenecks
+// ============================================================================
+
+async Task RunProfileAsync()
+{
+    Console.WriteLine("=== SHM Transport Component Profile ===");
+    Console.WriteLine($"Runtime: {RuntimeInformation.FrameworkDescription}");
+    Console.WriteLine($"CPU: {GetCpuInfo()}");
+    Console.WriteLine();
+
+    int[] profileSizes = { 1024, 4096, 16384, 65536, 262144, 524288, 1048576 };
+    const int Iterations = 500;
+    const int Warmup = 50;
+
+    // ---- Part 1: Component costs (in-process, no RPC overhead) ----
+    Console.WriteLine("Part 1: Component Costs (per operation, in-process)");
+    Console.WriteLine($"  {"Size",-10} {"Ser µs",-11} {"Deser µs",-11} {"Memcpy4 µs",-12} {"RingRT µs",-12} {"RingOH µs",-12} {"Pred. µs",-11}");
+    Console.WriteLine("  " + new string('-', 79));
+
+    var compCosts = new Dictionary<int, (double serUs, double deserUs, double memcpyUs, double ringRtUs)>();
+
+    foreach (var size in profileSizes)
+    {
+        // 1. Protobuf serialize
+        var payload = MakePayload(size);
+        var msg = new SimpleRequest { ResponseSize = size, Payload = payload };
+        var msgSize = msg.CalculateSize();
+
+        for (int i = 0; i < Warmup; i++)
+        {
+            var b = ArrayPool<byte>.Shared.Rent(msgSize);
+            using var cos = new CodedOutputStream(b);
+            msg.WriteTo(cos);
+            ArrayPool<byte>.Shared.Return(b);
+        }
+
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < Iterations; i++)
+        {
+            var b = ArrayPool<byte>.Shared.Rent(msgSize);
+            using var cos = new CodedOutputStream(b);
+            msg.WriteTo(cos);
+            ArrayPool<byte>.Shared.Return(b);
+        }
+        sw.Stop();
+        double serUs = sw.Elapsed.TotalMicroseconds / Iterations;
+
+        // 2. Protobuf deserialize
+        var serialized = new byte[msgSize];
+        using (var cos2 = new CodedOutputStream(serialized)) { msg.WriteTo(cos2); }
+        var parser = new MessageParser<SimpleRequest>(() => new SimpleRequest());
+        for (int i = 0; i < Warmup; i++) parser.ParseFrom(serialized);
+
+        sw.Restart();
+        for (int i = 0; i < Iterations; i++)
+        {
+            parser.ParseFrom(serialized);
+        }
+        sw.Stop();
+        double deserUs = sw.Elapsed.TotalMicroseconds / Iterations;
+
+        // 3. Raw memcpy baseline (4 copies like a unary round trip)
+        var src = new byte[size];
+        var dst = new byte[size];
+        for (int i = 0; i < Warmup * 4; i++) Buffer.BlockCopy(src, 0, dst, 0, size);
+
+        sw.Restart();
+        for (int i = 0; i < Iterations; i++)
+        {
+            Buffer.BlockCopy(src, 0, dst, 0, size);
+            Buffer.BlockCopy(src, 0, dst, 0, size);
+            Buffer.BlockCopy(src, 0, dst, 0, size);
+            Buffer.BlockCopy(src, 0, dst, 0, size);
+        }
+        sw.Stop();
+        double memcpyUs = sw.Elapsed.TotalMicroseconds / Iterations;
+
+        // 4. Ring buffer echo round-trip (write→read→write→read, 4 copies through ring)
+        var segName = $"profile_{Environment.ProcessId}_{size}";
+        Segment.TryRemoveSegment(segName);
+        using var segment = Segment.Create(segName, 64 * 1024 * 1024, 1);
+        segment.SetServerReady(true);
+        segment.SetClientReady(true);
+        var ringA = segment.RingA;
+        var ringB = segment.RingB;
+        var writeData = new byte[size];
+        int totalRingIters = Warmup + Iterations;
+
+        // Echo server thread: reads from ringA, writes response to ringB
+        var echoTask = Task.Factory.StartNew(() =>
+        {
+            for (int i = 0; i < totalRingIters; i++)
+            {
+                var (_, pay) = FrameProtocol.ReadFramePayload(ringA, false);
+                var respHdr = new FrameHeader(FrameType.Message, 1, (uint)pay.Length, 0);
+                FrameProtocol.WriteFrame(ringB, respHdr, pay.Memory.Span);
+                pay.Release();
+            }
+        }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+
+        // Warmup
+        for (int i = 0; i < Warmup; i++)
+        {
+            var hdr = new FrameHeader(FrameType.Message, 1, (uint)size, 0);
+            FrameProtocol.WriteFrame(ringA, hdr, writeData);
+            var (_, pay) = FrameProtocol.ReadFramePayload(ringB, false);
+            pay.Release();
+        }
+
+        // Measure: write → echo → read = full ring round-trip
+        sw.Restart();
+        for (int i = 0; i < Iterations; i++)
+        {
+            var hdr = new FrameHeader(FrameType.Message, 1, (uint)size, 0);
+            FrameProtocol.WriteFrame(ringA, hdr, writeData);
+            var (_, pay) = FrameProtocol.ReadFramePayload(ringB, false);
+            pay.Release();
+        }
+        sw.Stop();
+        double ringRtUs = sw.Elapsed.TotalMicroseconds / Iterations;
+
+        await echoTask;
+        Segment.TryRemoveSegment(segName);
+
+        compCosts[size] = (serUs, deserUs, memcpyUs, ringRtUs);
+
+        double ringOverhead = ringRtUs - memcpyUs;
+        // Predicted unary: 2×ser + 2×deser + ringRT (ring RT already includes 4 copies)
+        double predicted = 2 * serUs + 2 * deserUs + ringRtUs;
+
+        Console.WriteLine($"  {FormatSize(size),-10} {serUs,-11:F1} {deserUs,-11:F1} {memcpyUs,-12:F1} {ringRtUs,-12:F1} {ringOverhead,-12:F1} {predicted,-11:F1}");
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("  Ser = protobuf serialize, Deser = deserialize, Memcpy4 = 4× Buffer.BlockCopy,");
+    Console.WriteLine("  RingRT = ring echo round-trip (4 copies through ring), RingOH = RingRT - Memcpy4,");
+    Console.WriteLine("  Pred. = 2×Ser + 2×Deser + RingRT (predicted unary RPC floor)");
+    Console.WriteLine();
+
+    // ---- Part 2: Full RPC measurements ----
+    Console.WriteLine("Part 2: Actual gRPC RPC Latency (separate server processes)");
+    Console.WriteLine();
+
+    var shmResults = new Dictionary<int, (double unaryUs, double streamUs)>();
+    var tcpResults = new Dictionary<int, (double unaryUs, double streamUs)>();
+
+    // SHM RPC
+    {
+        Console.WriteLine("  Starting SHM server...");
+        await using var env = await StartShmEnv();
+        Console.WriteLine("  SHM server ready. Running RPCs...");
+
+        foreach (var size in profileSizes)
+        {
+            int iters = IterationsForSize(size);
+            var (unaryUs, _) = await MeasureUnary(env.Client, size, iters);
+            var (streamUs, _) = await MeasureStreaming(env.Client, size, iters);
+            shmResults[size] = (unaryUs, streamUs);
+        }
+        Console.WriteLine("  SHM complete.");
+    }
+
+    // TCP RPC
+    {
+        Console.WriteLine("  Starting TCP server...");
+        await using var env = await StartTcpEnv();
+        Console.WriteLine("  TCP server ready. Running RPCs...");
+
+        foreach (var size in profileSizes)
+        {
+            int iters = IterationsForSize(size);
+            var (unaryUs, _) = await MeasureUnary(env.Client, size, iters);
+            var (streamUs, _) = await MeasureStreaming(env.Client, size, iters);
+            tcpResults[size] = (unaryUs, streamUs);
+        }
+        Console.WriteLine("  TCP complete.");
+    }
+
+    Console.WriteLine();
+
+    // ---- Part 3: Analysis ----
+    Console.WriteLine("Part 3: Unary RPC Breakdown");
+    Console.WriteLine($"  {"Size",-8} {"Predicted",-11} {"SHM Act.",-11} {"Overhead",-11} {"OH %",-8} {"TCP",-11} {"Speedup",-8}");
+    Console.WriteLine("  " + new string('-', 68));
+
+    foreach (var size in profileSizes)
+    {
+        var (serUs, deserUs, _, ringRtUs) = compCosts[size];
+        double predicted = 2 * serUs + 2 * deserUs + ringRtUs;
+        double shmActual = shmResults[size].unaryUs;
+        double tcpActual = tcpResults[size].unaryUs;
+        double overhead = shmActual - predicted;
+        double overheadPct = (overhead / shmActual) * 100;
+        double speedup = tcpActual / shmActual;
+
+        Console.WriteLine($"  {FormatSize(size),-8} {predicted,-11:F0} {shmActual,-11:F0} {overhead,-11:F0} {overheadPct,-8:F0}% {tcpActual,-11:F0} {speedup,-8:F2}x");
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("  Predicted = component floor (protobuf + ring copies, no async/framing overhead)");
+    Console.WriteLine("  Overhead = Actual - Predicted (async machinery, gRPC framing, flow control, locks, metadata)");
+    Console.WriteLine();
+
+    Console.WriteLine("Part 4: Streaming Ping-Pong Breakdown");
+    Console.WriteLine($"  {"Size",-8} {"Predicted",-11} {"SHM Act.",-11} {"Overhead",-11} {"OH %",-8} {"TCP",-11} {"Speedup",-8}");
+    Console.WriteLine("  " + new string('-', 68));
+
+    foreach (var size in profileSizes)
+    {
+        var (serUs, deserUs, _, ringRtUs) = compCosts[size];
+        // Streaming: each ping-pong = ser+deser (send) + ring RT + ser+deser (recv)
+        // Same as unary: 2 ser + 2 deser + ring RT
+        double predicted = 2 * serUs + 2 * deserUs + ringRtUs;
+        double shmActual = shmResults[size].streamUs;
+        double tcpActual = tcpResults[size].streamUs;
+        double overhead = shmActual - predicted;
+        double overheadPct = (overhead / shmActual) * 100;
+        double speedup = tcpActual / shmActual;
+
+        Console.WriteLine($"  {FormatSize(size),-8} {predicted,-11:F0} {shmActual,-11:F0} {overhead,-11:F0} {overheadPct,-8:F0}% {tcpActual,-11:F0} {speedup,-8:F2}x");
+    }
+
+    Console.WriteLine();
+
+    // ---- Part 5: Cost attribution ----
+    Console.WriteLine("Part 5: Cost Attribution (1MB unary)");
+    if (compCosts.TryGetValue(1048576, out var mb) && shmResults.TryGetValue(1048576, out var shmMb))
+    {
+        double totalSer = 2 * mb.serUs;
+        double totalDeser = 2 * mb.deserUs;
+        double totalMemcpy = mb.memcpyUs;
+        double ringSync = mb.ringRtUs - mb.memcpyUs;
+        double predicted1M = totalSer + totalDeser + mb.ringRtUs;
+        double overhead1M = shmMb.unaryUs - predicted1M;
+
+        Console.WriteLine($"  Protobuf serialize   (2×): {totalSer,8:F0} µs  ({totalSer / shmMb.unaryUs * 100:F0}% of actual)");
+        Console.WriteLine($"  Protobuf deserialize (2×): {totalDeser,8:F0} µs  ({totalDeser / shmMb.unaryUs * 100:F0}% of actual)");
+        Console.WriteLine($"  Memory copies (4× 1MB):    {totalMemcpy,8:F0} µs  ({totalMemcpy / shmMb.unaryUs * 100:F0}% of actual)");
+        Console.WriteLine($"  Ring sync overhead:         {ringSync,8:F0} µs  ({ringSync / shmMb.unaryUs * 100:F0}% of actual)");
+        Console.WriteLine($"  ─── Component floor:        {predicted1M,8:F0} µs  ({predicted1M / shmMb.unaryUs * 100:F0}% of actual)");
+        Console.WriteLine($"  Async/framing overhead:     {overhead1M,8:F0} µs  ({overhead1M / shmMb.unaryUs * 100:F0}% of actual)");
+        Console.WriteLine($"  ═══ Actual SHM:             {shmMb.unaryUs,8:F0} µs  (100%)");
+    }
+
+    Console.WriteLine();
 }
 
 // ============================================================================
@@ -924,7 +1265,7 @@ sealed class BenchmarkServiceImpl : BenchmarkService.BenchmarkServiceBase
     static Payload MakePayload(int size)
     {
         if (size <= 0) return new Payload();
-        return new Payload { Body = ByteString.CopyFrom(new byte[size]) };
+        return new Payload { Body = UnsafeByteOperations.UnsafeWrap(new byte[size]) };
     }
 }
 

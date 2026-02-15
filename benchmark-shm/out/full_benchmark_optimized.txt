@@ -1,0 +1,100 @@
+﻿CPU: ARMv8 (64-bit) Family 8 Model 1 Revision 201, Qualcomm Technologies Inc
+Runtime: .NET 10.0.3
+
+[SRV] [SERVER] TCP ready on 127.0.0.1:57478
+=== TCP Transport ===
+
+  Unary ping-pong:
+  Payload      Iters    Avg µs         Throughput MB/s    Gen0   Gen1   Gen2  
+  ----------------------------------------------------------------------------
+  0B           2000     248.728        0.000              5      1      0     
+  1B           2000     209.272        0.009              5      0      0     
+  1KB          2000     164.947        11.841             6      0      0     
+  4KB          1200     175.887        44.418             5      0      0     
+  16KB         1200     191.913        162.834            12     0      0     
+  64KB         800      584.160        213.982            24     0      0     
+  256KB        400      5560.531       89.919             35     34     34    
+  512KB        250      8311.052       120.322            25     25     25    
+  1MB          150      7963.161       251.157            14     13     13    
+  2MB          80       18426.929      217.074            9      9      9     
+  4MB          40       53067.110      150.753            7      6      6     
+  16MB         20       202671.115     157.891            5      5      5     
+
+  Streaming ping-pong:
+  Payload      Iters    Avg µs         Throughput MB/s    Gen0   Gen1   Gen2  
+  ----------------------------------------------------------------------------
+  0B           2000     446.070        0.000              1      0      0     
+  1B           2000     308.712        0.006              0      0      0     
+  1KB          2000     144.449        13.521             1      0      0     
+  4KB          1200     368.835        21.182             1      0      0     
+  16KB         1200     532.854        58.646             5      0      0     
+  64KB         800      601.778        207.718            8      0      0     
+  256KB        400      5033.237       99.340             2      1      1     
+  512KB        250      5312.464       188.237            1      1      1     
+  1MB          150      15044.858      132.936            3      3      3     
+  2MB          80       19523.266      204.884            7      6      6     
+  4MB          40       34570.018      231.414            8      8      8     
+  16MB         20       164840.235     194.127            9      8      8     
+
+[SRV] [SERVER] SHM ready on segment: bench_shm_35836_6d4e3a23fde24cc49f392c4775174bab
+[SRV] SHM gRPC server listening on segment: bench_shm_35836_6d4e3a23fde24cc49f392c4775174bab
+=== SHM Transport ===
+
+  Unary ping-pong:
+  Payload      Iters    Avg µs         Throughput MB/s    Gen0   Gen1   Gen2  
+  ----------------------------------------------------------------------------
+  0B           2000     90.942         0.000              4      0      0     
+  1B           2000     70.275         0.027              8      0      0     
+  1KB          2000     97.310         20.071             16     0      0     
+  4KB          1200     105.703        73.910             8      0      0     
+  16KB         1200     189.804        164.644            7      0      0     
+  64KB         800      497.479        251.267            17     0      0     
+  256KB        400      1378.700       362.661            5      2      2     
+  512KB        250      1126.821       887.452            7      5      5     
+  1MB          150      759.760        2632.410           9      8      8     
+  2MB          80       2317.444       1726.040           8      8      8     
+  4MB          40       7070.825       1131.410           6      6      6     
+  16MB         20       35588.115      899.177            4      3      3     
+
+  Streaming ping-pong:
+  Payload      Iters    Avg µs         Throughput MB/s    Gen0   Gen1   Gen2  
+  ----------------------------------------------------------------------------
+  0B           2000     40.453         0.000              0      0      0     
+  1B           2000     38.156         0.050              0      0      0     
+  1KB          2000     116.519        16.762             0      0      0     
+  4KB          1200     48.639         160.622            0      0      0     
+  16KB         1200     88.332         353.780            2      1      1     
+  64KB         800      115.147        1085.571           2      0      0     
+  256KB        400      437.438        1143.020           1      1      1     
+  512KB        250      1253.590       797.709            3      3      3     
+  1MB          150      2208.373       905.644            3      3      3     
+  2MB          80       4210.376       950.034            3      3      3     
+  4MB          40       7723.580       1035.789           2      2      2     
+  16MB         20       26757.375      1195.932           2      2      2     
+
+Results written to: benchmark-shm\out\windows-net10-optimized\windows\results.json
+CSV written to: benchmark-shm\out\windows-net10-optimized\windows\results.csv
+Plots written to: benchmark-shm\out\windows-net10-optimized\windows
+Plot generation attempt with '.venv\Scripts\python.exe' failed (exit 1).
+Traceback (most recent call last):
+  File "C:\source\grpc-dotnet-shm\benchmark-shm\benchmark_runner.py", line 1115, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "C:\source\grpc-dotnet-shm\benchmark-shm\benchmark_runner.py", line 1108, in main
+    print(f"  {consolidated_file}  \u2190 CONSOLIDATED (all data)")
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.11_3.11.2544.0_x64__qbz5n2kfra8p0\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2190' in position 82: character maps to <undefined>
+Plot generation attempt with 'python' failed (exit 1).
+Traceback (most recent call last):
+  File "C:\source\grpc-dotnet-shm\benchmark-shm\benchmark_runner.py", line 1115, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "C:\source\grpc-dotnet-shm\benchmark-shm\benchmark_runner.py", line 1108, in main
+    print(f"  {consolidated_file}  \u2190 CONSOLIDATED (all data)")
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.11_3.11.2544.0_x64__qbz5n2kfra8p0\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2190' in position 82: character maps to <undefined>
+Plot generation skipped: no usable Python runtime found.
