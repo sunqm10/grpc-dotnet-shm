@@ -1,0 +1,109 @@
+CPU: ARMv8 (64-bit) Family 8 Model 1 Revision 201, Qualcomm Technologies Inc
+Runtime: .NET 10.0.3
+
+[SRV] [SERVER] TCP ready on 127.0.0.1:54408
+=== TCP Transport ===
+
+  Unary ping-pong:
+  Payload      Iters    Avg -存         Throughput MB/s    Gen0   Gen1   Gen2  
+  ----------------------------------------------------------------------------
+  0B           2000     204.119        0.000              5      1      0     
+  1B           2000     232.028        0.008              5      0      0     
+  1KB          2000     211.316        9.243              6      0      0     
+  4KB          1200     222.381        35.131             5      0      0     
+  16KB         1200     277.139        112.759            12     0      0     
+  64KB         800      1381.650       90.472             16     0      0     
+  256KB        400      4122.268       121.292            33     31     31    
+  512KB        250      7617.241       131.281            45     44     43    
+  1MB          150      9477.153       211.034            43     42     41    
+  2MB          80       18585.537      215.221            29     28     28    
+  4MB          40       38632.518      207.079            19     19     18    
+  16MB         20       150909.685     212.047            13     13     11    
+  32MB         10       268413.280     238.438            8      8      7     
+  64MB         6        551165.367     232.235            5      4      4     
+  128MB        4        1464032.375    174.860            5      4      4     
+
+  Streaming ping-pong:
+  Payload      Iters    Avg -存         Throughput MB/s    Gen0   Gen1   Gen2  
+  ----------------------------------------------------------------------------
+  0B           2000     281.184        0.000              0      0      0     
+  1B           2000     154.251        0.012              1      1      0     
+  1KB          2000     140.836        13.868             0      0      0     
+  4KB          1200     246.946        31.636             1      0      0     
+  16KB         1200     323.420        96.624             3      0      0     
+  64KB         800      555.356        225.081            10     0      0     
+  256KB        400      8261.331       60.523             1      0      0     
+  512KB        250      12407.367      80.597             1      1      1     
+  1MB          150      13894.634      143.940            2      1      1     
+  2MB          80       19775.180      202.274            1      1      1     
+  4MB          40       47799.765      167.365            2      1      1     
+  16MB         20       174129.300     183.771            4      4      4     
+  32MB         10       288866.020     221.556            5      4      4     
+  64MB         6        780168.517     164.067            3      3      3     
+  128MB        4        714954.750     358.065            5      4      4     
+
+[SRV] [SERVER] SHM ready on segment: bench_shm_52764_4fd3c1779df6408e8ae6875cb75854da
+[SRV] SHM gRPC server listening on segment: bench_shm_52764_4fd3c1779df6408e8ae6875cb75854da
+=== SHM Transport ===
+
+  Unary ping-pong:
+  Payload      Iters    Avg -存         Throughput MB/s    Gen0   Gen1   Gen2  
+  ----------------------------------------------------------------------------
+  0B           2000     57.400         0.000              3      0      0     
+  1B           2000     55.977         0.034              7      0      0     
+  1KB          2000     65.562         29.790             16     1      1     
+  4KB          1200     99.855         78.239             9      1      1     
+  16KB         1200     173.113        180.518            11     0      0     
+  64KB         800      480.626        260.077            10     0      0     
+  256KB        400      1125.479       444.255            1      0      0     
+  512KB        250      2305.414       433.762            1      0      0     
+  1MB          150      3619.973       552.490            1      1      1     
+  2MB          80       6124.431       653.122            2      1      1     
+  4MB          40       10196.862      784.555            1      1      1     
+  16MB         20       27846.495      1149.157           2      2      2     
+  32MB         10       65304.830      980.019            2      2      2     
+  64MB         6        155571.533     822.773            1      1      1     
+  128MB        4        373920.100     684.638            3      3      3     
+
+  Streaming ping-pong:
+  Payload      Iters    Avg -存         Throughput MB/s    Gen0   Gen1   Gen2  
+  ----------------------------------------------------------------------------
+  0B           2000     24.393         0.000              1      0      0     
+  1B           2000     24.555         0.078              0      0      0     
+  1KB          2000     32.357         60.361             1      0      0     
+  4KB          1200     35.986         217.100            2      0      0     
+  16KB         1200     114.898        271.980            5      0      0     
+  64KB         800      98.366         1270.761           8      0      0     
+  256KB        400      598.379        835.591            1      0      0     
+  512KB        250      1249.655       800.221            0      0      0     
+  1MB          150      2443.774       818.406            0      0      0     
+  2MB          80       3960.972       1009.853           1      1      1     
+  4MB          40       8380.625       954.583            0      0      0     
+  16MB         20       32114.695      996.429            1      1      1     
+  32MB         10       60231.510      1062.567           1      1      1     
+  64MB         6        141081.383     907.278            2      2      2     
+  128MB        4        285938.400     895.298            1      1      1     
+
+Results written to: C:\source\grpc-dotnet-shm\benchmark-shm\out\windows\results.json
+CSV written to: C:\source\grpc-dotnet-shm\benchmark-shm\out\windows\results.csv
+Plots written to: C:\source\grpc-dotnet-shm\benchmark-shm\out\windows
+Generated PNG benchmark plots via benchmark_runner.py.
+Loaded results from: C:\source\grpc-dotnet-shm\benchmark-shm\out\windows\results.json
+  Timestamp: 2026-02-16T14:37:54.0932858Z
+  CPU: ARMv8 (64-bit) Family 8 Model 1 Revision 201, Qualcomm Technologies Inc
+Created: C:\source\grpc-dotnet-shm\benchmark-shm\out\windows\benchmark_patterns.png
+Created: C:\source\grpc-dotnet-shm\benchmark-shm\out\windows\benchmark_summary.png
+Created: C:\source\grpc-dotnet-shm\benchmark-shm\out\windows\benchmark_large_payloads.png
+Created: C:\source\grpc-dotnet-shm\benchmark-shm\out\windows\benchmark_consolidated.png
+
+======================================================================
+BENCHMARK PLOTS GENERATED
+======================================================================
+  C:\source\grpc-dotnet-shm\benchmark-shm\out\windows\benchmark_patterns.png
+  C:\source\grpc-dotnet-shm\benchmark-shm\out\windows\benchmark_summary.png
+  C:\source\grpc-dotnet-shm\benchmark-shm\out\windows\benchmark_large_payloads.png
+  C:\source\grpc-dotnet-shm\benchmark-shm\out\windows\benchmark_consolidated.png  <- CONSOLIDATED (all data)
+
+Consolidated plot: C:\source\grpc-dotnet-shm\benchmark-shm\out\windows\benchmark_consolidated.png
+
+
