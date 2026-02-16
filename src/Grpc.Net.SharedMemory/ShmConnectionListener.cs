@@ -22,8 +22,9 @@ using System.Net;
 namespace Grpc.Net.SharedMemory;
 
 /// <summary>
-/// A connection listener that accepts gRPC connections over shared memory.
-/// Used for ASP.NET Core server integration.
+/// Advanced/low-level connection listener that accepts gRPC connections over shared memory.
+/// New server implementations should prefer <see cref="ShmGrpcServer"/> as the canonical hosting surface.
+/// Used for ASP.NET Core server integration and custom transport hosting.
 /// </summary>
 public sealed class ShmConnectionListener : IDisposable, IAsyncDisposable
 {

@@ -13,7 +13,7 @@ The shared memory transport uses:
 ## Projects
 
 - **Server**: Listens on a shared memory segment and handles Greeter requests
-- **Client**: Connects to the shared memory segment using `ShmHandler` with standard `GrpcChannel`
+- **Client**: Connects to the shared memory segment using `ShmControlHandler` with standard `GrpcChannel`
 
 ## Running the Example
 
@@ -35,16 +35,14 @@ dotnet run
 
 ## Key Components
 
-### Client Side (ShmHandler)
+### Client Side (ShmControlHandler)
 
 ```csharp
-// Create handler that connects to shared memory segment
-using var handler = new ShmHandler("greeter-shm");
-
 // Use with standard GrpcChannel
 using var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
 {
-    HttpHandler = handler
+    HttpHandler = new ShmControlHandler("greeter_shm_example"),
+    DisposeHttpClient = true
 });
 
 // Create typed client and make calls
@@ -52,15 +50,13 @@ var client = new Greeter.GreeterClient(channel);
 var reply = await client.SayHelloAsync(new HelloRequest { Name = "World" });
 ```
 
-### Server Side (ShmConnectionListener)
+### Server Side (ShmGrpcServer)
 
 ```csharp
-using var listener = new ShmConnectionListener("greeter-shm",
-    ringCapacity: 1024 * 1024,
-    maxStreams: 100);
-
-// Accept and process incoming streams
-// See Program.cs for the handling loop
+await using var server = new ShmGrpcServer("greeter_shm_example");
+server.MapUnary<HelloRequest, HelloReply>(
+    "/greet.Greeter/SayHello", service.SayHello);
+await server.RunAsync();
 ```
 
 ## Performance Characteristics

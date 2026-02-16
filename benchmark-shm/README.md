@@ -5,10 +5,7 @@ This directory contains benchmarks comparing gRPC .NET performance over TCP vs s
 ## Current Status
 
 - **TCP Transport**: Fully functional
-- **SHM Transport**: Work in progress - requires client/server protocol alignment
-
-> Note: The SHM benchmarks currently require further integration between the client-side 
-> `ShmHandler` and server-side `ShmControlListener` protocols.
+- **SHM Transport**: Active and benchmarked alongside TCP using shared-memory control/data segments
 
 ## Quick Start
 

@@ -180,10 +180,10 @@ Objective: minimize avoidable allocations/copies across request/response paths.
 Objective: define and enforce one recommended SHM client/server usage pattern.
 
 ### Tasks
-- [ ] Select primary client handler pattern and document why.
-- [ ] Select primary server hosting pattern and document why.
-- [ ] Mark alternate APIs as advanced/legacy/internal where appropriate.
-- [ ] Update docs/examples to use the primary pattern.
+- [x] Select primary client handler pattern and document why. *(Canonical: `ShmControlHandler` with `GrpcChannel.ForAddress("http://localhost", ...)`.)*
+- [x] Select primary server hosting pattern and document why. *(Canonical: `ShmGrpcServer` with `MapUnary`/`MapDuplexStreaming`.)*
+- [x] Mark alternate APIs as advanced/legacy/internal where appropriate. *(`ShmHandler` and `ShmConnectionListener` XML docs now marked legacy/advanced.)*
+- [ ] Update docs/examples to use the primary pattern. *(In progress: remaining `ShmHandler` clients and stale example docs migrated in this session.)*
 
 ### Validation
 - [ ] All updated examples compile and run.

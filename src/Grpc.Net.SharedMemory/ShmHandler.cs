@@ -26,7 +26,8 @@ using Grpc.Net.SharedMemory.Compression;
 namespace Grpc.Net.SharedMemory;
 
 /// <summary>
-/// An HttpMessageHandler that routes gRPC requests over shared memory.
+/// Legacy/advanced <see cref="HttpMessageHandler"/> for shared-memory gRPC clients.
+/// New code should prefer <see cref="ShmControlHandler"/> as the canonical client surface.
 /// Use with GrpcChannel.ForAddress() by setting GrpcChannelOptions.HttpHandler.
 /// </summary>
 /// <example>

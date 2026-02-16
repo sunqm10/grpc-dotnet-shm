@@ -24,6 +24,7 @@ using Grpc.Core;
 namespace Grpc.Net.SharedMemory;
 
 /// <summary>
+/// Recommended server hosting surface for shared-memory gRPC services.
 /// A standalone gRPC server that uses shared memory transport directly.
 /// Per RFC A73, the transport exposes gRPC semantics (headers, messages, trailers)
 /// and hides HTTP/2 semantics. HTTP/2 is only used conceptually for the dialer

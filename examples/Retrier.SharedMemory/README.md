@@ -48,13 +48,13 @@ var retryPolicy = new ShmRetryPolicy
 
 ### Shared Memory Transport
 
-The client uses `ShmHandler` for zero-copy communication:
+The client uses `ShmControlHandler` for shared-memory communication:
 
 ```csharp
-using var handler = new ShmHandler(segmentName);
-using var channel = GrpcChannel.ForAddress("shm://localhost", new GrpcChannelOptions
+using var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
 {
-    HttpHandler = handler
+    HttpHandler = new ShmControlHandler(segmentName),
+    DisposeHttpClient = true
 });
 ```
 

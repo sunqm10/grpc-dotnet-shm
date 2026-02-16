@@ -23,8 +23,8 @@ using Grpc.Core;
 namespace Grpc.Net.SharedMemory;
 
 /// <summary>
-/// An HttpMessageHandler that routes gRPC requests over shared memory
-/// using the grpc-go-shmem compatible control segment protocol.
+/// Recommended <see cref="HttpMessageHandler"/> for shared-memory gRPC clients.
+/// Routes gRPC requests over shared memory using the grpc-go-shmem compatible control segment protocol.
 /// Use with GrpcChannel.ForAddress() by setting GrpcChannelOptions.HttpHandler.
 /// </summary>
 /// <example>
