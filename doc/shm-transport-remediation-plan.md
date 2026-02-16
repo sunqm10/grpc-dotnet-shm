@@ -69,7 +69,7 @@ Update this table at least once per session.
 | WS2 | Zero-copy path hardening and copy elimination | TBD | Done | TBD | 2026-02-16 | Completed transport copy-map items: pooled multipart receive assembly, pooled/borrowed control-frame decode paths, allocation-free control-frame writes, and ownership/lifetime regression coverage. |
 | WS3 | Dialer/server API standardization | TBD | Done | TBD | 2026-02-16 | Canonical surface documented and applied (`ShmControlHandler` + `ShmGrpcServer`); alternates marked advanced/legacy; docs aligned. |
 | WS4 | E2E example normalization to idiomatic gRPC | TBD | In Progress | TBD | 2026-02-16 | Manual framing removed from Metadata/Reflector/Uploader shared-memory examples; broad smoke-run and remaining payload-memory validation pending. |
-| WS5 | Test hardening and coverage alignment | TBD | In Progress | TBD | 2026-02-15 | Existing E2E tests include simulated behavior; realism gap identified. |
+| WS5 | Test hardening and coverage alignment | TBD | In Progress | TBD | 2026-02-16 | EndToEnd tests now use real stream routing (`AcceptStreamAsync`) instead of simulated delays; full SHM suite currently green. |
 | WS6 | Benchmark realism and reporting cleanup | TBD | In Progress | TBD | 2026-02-15 | README/status drift and estimated plot metrics identified. |
 | WS7 | Code organization and deprecation cleanup | TBD | In Progress | TBD | 2026-02-15 | Overlapping transport surfaces identified; ownership consolidation pending. |
 
@@ -218,12 +218,12 @@ Objective: ensure examples use generated clients/stubs and idiomatic patterns.
 Objective: ensure tests validate real behavior, not simulated behavior.
 
 ### Tasks
-- [ ] Replace simulated E2E patterns with true connection/stream routing where possible.
-- [ ] Add regression tests for no-polling and no-copy goals (where testable).
+- [x] Replace simulated E2E patterns with true connection/stream routing where possible. *(Refactored `EndToEndTests` to use real server stream acceptance and true request/response/message/trailer paths.)*
+- [x] Add regression tests for no-polling and no-copy goals (where testable). *(Coverage in place via `SegmentTests.Ws1_NoPollingFallbackMarkers_RemainRemoved`, `ShmGrpcStreamTests.ReceiveMessagesAsync_ReturnsOwnedIndependentBuffers`, and large-message E2E assertions.)*
 - [ ] Ensure cross-platform sync behavior (Windows/Linux) is covered.
 
 ### Validation
-- [ ] `Grpc.Net.SharedMemory.Tests` fully passing.
+- [x] `Grpc.Net.SharedMemory.Tests` fully passing. *(393 total, 0 failed, 388 passed, 4 skipped.)*
 - [ ] No new flaky tests introduced.
 
 ### Exit Criteria

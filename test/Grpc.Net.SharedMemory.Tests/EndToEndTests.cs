@@ -32,95 +32,100 @@ public class EndToEndTests
     [Timeout(10000)]
     public async Task UnaryCall_SimpleRequestResponse_Works()
     {
-        // Arrange
         var segmentName = $"grpc_e2e_{Guid.NewGuid():N}";
-
-        // Create server connection
         using var serverConnection = ShmConnection.CreateAsServer(segmentName, ringCapacity: 4096, maxStreams: 100);
-
-        // Create client connection
         using var clientConnection = ShmConnection.ConnectAsClient(segmentName);
 
-        // Start server task to handle one request
         var serverTask = Task.Run(async () =>
         {
-            // Create a server-side stream to respond
-            var serverStream = serverConnection.CreateStream();
+            var serverStream = await serverConnection.AcceptStreamAsync();
+            Assert.That(serverStream, Is.Not.Null);
 
-            // Wait for request headers from client
-            // In real implementation, the connection would route frames to streams
-            // For this test, we simulate by directly reading from the ring
-            await Task.Delay(50); // Give client time to send
+            Assert.That(serverStream!.RequestHeaders, Is.Not.Null);
+            Assert.That(serverStream.RequestHeaders!.Method, Is.EqualTo("/greet.Greeter/SayHello"));
+            Assert.That(serverStream.RequestHeaders.Metadata.Count, Is.EqualTo(1));
 
-            // Server sends response headers
+            byte[]? request = null;
+            await foreach (var message in serverStream.ReceiveMessagesAsync())
+            {
+                request = message;
+            }
+
+            Assert.That(request, Is.Not.Null);
+
             await serverStream.SendResponseHeadersAsync();
-
-            // Server sends a message (simulated response)
-            var responseMessage = Encoding.UTF8.GetBytes("Hello, World!");
+            var name = Encoding.UTF8.GetString(request!);
+            var responseMessage = Encoding.UTF8.GetBytes($"Hello, {name}!");
             await serverStream.SendMessageAsync(responseMessage);
-
-            // Server sends trailers to complete
             await serverStream.SendTrailersAsync(StatusCode.OK, "Success");
-
-            return "server done";
         });
 
-        // Client sends a request
         var clientStream = clientConnection.CreateStream();
-
         var metadata = new Metadata { { "client-id", "test-client" } };
         await clientStream.SendRequestHeadersAsync("/greet.Greeter/SayHello", "localhost", metadata);
-
-        // Client sends request message
         var requestMessage = Encoding.UTF8.GetBytes("GreeterClient");
         await clientStream.SendMessageAsync(requestMessage);
-
-        // Client signals end of request
         await clientStream.SendHalfCloseAsync();
 
-        // Wait for server to complete
+        var headers = await clientStream.ReceiveResponseHeadersAsync();
+        Assert.That(headers, Is.Not.Null);
+
+        var responses = new List<string>();
+        await foreach (var msg in clientStream.ReceiveMessagesAsync())
+        {
+            responses.Add(Encoding.UTF8.GetString(msg));
+        }
+
         await serverTask;
 
-        // Assert - verify client state
+        Assert.That(responses, Is.EqualTo(new[] { "Hello, GreeterClient!" }));
+        Assert.That(clientStream.Trailers, Is.Not.Null);
+        Assert.That(clientStream.Trailers!.GrpcStatusCode, Is.EqualTo(StatusCode.OK));
         Assert.That(clientStream.IsLocalHalfClosed, Is.True);
-        Assert.That(clientStream.RequestHeaders, Is.Not.Null);
-        Assert.That(clientStream.RequestHeaders!.Method, Is.EqualTo("/greet.Greeter/SayHello"));
     }
 
     [Test]
     [Timeout(10000)]
     public async Task ServerStreaming_MultipleMessages_Works()
     {
-        // Arrange
         var segmentName = $"grpc_e2e_{Guid.NewGuid():N}";
         using var serverConnection = ShmConnection.CreateAsServer(segmentName, ringCapacity: 8192, maxStreams: 100);
         using var clientConnection = ShmConnection.ConnectAsClient(segmentName);
 
-        // Server task that sends multiple messages
         var messageCount = 5;
         var serverTask = Task.Run(async () =>
         {
-            var serverStream = serverConnection.CreateStream();
-            await serverStream.SendResponseHeadersAsync();
+            var serverStream = await serverConnection.AcceptStreamAsync();
+            Assert.That(serverStream, Is.Not.Null);
 
-            // Send multiple messages
+            await serverStream.SendResponseHeadersAsync();
             for (int i = 0; i < messageCount; i++)
             {
                 var message = Encoding.UTF8.GetBytes($"Message {i}");
                 await serverStream.SendMessageAsync(message);
             }
-
             await serverStream.SendTrailersAsync(StatusCode.OK);
         });
 
-        // Client initiates request
         var clientStream = clientConnection.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/ServerStream", "localhost");
         await clientStream.SendHalfCloseAsync();
 
+        _ = await clientStream.ReceiveResponseHeadersAsync();
+
+        var responses = new List<string>();
+        await foreach (var msg in clientStream.ReceiveMessagesAsync())
+        {
+            responses.Add(Encoding.UTF8.GetString(msg));
+        }
+
         await serverTask;
 
-        // Assert
+        Assert.That(responses.Count, Is.EqualTo(messageCount));
+        Assert.That(responses[0], Is.EqualTo("Message 0"));
+        Assert.That(responses[4], Is.EqualTo("Message 4"));
+        Assert.That(clientStream.Trailers, Is.Not.Null);
+        Assert.That(clientStream.Trailers!.GrpcStatusCode, Is.EqualTo(StatusCode.OK));
         Assert.That(clientStream.IsLocalHalfClosed, Is.True);
     }
 
@@ -128,26 +133,27 @@ public class EndToEndTests
     [Timeout(10000)]
     public async Task ClientStreaming_MultipleMessages_Works()
     {
-        // Arrange
         var segmentName = $"grpc_e2e_{Guid.NewGuid():N}";
         using var serverConnection = ShmConnection.CreateAsServer(segmentName, ringCapacity: 8192, maxStreams: 100);
         using var clientConnection = ShmConnection.ConnectAsClient(segmentName);
 
         var messageCount = 5;
-
-        // Server task that waits for client messages
         var serverTask = Task.Run(async () =>
         {
-            var serverStream = serverConnection.CreateStream();
+            var serverStream = await serverConnection.AcceptStreamAsync();
+            Assert.That(serverStream, Is.Not.Null);
+
+            var received = 0;
+            await foreach (var _ in serverStream!.ReceiveMessagesAsync())
+            {
+                received++;
+            }
+
             await serverStream.SendResponseHeadersAsync();
-
-            // In real implementation, server would receive and process messages
-            await Task.Delay(100);
-
-            await serverStream.SendTrailersAsync(StatusCode.OK, $"Received messages");
+            await serverStream.SendMessageAsync(Encoding.UTF8.GetBytes(received.ToString()));
+            await serverStream.SendTrailersAsync(StatusCode.OK, $"Received {received} messages");
         });
 
-        // Client sends multiple messages
         var clientStream = clientConnection.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/ClientStream", "localhost");
 
@@ -158,9 +164,19 @@ public class EndToEndTests
         }
 
         await clientStream.SendHalfCloseAsync();
+
+        _ = await clientStream.ReceiveResponseHeadersAsync();
+        var responses = new List<string>();
+        await foreach (var msg in clientStream.ReceiveMessagesAsync())
+        {
+            responses.Add(Encoding.UTF8.GetString(msg));
+        }
+
         await serverTask;
 
-        // Assert
+        Assert.That(responses, Is.EqualTo(new[] { "5" }));
+        Assert.That(clientStream.Trailers, Is.Not.Null);
+        Assert.That(clientStream.Trailers!.GrpcStatusCode, Is.EqualTo(StatusCode.OK));
         Assert.That(clientStream.IsLocalHalfClosed, Is.True);
     }
 
@@ -168,42 +184,51 @@ public class EndToEndTests
     [Timeout(10000)]
     public async Task BidirectionalStreaming_Works()
     {
-        // Arrange
         var segmentName = $"grpc_e2e_{Guid.NewGuid():N}";
         using var serverConnection = ShmConnection.CreateAsServer(segmentName, ringCapacity: 8192, maxStreams: 100);
         using var clientConnection = ShmConnection.ConnectAsClient(segmentName);
 
-        // Server echoes messages
         var serverTask = Task.Run(async () =>
         {
-            var serverStream = serverConnection.CreateStream();
+            var serverStream = await serverConnection.AcceptStreamAsync();
+            Assert.That(serverStream, Is.Not.Null);
+
             await serverStream.SendResponseHeadersAsync();
 
-            // Echo a few messages
-            for (int i = 0; i < 3; i++)
+            await foreach (var message in serverStream!.ReceiveMessagesAsync())
             {
-                var message = Encoding.UTF8.GetBytes($"Echo {i}");
                 await serverStream.SendMessageAsync(message);
             }
 
             await serverStream.SendTrailersAsync(StatusCode.OK);
         });
 
-        // Client sends and receives
         var clientStream = clientConnection.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/BiDi", "localhost");
 
-        // Send messages
+        var requests = new List<string>();
         for (int i = 0; i < 3; i++)
         {
-            var message = Encoding.UTF8.GetBytes($"Request {i}");
+            var text = $"Request {i}";
+            requests.Add(text);
+            var message = Encoding.UTF8.GetBytes(text);
             await clientStream.SendMessageAsync(message);
         }
 
         await clientStream.SendHalfCloseAsync();
+
+        _ = await clientStream.ReceiveResponseHeadersAsync();
+        var echoes = new List<string>();
+        await foreach (var msg in clientStream.ReceiveMessagesAsync())
+        {
+            echoes.Add(Encoding.UTF8.GetString(msg));
+        }
+
         await serverTask;
 
-        // Assert
+        Assert.That(echoes, Is.EqualTo(requests));
+        Assert.That(clientStream.Trailers, Is.Not.Null);
+        Assert.That(clientStream.Trailers!.GrpcStatusCode, Is.EqualTo(StatusCode.OK));
         Assert.That(clientStream.IsLocalHalfClosed, Is.True);
     }
 
@@ -211,30 +236,38 @@ public class EndToEndTests
     [Timeout(10000)]
     public async Task ErrorResponse_ReturnsStatusCode()
     {
-        // Arrange
         var segmentName = $"grpc_e2e_{Guid.NewGuid():N}";
         using var serverConnection = ShmConnection.CreateAsServer(segmentName, ringCapacity: 4096, maxStreams: 100);
         using var clientConnection = ShmConnection.ConnectAsClient(segmentName);
 
-        // Server returns error
         var serverTask = Task.Run(async () =>
         {
-            var serverStream = serverConnection.CreateStream();
+            var serverStream = await serverConnection.AcceptStreamAsync();
+            Assert.That(serverStream, Is.Not.Null);
+
+            await foreach (var _ in serverStream!.ReceiveMessagesAsync())
+            {
+            }
+
             await serverStream.SendResponseHeadersAsync();
             await serverStream.SendTrailersAsync(StatusCode.InvalidArgument, "Missing required field");
         });
 
-        // Client makes request
         var clientStream = clientConnection.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/Error", "localhost");
+        await clientStream.SendMessageAsync(Encoding.UTF8.GetBytes("bad-request"));
         await clientStream.SendHalfCloseAsync();
+
+        _ = await clientStream.ReceiveResponseHeadersAsync();
+        await foreach (var _ in clientStream.ReceiveMessagesAsync())
+        {
+        }
 
         await serverTask;
 
-        // Assert - server stream should have trailers set
-        var serverStream2 = serverConnection.CreateStream();
-        await serverStream2.SendTrailersAsync(StatusCode.NotFound, "Test");
-        Assert.That(serverStream2.Trailers!.GrpcStatusCode, Is.EqualTo(StatusCode.NotFound));
+        Assert.That(clientStream.Trailers, Is.Not.Null);
+        Assert.That(clientStream.Trailers!.GrpcStatusCode, Is.EqualTo(StatusCode.InvalidArgument));
+        Assert.That(clientStream.Trailers.GrpcStatusMessage, Is.EqualTo("Missing required field"));
     }
 
     [Test]
@@ -259,27 +292,33 @@ public class EndToEndTests
     [Timeout(10000)]
     public async Task Deadline_PropagatesInHeaders()
     {
-        // Arrange
         var segmentName = $"grpc_e2e_{Guid.NewGuid():N}";
         using var serverConnection = ShmConnection.CreateAsServer(segmentName, ringCapacity: 4096, maxStreams: 100);
         using var clientConnection = ShmConnection.ConnectAsClient(segmentName);
 
         var deadline = DateTime.UtcNow.AddSeconds(30);
 
-        // Client sends request with deadline
+        var serverTask = Task.Run(async () =>
+        {
+            var serverStream = await serverConnection.AcceptStreamAsync();
+            Assert.That(serverStream, Is.Not.Null);
+            Assert.That(serverStream!.RequestHeaders, Is.Not.Null);
+            Assert.That(serverStream.RequestHeaders!.DeadlineUnixNano, Is.GreaterThan(0UL));
+        });
+
         var clientStream = clientConnection.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/Deadline", "localhost", deadline: deadline);
+        await clientStream.SendHalfCloseAsync();
 
-        // Assert - deadline should be in headers
         Assert.That(clientStream.RequestHeaders, Is.Not.Null);
         Assert.That(clientStream.RequestHeaders!.DeadlineUnixNano, Is.GreaterThan(0UL));
+        await serverTask;
     }
 
     [Test]
     [Timeout(10000)]
     public async Task Metadata_RoundTrips()
     {
-        // Arrange
         var segmentName = $"grpc_e2e_{Guid.NewGuid():N}";
         using var serverConnection = ShmConnection.CreateAsServer(segmentName, ringCapacity: 4096, maxStreams: 100);
         using var clientConnection = ShmConnection.ConnectAsClient(segmentName);
@@ -290,36 +329,96 @@ public class EndToEndTests
             { "x-another-header", "another-value" }
         };
 
-        // Client sends request with metadata
+        var serverTask = Task.Run(async () =>
+        {
+            var serverStream = await serverConnection.AcceptStreamAsync();
+            Assert.That(serverStream, Is.Not.Null);
+            Assert.That(serverStream!.RequestHeaders, Is.Not.Null);
+            Assert.That(serverStream.RequestHeaders!.Metadata.Count, Is.EqualTo(2));
+
+            await foreach (var _ in serverStream.ReceiveMessagesAsync())
+            {
+            }
+
+            var responseHeaders = new Metadata
+            {
+                { "x-server-header", "server-value" }
+            };
+            var responseTrailers = new Metadata
+            {
+                { "x-server-trailer", "trailer-value" }
+            };
+
+            await serverStream.SendResponseHeadersAsync(responseHeaders);
+            await serverStream.SendTrailersAsync(StatusCode.OK, metadata: responseTrailers);
+        });
+
         var clientStream = clientConnection.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/Metadata", "localhost", metadata);
+        await clientStream.SendHalfCloseAsync();
 
-        // Assert - metadata should be in headers
+        var headers = await clientStream.ReceiveResponseHeadersAsync();
+        await foreach (var _ in clientStream.ReceiveMessagesAsync())
+        {
+        }
+
+        await serverTask;
+
         Assert.That(clientStream.RequestHeaders, Is.Not.Null);
         Assert.That(clientStream.RequestHeaders!.Metadata.Count, Is.EqualTo(2));
+        Assert.That(headers.Metadata.Any(kv => kv.Key == "x-server-header"), Is.True);
+        Assert.That(clientStream.Trailers, Is.Not.Null);
+        Assert.That(clientStream.Trailers!.Metadata.Any(kv => kv.Key == "x-server-trailer"), Is.True);
     }
 
     [Test]
     [Timeout(10000)]
     public async Task LargeMessage_TransfersCorrectly()
     {
-        // Arrange - use larger ring for this test
         var segmentName = $"grpc_e2e_{Guid.NewGuid():N}";
-        // Ring capacity must be power of 2
         using var serverConnection = ShmConnection.CreateAsServer(segmentName, ringCapacity: 2 * 1024 * 1024, maxStreams: 100);
         using var clientConnection = ShmConnection.ConnectAsClient(segmentName);
 
-        // Create a message smaller than initial window size (65535 bytes)
-        var largeMessage = new byte[32 * 1024]; // 32KB
+        var largeMessage = new byte[32 * 1024];
         new Random(42).NextBytes(largeMessage);
 
-        // Client sends message
+        var serverTask = Task.Run(async () =>
+        {
+            var serverStream = await serverConnection.AcceptStreamAsync();
+            Assert.That(serverStream, Is.Not.Null);
+
+            byte[]? received = null;
+            await foreach (var msg in serverStream!.ReceiveMessagesAsync())
+            {
+                received = msg;
+            }
+
+            Assert.That(received, Is.Not.Null);
+            Assert.That(received, Is.EqualTo(largeMessage));
+
+            await serverStream.SendResponseHeadersAsync();
+            await serverStream.SendMessageAsync(Encoding.UTF8.GetBytes("ok"));
+            await serverStream.SendTrailersAsync(StatusCode.OK);
+        });
+
         var clientStream = clientConnection.CreateStream();
         await clientStream.SendRequestHeadersAsync("/test/Large", "localhost");
         await clientStream.SendMessageAsync(largeMessage);
         await clientStream.SendHalfCloseAsync();
 
-        // Assert
+        _ = await clientStream.ReceiveResponseHeadersAsync();
+
+        var responses = new List<string>();
+        await foreach (var msg in clientStream.ReceiveMessagesAsync())
+        {
+            responses.Add(Encoding.UTF8.GetString(msg));
+        }
+
+        await serverTask;
+
+        Assert.That(responses, Is.EqualTo(new[] { "ok" }));
+        Assert.That(clientStream.Trailers, Is.Not.Null);
+        Assert.That(clientStream.Trailers!.GrpcStatusCode, Is.EqualTo(StatusCode.OK));
         Assert.That(clientStream.IsLocalHalfClosed, Is.True);
     }
 
