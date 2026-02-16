@@ -247,71 +247,6 @@ static Payload MakePayload(int size)
     return new Payload { Body = UnsafeByteOperations.UnsafeWrap(new byte[size]) };
 }
 
-/// <summary>
-/// Extracts the response_size field (field 1, varint) from a serialized
-/// SimpleRequest without full protobuf deserialization.  For a 1MB message
-/// this replaces an ~876 µs ParseFrom with a ~0 µs field scan.
-/// </summary>
-static int ExtractResponseSize(ReadOnlySpan<byte> data)
-{
-    int offset = 0;
-    while (offset < data.Length)
-    {
-        // Read varint tag
-        int tag = 0;
-        int shift = 0;
-        byte b;
-        do
-        {
-            if (offset >= data.Length) return 0;
-            b = data[offset++];
-            tag |= (b & 0x7F) << shift;
-            shift += 7;
-        } while ((b & 0x80) != 0);
-
-        int fieldNumber = tag >> 3;
-        int wireType = tag & 7;
-
-        if (fieldNumber == 1 && wireType == 0) // response_size: varint
-        {
-            int value = 0;
-            shift = 0;
-            do
-            {
-                if (offset >= data.Length) return 0;
-                b = data[offset++];
-                value |= (b & 0x7F) << shift;
-                shift += 7;
-            } while ((b & 0x80) != 0);
-            return value;
-        }
-
-        // Skip field based on wire type
-        switch (wireType)
-        {
-            case 0: // varint
-                while (offset < data.Length && (data[offset++] & 0x80) != 0) { }
-                break;
-            case 1: offset += 8; break; // 64-bit
-            case 2: // length-delimited
-                int len = 0;
-                shift = 0;
-                do
-                {
-                    if (offset >= data.Length) return 0;
-                    b = data[offset++];
-                    len |= (b & 0x7F) << shift;
-                    shift += 7;
-                } while ((b & 0x80) != 0);
-                offset += len;
-                break;
-            case 5: offset += 4; break; // 32-bit
-            default: return 0;
-        }
-    }
-    return 0;
-}
-
 // ============================================================================
 // Environment Setup
 // ============================================================================
@@ -594,72 +529,23 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
 
     var server = new ShmGrpcServer(segmentName, ringCapacity: ShmRingCapacityBytes, maxStreams: 2);
 
-    // Reusable response buffer to avoid LOH allocations per RPC.
-    // At 128MB, new byte[] every call triggers Gen2 GC pauses.
-    // Safe because the SHM server processes one unary/streaming RPC at a time
-    // per stream, and the buffer is fully consumed before the next call.
-    byte[]? _cachedResponseBuffer = null;
-
-    (byte[] buffer, int length) BuildSerializedResponse(ReadOnlySpan<byte> rawRequest)
-    {
-        // Extract only the ResponseSize field without full protobuf deserialization.
-        // At 128MB this avoids parsing the entire payload body just for a 4-byte int.
-        int responseSize = ExtractResponseSize(rawRequest);
-
-        if (responseSize <= 0)
-        {
-            return (Array.Empty<byte>(), 0);
-        }
-
-        // Build the wire-format directly: SimpleResponse { Payload { Body = bytes } }
-        // Wire layout:
-        //   field 1 (Payload) = tag 0x0A, length-delimited
-        //     field 1 (Body)  = tag 0x0A, length-delimited, <responseSize zero bytes>
-        var bodyTag = 1;          // field 1 = Body (bytes)
-        var bodyTagByte = (byte)((bodyTag << 3) | 2); // wire type 2 = length-delimited
-        int bodyHeaderSize = 1 + CodedOutputStream.ComputeRawVarint32Size((uint)responseSize);
-        int innerPayloadSize = bodyHeaderSize + responseSize;
-
-        var payloadTag = 1;      // field 1 = Payload (message)
-        var payloadTagByte = (byte)((payloadTag << 3) | 2);
-        int payloadHeaderSize = 1 + CodedOutputStream.ComputeRawVarint32Size((uint)innerPayloadSize);
-
-        int totalSize = payloadHeaderSize + innerPayloadSize;
-
-        // Reuse the cached buffer if large enough; otherwise allocate once and cache.
-        if (_cachedResponseBuffer == null || _cachedResponseBuffer.Length < totalSize)
-        {
-            _cachedResponseBuffer = new byte[totalSize];
-        }
-        else
-        {
-            // Zero the body region — reused buffer may have stale data.
-            _cachedResponseBuffer.AsSpan(0, totalSize).Clear();
-        }
-
-        var cos = new CodedOutputStream(_cachedResponseBuffer);
-        cos.WriteTag(payloadTagByte);
-        cos.WriteLength(innerPayloadSize);
-        cos.WriteTag(bodyTagByte);
-        cos.WriteLength(responseSize);
-        cos.Flush();
-        return (_cachedResponseBuffer, totalSize);
-    }
-
-    server.MapUnaryRaw(
+    // Use the same typed protobuf handlers as the TCP server so the benchmark
+    // measures pure transport advantage.  The ShmGrpcServer's typed handler
+    // path already reads messages via zero-copy ring buffer reservations
+    // (ReceiveMessageBuffersAsync) — no extra application code required.
+    server.MapUnary<SimpleRequest, SimpleResponse>(
         "/grpc.testing.BenchmarkService/UnaryCall",
-        (rawRequest, _) =>
-        {
-            var (buf, len) = BuildSerializedResponse(rawRequest.Span);
-            return Task.FromResult<ReadOnlyMemory<byte>>(new ReadOnlyMemory<byte>(buf, 0, len));
-        });
+        (request, context) => Task.FromResult(new SimpleResponse { Payload = MakePayload(request.ResponseSize) }));
 
-    server.MapDuplexStreamingRaw(
+    server.MapDuplexStreaming<SimpleRequest, SimpleResponse>(
         "/grpc.testing.BenchmarkService/StreamingCall",
-        (rawRequest, ct) =>
+        async (requestStream, responseStream, context) =>
         {
-            var (buf, len) = BuildSerializedResponse(rawRequest.Span);
-            return new ValueTask<ReadOnlyMemory<byte>>(new ReadOnlyMemory<byte>(buf, 0, len));
+            while (await requestStream.MoveNext(context.CancellationToken))
+            {
+                var req = requestStream.Current;
+                await responseStream.WriteAsync(new SimpleResponse { Payload = MakePayload(req.ResponseSize) });
+            }
         });
 
     Console.WriteLine($"[SERVER] SHM ready on segment: {segmentName}");
