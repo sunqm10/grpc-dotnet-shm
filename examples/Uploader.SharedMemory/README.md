@@ -30,6 +30,12 @@ dotnet run
 2. **Chunked Transfer**: Sending files in chunks to manage memory efficiently
 3. **Metadata + Data Pattern**: Sending file metadata first, then data chunks
 
+## Memory Behavior for Large Payloads
+
+- The client reads and sends data in fixed-size chunks (`32 KB`) instead of loading the full file into memory.
+- The server streams chunks directly to disk as they arrive.
+- This keeps memory usage bounded for large uploads and avoids full-payload buffering.
+
 ## Shared Memory Transport
 
 This example uses the shared memory transport instead of TCP for ultra-low latency

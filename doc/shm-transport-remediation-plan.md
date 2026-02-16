@@ -202,14 +202,14 @@ Objective: ensure examples use generated clients/stubs and idiomatic patterns.
 - [x] Remove manual frame-level handling from end-user examples. *(Migrated manual frame/stream handling in `Metadata.SharedMemory`, `Reflector.SharedMemory`, and `Uploader.SharedMemory`.)*
 - [x] Use generated stubs and normal gRPC read/write loops. *(Converted migrated examples to typed unary/client-streaming/duplex handlers and clients.)*
 - [x] Keep SHM-specific configuration limited to transport selection. *(Examples now use `ShmControlHandler` client + `ShmGrpcServer` server without manual framing APIs.)*
-- [ ] Ensure large payload examples demonstrate non-regressive memory behavior.
+- [x] Ensure large payload examples demonstrate non-regressive memory behavior. *(Uploader/Downloader examples stream payloads in bounded `32 KB` chunks and write incrementally, avoiding full-payload buffering.)*
 
 ### Validation
-- [ ] All SHM examples build. *(Validated migrated projects: `Uploader.SharedMemory/Server`, `Reflector.SharedMemory/Server`, `Metadata.SharedMemory/Server`, `Metadata.SharedMemory/Client`.)*
-- [ ] Smoke-run critical examples (Greeter, RouteGuide, Uploader/Downloader, Metadata, Error).
+- [x] All SHM examples build. *(Project-level build matrix: `42/42` SharedMemory `.csproj` build successfully. Note: two legacy `.slnx` wrappers (`Progressor.SharedMemory.slnx`, `Racer.SharedMemory.slnx`) contain classic `.sln` text and fail XML `.slnx` parsing, but their underlying projects build.)*
+- [x] Smoke-run critical examples (Greeter, RouteGuide, Uploader/Downloader, Metadata, Error). *(Validated live RPC calls and expected responses over SHM for all listed pairs.)*
 
 ### Exit Criteria
-- [ ] No example requires manual gRPC framing unless explicitly marked low-level/internal.
+- [x] No example requires manual gRPC framing unless explicitly marked low-level/internal.
 
 ---
 
