@@ -17,7 +17,7 @@
 #endregion
 
 using Google.Protobuf;
-using Grpc.Net.SharedMemory;
+using Grpc.Core;
 using Upload;
 
 namespace Server.Services;
@@ -37,8 +37,11 @@ public class UploaderService
     /// <summary>
     /// Receives a file upload from the client via streaming.
     /// </summary>
-    public async Task<string> UploadFileAsync(ShmGrpcStream stream, CancellationToken cancellationToken)
+    public async Task<UploadFileResponse> UploadFileAsync(
+        IAsyncStreamReader<UploadFileRequest> requestStream,
+        ServerCallContext context)
     {
+        var cancellationToken = context.CancellationToken;
         var uploadId = Path.GetRandomFileName();
         var uploadPath = Path.Combine(_uploadsPath, uploadId);
         Directory.CreateDirectory(uploadPath);
@@ -48,30 +51,8 @@ public class UploaderService
         await using var writeStream = File.Create(Path.Combine(uploadPath, "data.bin"));
         long totalBytesReceived = 0;
 
-        // Read messages from the client stream using ReceiveFrameAsync
-        while (!cancellationToken.IsCancellationRequested)
+        await foreach (var message in requestStream.ReadAllAsync(cancellationToken))
         {
-            var frame = await stream.ReceiveFrameAsync(cancellationToken);
-            if (frame == null)
-            {
-                break; // End of stream
-            }
-
-            var (frameType, payload) = frame.Value;
-            
-            // Only process MESSAGE frames (DATA frames in HTTP/2 terminology)
-            if (frameType != FrameType.Message || payload.Length == 0)
-            {
-                // HALF_CLOSE or other frame types indicate end of client stream
-                if (frameType == FrameType.HalfClose)
-                {
-                    break;
-                }
-                continue;
-            }
-
-            var message = UploadFileRequest.Parser.ParseFrom(payload);
-
             if (message.Metadata != null)
             {
                 Console.WriteLine($"Received metadata: {message.Metadata.FileName}");
@@ -92,6 +73,6 @@ public class UploaderService
         Console.WriteLine($"Upload complete: {uploadId}, total bytes: {totalBytesReceived}");
         Console.WriteLine($"Files saved to: {uploadPath}");
 
-        return uploadId;
+        return new UploadFileResponse { Id = uploadId };
     }
 }

@@ -21,30 +21,10 @@ using Grpc.Core;
 
 namespace Server;
 
-public class EchoService : Echo.Echo.EchoBase
+public class EchoService
 {
-    private readonly ILogger<EchoService> _logger;
-
-    public EchoService(ILogger<EchoService> logger)
+    public Task<EchoResponse> UnaryEcho(EchoRequest request, ServerCallContext context)
     {
-        _logger = logger;
-    }
-
-    public override Task<EchoResponse> UnaryEcho(EchoRequest request, ServerCallContext context)
-    {
-        _logger.LogInformation("UnaryEcho: {Message}", request.Message);
         return Task.FromResult(new EchoResponse { Message = request.Message });
-    }
-
-    public override async Task BidirectionalStreamingEcho(
-        IAsyncStreamReader<EchoRequest> requestStream,
-        IServerStreamWriter<EchoResponse> responseStream,
-        ServerCallContext context)
-    {
-        await foreach (var req in requestStream.ReadAllAsync())
-        {
-            _logger.LogInformation("BidirectionalStreamingEcho: {Message}", req.Message);
-            await responseStream.WriteAsync(new EchoResponse { Message = req.Message });
-        }
     }
 }

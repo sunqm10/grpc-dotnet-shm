@@ -2,11 +2,9 @@
 
 This example demonstrates metadata (headers/trailers) handling over shared memory transport.
 
-> Note: This example intentionally uses low-level `ShmConnection`/`ShmGrpcStream` APIs to show frame-level metadata behavior. For normal applications, prefer the canonical `ShmControlHandler` (client) + `ShmGrpcServer` (server) pattern used in other shared-memory examples.
-
-## Design
-
-Mirrors the Go grpc-go-shmem `examples/shm/features/metadata` example.
+It uses the canonical shared-memory gRPC pattern:
+- Client: `GrpcChannel` + `ShmControlHandler`
+- Server: `ShmGrpcServer` + generated protobuf stubs
 
 Features demonstrated:
 - Sending custom metadata from client
@@ -36,16 +34,24 @@ dotnet run
 **Client:**
 ```
 === Unary Call with Metadata ===
-Sending request with timestamp metadata
-Received response: Echo: this is examples/metadata
-Response headers received with timestamp
+Sending request with metadata:
+	timestamp = Jan 15 15:30:45.1234567
+	client-id = shm-client-1
 
-=== Server Streaming with Metadata ===
-...
+Received response headers:
+	timestamp = Jan 15 15:30:45.1234567
+	server-location = shared-memory
+
+Received response: this is examples/metadata
+
+Received trailers:
+	trailer-timestamp = Jan 15 15:30:45.1234567
 ```
 
 **Server:**
 ```
-Received metadata: timestamp = Jan 15 15:30:45.123456789
-Echoing message: this is examples/metadata
+Received request metadata:
+	timestamp = Jan 15 15:30:45.1234567
+	client-id = shm-client-1
+Message: "this is examples/metadata", sending echo
 ```

@@ -16,9 +16,9 @@
 
 #endregion
 
-using Google.Protobuf;
-using Grpc.Core;
+using Greet;
 using Grpc.Net.SharedMemory;
+using Grpc.Reflection;
 using Grpc.Reflection.V1Alpha;
 using Server.Services;
 
@@ -30,10 +30,15 @@ Console.WriteLine($"Segment name: {SegmentName}");
 
 // Create services
 var greeterService = new GreeterService();
-var reflectionService = new ReflectionService();
+var reflectionService = new ReflectionServiceImpl(ServerReflection.Descriptor, Greeter.Descriptor);
 
-// Create the shared memory listener using ShmControlListener for grpc-go-shmem compatibility
-using var listener = new ShmControlListener(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
+// Create SHM gRPC server (canonical WS4 hosting surface)
+await using var server = new ShmGrpcServer(SegmentName, ringCapacity: 1024 * 1024, maxStreams: 100);
+server.MapUnary<HelloRequest, HelloReply>(
+    "/greet.Greeter/SayHello", greeterService.SayHelloAsync);
+server.MapDuplexStreaming<ServerReflectionRequest, ServerReflectionResponse>(
+    "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo", reflectionService.ServerReflectionInfo);
+
 Console.WriteLine("Server listening on shared memory segment: " + SegmentName);
 Console.WriteLine("Press Ctrl+C to stop the server.");
 
@@ -46,65 +51,7 @@ Console.CancelKeyPress += (_, e) =>
 
 try
 {
-    await foreach (var connection in listener.AcceptConnectionsAsync(cts.Token))
-    {
-        Console.WriteLine($"New connection accepted: {connection.Name}");
-
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await foreach (var stream in connection.AcceptStreamsAsync(cts.Token))
-                {
-                    try
-                    {
-                        var headers = stream.RequestHeaders;
-                        if (headers?.Method is { } method)
-                        {
-                            Console.WriteLine($"Received request for method: {method}");
-
-                            if (method == "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo")
-                            {
-                                await stream.SendResponseHeadersAsync();
-                                await reflectionService.HandleReflectionAsync(stream, cts.Token);
-                                await stream.SendTrailersAsync(StatusCode.OK);
-                            }
-                            else if (method == "/greet.Greeter/SayHello")
-                            {
-                                // Read the request message
-                                ReadOnlyMemory<byte> requestBytes = default;
-                                await foreach (var msg in stream.ReceiveMessagesAsync(cts.Token))
-                                {
-                                    requestBytes = msg;
-                                    break;
-                                }
-
-                                await stream.SendResponseHeadersAsync();
-                                var response = await greeterService.SayHelloAsync(stream, requestBytes);
-                                await stream.SendMessageAsync(response);
-                                await stream.SendTrailersAsync(StatusCode.OK);
-                            }
-                            else
-                            {
-                                throw new RpcException(new Status(StatusCode.Unimplemented, $"Method {method} is not implemented"));
-                            }
-                        }
-                    }
-                    catch (RpcException ex)
-                    {
-                        Console.WriteLine($"RPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
-                        await stream.SendTrailersAsync(ex.Status.StatusCode, ex.Status.Detail);
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"Error: {ex.Message}");
-                        await stream.SendTrailersAsync(StatusCode.Internal, ex.Message);
-                    }
-                }
-            }
-            catch (OperationCanceledException) { }
-        });
-    }
+    await server.RunAsync(cts.Token);
 }
 catch (OperationCanceledException)
 {

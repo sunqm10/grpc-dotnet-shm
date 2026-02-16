@@ -68,7 +68,7 @@ Update this table at least once per session.
 | WS1 | Remove polling from transport/control paths | TBD | Done | TBD | 2026-02-16 | Completed: polling removed from default control/readiness paths, explicit non-default missing-sync compatibility mode added, and WS1-targeted tests pass. |
 | WS2 | Zero-copy path hardening and copy elimination | TBD | Done | TBD | 2026-02-16 | Completed transport copy-map items: pooled multipart receive assembly, pooled/borrowed control-frame decode paths, allocation-free control-frame writes, and ownership/lifetime regression coverage. |
 | WS3 | Dialer/server API standardization | TBD | Done | TBD | 2026-02-16 | Canonical surface documented and applied (`ShmControlHandler` + `ShmGrpcServer`); alternates marked advanced/legacy; docs aligned. |
-| WS4 | E2E example normalization to idiomatic gRPC | TBD | In Progress | TBD | 2026-02-15 | Multiple examples are low-level/manual rather than idiomatic generated stubs. |
+| WS4 | E2E example normalization to idiomatic gRPC | TBD | In Progress | TBD | 2026-02-16 | Manual framing removed from Metadata/Reflector/Uploader shared-memory examples; broad smoke-run and remaining payload-memory validation pending. |
 | WS5 | Test hardening and coverage alignment | TBD | In Progress | TBD | 2026-02-15 | Existing E2E tests include simulated behavior; realism gap identified. |
 | WS6 | Benchmark realism and reporting cleanup | TBD | In Progress | TBD | 2026-02-15 | README/status drift and estimated plot metrics identified. |
 | WS7 | Code organization and deprecation cleanup | TBD | In Progress | TBD | 2026-02-15 | Overlapping transport surfaces identified; ownership consolidation pending. |
@@ -183,7 +183,7 @@ Objective: define and enforce one recommended SHM client/server usage pattern.
 - [x] Select primary client handler pattern and document why. *(Canonical: `ShmControlHandler` with `GrpcChannel.ForAddress("http://localhost", ...)`.)*
 - [x] Select primary server hosting pattern and document why. *(Canonical: `ShmGrpcServer` with `MapUnary`/`MapDuplexStreaming`.)*
 - [x] Mark alternate APIs as advanced/legacy/internal where appropriate. *(`ShmHandler` and `ShmConnectionListener` XML docs now marked legacy/advanced.)*
-- [x] Update docs/examples to use the primary pattern. *(Canonical client/server path now used across standard SHM examples; `Metadata.SharedMemory` is explicitly marked as an intentional low-level/advanced example and tracked under WS4 normalization.)*
+- [x] Update docs/examples to use the primary pattern. *(Canonical client/server path now used across SHM examples.)*
 
 ### Validation
 - [x] All updated examples compile and run. *(Updated server projects validated: `Vigor.SharedMemory`, `Error.SharedMemory`, `Downloader.SharedMemory`.)*
@@ -199,13 +199,13 @@ Objective: define and enforce one recommended SHM client/server usage pattern.
 Objective: ensure examples use generated clients/stubs and idiomatic patterns.
 
 ### Tasks
-- [ ] Remove manual frame-level handling from end-user examples.
-- [ ] Use generated stubs and normal gRPC read/write loops.
-- [ ] Keep SHM-specific configuration limited to transport selection.
+- [x] Remove manual frame-level handling from end-user examples. *(Migrated manual frame/stream handling in `Metadata.SharedMemory`, `Reflector.SharedMemory`, and `Uploader.SharedMemory`.)*
+- [x] Use generated stubs and normal gRPC read/write loops. *(Converted migrated examples to typed unary/client-streaming/duplex handlers and clients.)*
+- [x] Keep SHM-specific configuration limited to transport selection. *(Examples now use `ShmControlHandler` client + `ShmGrpcServer` server without manual framing APIs.)*
 - [ ] Ensure large payload examples demonstrate non-regressive memory behavior.
 
 ### Validation
-- [ ] All SHM examples build.
+- [ ] All SHM examples build. *(Validated migrated projects: `Uploader.SharedMemory/Server`, `Reflector.SharedMemory/Server`, `Metadata.SharedMemory/Server`, `Metadata.SharedMemory/Client`.)*
 - [ ] Smoke-run critical examples (Greeter, RouteGuide, Uploader/Downloader, Metadata, Error).
 
 ### Exit Criteria

@@ -16,9 +16,10 @@
 
 #endregion
 
-using System.Net;
-using System.Text;
+using Echo;
+using System.Globalization;
 using Grpc.Core;
+using Grpc.Net.Client;
 using Grpc.Net.SharedMemory;
 
 const string SegmentName = "metadata_shm";
@@ -29,7 +30,13 @@ Console.WriteLine("Metadata Example - Shared Memory Client");
 Console.WriteLine($"Connecting to shm://{SegmentName}");
 Console.WriteLine();
 
-using var connection = ShmConnection.ConnectAsClient(SegmentName);
+using var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
+{
+    HttpHandler = new ShmControlHandler(SegmentName),
+    DisposeHttpClient = true
+});
+
+var client = new Echo.Echo.EchoClient(channel);
 Console.WriteLine("Connected to server");
 Console.WriteLine();
 
@@ -37,21 +44,19 @@ Console.WriteLine();
 // Unary Call with Metadata
 // ============================================================
 Console.WriteLine("=== Unary Call with Metadata ===");
-await UnaryCallWithMetadata(connection, Message);
+await UnaryCallWithMetadata(client, Message);
 Console.WriteLine();
 
 Console.WriteLine("All metadata tests completed!");
 
-async Task UnaryCallWithMetadata(ShmConnection conn, string message)
+async Task UnaryCallWithMetadata(Echo.Echo.EchoClient echoClient, string message)
 {
-    var stream = conn.CreateStream();
-
     try
     {
         // Create metadata with timestamp
         var requestMetadata = new Metadata
         {
-            { "timestamp", DateTime.UtcNow.ToString(TimestampFormat) },
+            { "timestamp", DateTime.UtcNow.ToString(TimestampFormat, CultureInfo.InvariantCulture) },
             { "client-id", "shm-client-1" }
         };
 
@@ -61,69 +66,39 @@ async Task UnaryCallWithMetadata(ShmConnection conn, string message)
             Console.WriteLine($"  {entry.Key} = {entry.Value}");
         }
 
-        // Send request with metadata
-        await stream.SendRequestHeadersAsync("/echo.Echo/UnaryEcho", SegmentName, requestMetadata);
+        var call = echoClient.UnaryEchoAsync(new EchoRequest { Message = message }, headers: requestMetadata);
 
-        // Send message
-        var messageBytes = Encoding.UTF8.GetBytes(message);
-        var framedMessage = new byte[5 + messageBytes.Length];
-        framedMessage[0] = 0;
-        var lengthBytes = BitConverter.GetBytes(IPAddress.HostToNetworkOrder(messageBytes.Length));
-        Buffer.BlockCopy(lengthBytes, 0, framedMessage, 1, 4);
-        Buffer.BlockCopy(messageBytes, 0, framedMessage, 5, messageBytes.Length);
-        await stream.SendMessageAsync(framedMessage);
-        await stream.SendTrailersAsync(StatusCode.OK); // Half-close
-
-        // Receive response headers with metadata
-        var headerFrame = await stream.ReceiveFrameAsync();
-        if (headerFrame?.Type == FrameType.Headers)
+        var responseHeaders = await call.ResponseHeadersAsync;
+        Console.WriteLine("\nReceived response headers:");
+        foreach (var entry in responseHeaders)
         {
-            Console.WriteLine("\nReceived response headers:");
-            if (stream.ResponseHeaders?.Metadata != null)
+            var value = entry.IsBinary
+                ? Convert.ToBase64String(entry.ValueBytes)
+                : entry.Value;
+            if (value != null)
             {
-                foreach (var kv in stream.ResponseHeaders.Metadata)
-                {
-                    foreach (var value in kv.Values)
-                    {
-                        Console.WriteLine($"  {kv.Key} = {Encoding.UTF8.GetString(value)}");
-                    }
-                }
+                Console.WriteLine($"  {entry.Key} = {value}");
             }
         }
 
-        // Receive response message
-        var dataFrame = await stream.ReceiveFrameAsync();
-        if (dataFrame?.Type == FrameType.Data)
-        {
-            var response = Encoding.UTF8.GetString(dataFrame.Value.Payload.AsSpan(5));
-            Console.WriteLine($"\nReceived response: {response}");
-        }
+        var response = await call.ResponseAsync;
+        Console.WriteLine($"\nReceived response: {response.Message}");
 
-        // Receive trailers with metadata
-        var trailerFrame = await stream.ReceiveFrameAsync();
-        if (trailerFrame?.Type == FrameType.Trailers)
+        var trailers = call.GetTrailers();
+        Console.WriteLine("\nReceived trailers:");
+        foreach (var entry in trailers)
         {
-            var trailers = TrailersV1.Decode(trailerFrame.Value.Payload);
-            Console.WriteLine("\nReceived trailers:");
-            Console.WriteLine($"  status = {trailers.GrpcStatusCode}");
-            if (trailers.Metadata != null)
+            var value = entry.IsBinary
+                ? Convert.ToBase64String(entry.ValueBytes)
+                : entry.Value;
+            if (value != null)
             {
-                foreach (var kv in trailers.Metadata)
-                {
-                    foreach (var value in kv.Values)
-                    {
-                        Console.WriteLine($"  {kv.Key} = {Encoding.UTF8.GetString(value)}");
-                    }
-                }
+                Console.WriteLine($"  {entry.Key} = {value}");
             }
         }
     }
     catch (Exception ex)
     {
         Console.WriteLine($"Error: {ex.Message}");
-    }
-    finally
-    {
-        stream.Dispose();
     }
 }

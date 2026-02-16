@@ -16,9 +16,8 @@
 
 #endregion
 
-using Google.Protobuf;
 using Greet;
-using Grpc.Net.SharedMemory;
+using Grpc.Core;
 
 namespace Server.Services;
 
@@ -27,13 +26,12 @@ namespace Server.Services;
 /// </summary>
 public class GreeterService
 {
-    public Task<byte[]> SayHelloAsync(ShmGrpcStream stream, byte[] requestData)
+    public Task<HelloReply> SayHelloAsync(HelloRequest request, ServerCallContext context)
     {
-        var request = HelloRequest.Parser.ParseFrom(requestData);
         var response = new HelloReply
         {
             Message = $"Hello {request.Name}!"
         };
-        return Task.FromResult(response.ToByteArray());
+        return Task.FromResult(response);
     }
 }
