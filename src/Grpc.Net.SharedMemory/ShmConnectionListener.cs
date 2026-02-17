@@ -16,7 +16,6 @@
 
 #endregion
 
-using System.IO.Pipelines;
 using System.Net;
 
 namespace Grpc.Net.SharedMemory;
@@ -152,13 +151,13 @@ public sealed class ShmEndPoint : EndPoint
 public static class ShmServerExtensions
 {
     /// <summary>
-    /// Configures the server to listen on a shared memory segment.
+    /// Creates an advanced shared-memory listener for custom hosting.
+    /// New server implementations should prefer <see cref="ShmGrpcServer"/>.
     /// </summary>
-    /// <param name="builder">The web application builder.</param>
     /// <param name="segmentName">The shared memory segment name.</param>
     /// <param name="ringCapacity">Ring buffer capacity (default: 64MB).</param>
     /// <param name="maxStreams">Maximum concurrent streams (default: 100).</param>
-    /// <returns>The listener for use in custom server implementations.</returns>
+    /// <returns>A low-level listener for custom server implementations.</returns>
     public static ShmConnectionListener ListenOnSharedMemory(
         string segmentName,
         ulong ringCapacity = 64 * 1024 * 1024,

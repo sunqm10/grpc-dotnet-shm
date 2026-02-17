@@ -21,14 +21,15 @@ using System.Net.Http;
 namespace Grpc.Net.SharedMemory;
 
 /// <summary>
-/// An <see cref="HttpMessageHandler"/> that routes HTTP/2 gRPC traffic over shared memory
+/// Advanced/legacy <see cref="HttpMessageHandler"/> that routes HTTP/2 gRPC traffic over shared memory
 /// using the grpc-go-shmem compatible control segment protocol.
-/// The underlying transport is standard HTTP/2; only the byte stream is replaced with
-/// shared memory ring buffers instead of TCP sockets.
+/// New client implementations should prefer <see cref="ShmControlHandler"/> as the canonical surface.
 /// </summary>
 /// <remarks>
-/// Use this handler with <c>GrpcChannel.ForAddress</c> to create a client that communicates
-/// over shared memory while using standard gRPC service stubs:
+/// This handler is primarily for low-level compatibility and custom HTTP stack integration.
+/// For standard client usage, use <see cref="ShmControlHandler"/> with <c>GrpcChannel.ForAddress</c>.
+///
+/// Example of this advanced handler:
 /// <code>
 /// using var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
 /// {

@@ -23,9 +23,10 @@ using System.Net;
 namespace Grpc.Net.SharedMemory;
 
 /// <summary>
-/// A connection listener compatible with grpc-go-shmem.
+/// Advanced control-plane connection listener compatible with grpc-go-shmem.
 /// Uses a control segment (_ctl) for connection establishment and creates
 /// per-connection data segments, matching the Go implementation.
+/// This is infrastructure used by <see cref="ShmGrpcServer"/> and custom hosts.
 /// </summary>
 public sealed class ShmControlListener : IDisposable, IAsyncDisposable
 {
