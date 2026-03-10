@@ -383,6 +383,10 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// <summary>
     /// Receives response headers (client-side).
     /// </summary>
+    /// <exception cref="ShmStreamRefusedException">
+    /// Thrown when the server refuses the stream (sends TRAILERS before HEADERS),
+    /// typically because the maximum concurrent stream limit was reached.
+    /// </exception>
     public async Task<HeadersV1> ReceiveResponseHeadersAsync(CancellationToken cancellationToken = default)
     {
         if (!IsClientStream)
@@ -399,6 +403,18 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 _responseHeaders = HeadersV1.Decode(frame.Value.Memory.Span);
                 frame.Value.ReturnToPool();
                 return _responseHeaders;
+            }
+
+            // Server sent TRAILERS before HEADERS — stream was refused.
+            // This happens when the server's max concurrent streams is exceeded.
+            // Analogous to HTTP/2 RST_STREAM with REFUSED_STREAM error code.
+            if (frame.Value.Type == FrameType.Trailers)
+            {
+                var trailers = TrailersV1.Decode(frame.Value.Memory.Span);
+                frame.Value.ReturnToPool();
+                _trailers = trailers;
+                _halfCloseReceived = true;
+                throw new ShmStreamRefusedException(trailers.GrpcStatusMessage ?? "Stream refused by server");
             }
 
             frame.Value.ReturnToPool();
@@ -628,7 +644,35 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         }
     }
 
-    private async Task SendFrameAsync(FrameType type, byte flags, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
+    private Task SendFrameAsync(FrameType type, byte flags, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken = default)
+    {
+        // Synchronous fast path: if the send lock is uncontended (the common case
+        // for unary calls and low-concurrency streaming), acquire it synchronously
+        // to avoid allocating an async state machine (~200 bytes per call).
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // Wait(0) is a non-blocking try-acquire; cancellation token is irrelevant.
+#pragma warning disable CA2016
+        if (_sendLock.Wait(0))
+#pragma warning restore CA2016
+        {
+            try
+            {
+                _connection.SendFrame(type, StreamId, flags, payload.Span);
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+
+            return Task.CompletedTask;
+        }
+
+        // Contended: fall back to async wait.
+        return SendFrameAsyncContended(type, flags, payload, cancellationToken);
+    }
+
+    private async Task SendFrameAsyncContended(FrameType type, byte flags, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
     {
         await _sendLock.WaitAsync(cancellationToken);
         try
@@ -645,8 +689,45 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// Zero-copy variant: enqueues without copying; the pooled buffer is returned
     /// to <see cref="ArrayPool{T}"/> by the writer thread after the ring write.
     /// </summary>
-    private async Task SendFrameZeroCopyAsync(FrameType type, byte flags,
+    private Task SendFrameZeroCopyAsync(FrameType type, byte flags,
         ReadOnlyMemory<byte> payload, byte[] pooledBuffer, CancellationToken cancellationToken = default)
+    {
+        // Synchronous fast path: same optimization as SendFrameAsync.
+        // Uses IsCancellationRequested + Task.FromCanceled instead of ThrowIfCancellationRequested
+        // because we must return pooledBuffer to ArrayPool before failing.
+        if (cancellationToken.IsCancellationRequested)
+        {
+            ArrayPool<byte>.Shared.Return(pooledBuffer);
+            return Task.FromCanceled(cancellationToken);
+        }
+
+        // Wait(0) is a non-blocking try-acquire; cancellation token is irrelevant.
+#pragma warning disable CA2016
+        if (_sendLock.Wait(0))
+#pragma warning restore CA2016
+        {
+            try
+            {
+                _connection.SendFrameZeroCopy(type, StreamId, flags, payload, pooledBuffer);
+            }
+            catch
+            {
+                ArrayPool<byte>.Shared.Return(pooledBuffer);
+                throw;
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+
+            return Task.CompletedTask;
+        }
+
+        return SendFrameZeroCopyAsyncContended(type, flags, payload, pooledBuffer, cancellationToken);
+    }
+
+    private async Task SendFrameZeroCopyAsyncContended(FrameType type, byte flags,
+        ReadOnlyMemory<byte> payload, byte[] pooledBuffer, CancellationToken cancellationToken)
     {
         try
         {

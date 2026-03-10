@@ -40,22 +40,51 @@ namespace Grpc.Net.SharedMemory;
 public sealed class ShmControlHandler : HttpMessageHandler
 {
     private readonly string _baseName;
-    private ShmConnection? _connection;
-    private readonly SemaphoreSlim _connectionLock;
-    private readonly TimeSpan _connectTimeout;
+    private readonly ShmClientTransportOptions _options;
+    private readonly ShmConnectionPool? _pool;
     private bool _disposed;
+
+    // --- Pool-bypass mode (EnableMultipleConnections = false) ---
+    // Holds a single direct connection, lazily initialized on first use.
+    private readonly SemaphoreSlim? _directConnectLock;
+    private volatile ShmConnection? _directConnection;
 
     /// <summary>
     /// Creates a new ShmControlHandler that connects to the specified shared memory segment
     /// using the grpc-go-shmem control segment protocol.
     /// </summary>
     /// <param name="baseName">The base name of the shared memory segment (without _ctl suffix).</param>
-    /// <param name="connectTimeout">Timeout for connection establishment (default: 30s).</param>
-    public ShmControlHandler(string baseName, TimeSpan? connectTimeout = null)
+    /// <param name="options">
+    /// Optional transport options. When <c>null</c>, default options are used
+    /// (multiple connections enabled, 64 MB ring, 30s connect timeout).
+    /// </param>
+    public ShmControlHandler(string baseName, ShmClientTransportOptions? options = null)
     {
         _baseName = baseName ?? throw new ArgumentNullException(nameof(baseName));
-        _connectionLock = new SemaphoreSlim(1, 1);
-        _connectTimeout = connectTimeout ?? TimeSpan.FromSeconds(30);
+        _options = options ?? new ShmClientTransportOptions();
+
+        if (_options.EnableMultipleConnections)
+        {
+            _pool = new ShmConnectionPool(_options, ConnectViaControlSegmentAsync);
+        }
+        else
+        {
+            // Single-connection bypass mode: lazy-init on first request.
+            _directConnectLock = new SemaphoreSlim(1, 1);
+        }
+    }
+
+    /// <summary>
+    /// Creates a new ShmControlHandler with a legacy-compatible connect timeout parameter.
+    /// Equivalent to passing <c>new ShmClientTransportOptions { ConnectTimeout = connectTimeout }</c>.
+    /// </summary>
+    /// <param name="baseName">The base name of the shared memory segment (without _ctl suffix).</param>
+    /// <param name="connectTimeout">Timeout for connection establishment. <c>null</c> uses the default (30s).</param>
+    public ShmControlHandler(string baseName, TimeSpan? connectTimeout)
+        : this(baseName, connectTimeout.HasValue
+            ? new ShmClientTransportOptions { ConnectTimeout = connectTimeout.Value }
+            : null)
+    {
     }
 
     /// <summary>
@@ -63,81 +92,64 @@ public sealed class ShmControlHandler : HttpMessageHandler
     /// </summary>
     public string BaseName => _baseName;
 
+    /// <summary>
+    /// Gets the connection pool used by this handler, or <c>null</c> when
+    /// <see cref="ShmClientTransportOptions.EnableMultipleConnections"/> is <c>false</c>.
+    /// Exposed for diagnostics.
+    /// </summary>
+    internal ShmConnectionPool? Pool => _pool;
+
+    /// <summary>
+    /// Gets whether connection pooling is enabled for this handler.
+    /// Equivalent to <see cref="ShmClientTransportOptions.EnableMultipleConnections"/>.
+    /// </summary>
+    internal bool IsPoolingEnabled => _pool != null;
+
     /// <inheritdoc/>
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        // Ensure we have a connection
-        var connection = await EnsureConnectedAsync(cancellationToken).ConfigureAwait(false);
+        ShmGrpcStream stream;
 
-        // Create a new stream for this request
-        var stream = connection.CreateStream();
+        if (_pool != null)
+        {
+            // === Pooled path ===
+            // Try synchronous fast path first to avoid ValueTask→await overhead.
+            if (!_pool.TryGetConnection(out var pooledConn))
+            {
+                pooledConn = await _pool.GetConnectionAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            try
+            {
+                stream = pooledConn.CreateStream();
+            }
+            catch (ShmStreamCapacityExceededException) when (!cancellationToken.IsCancellationRequested)
+            {
+                // Capacity race: another thread took the last slot.
+                // Enter slow retry path with timeout.
+                stream = await CreateStreamWithRetryAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (ShmStreamCapacityExceededException) when (cancellationToken.IsCancellationRequested)
+            {
+                // Cancelled while also hitting capacity — surface the cancellation,
+                // not the transport-layer capacity exception.
+                cancellationToken.ThrowIfCancellationRequested();
+                throw; // unreachable, but satisfies compiler
+            }
+        }
+        else
+        {
+            // === Pool-bypass path ===
+            // Zero pool overhead: direct connection.CreateStream().
+            var conn = _directConnection ?? await EnsureDirectConnectionAsync(cancellationToken).ConfigureAwait(false);
+            stream = conn.CreateStream();
+        }
 
         try
         {
-            // Extract gRPC metadata
-            var method = request.RequestUri?.AbsolutePath ?? "/";
-            var authority = request.RequestUri?.Authority ?? "localhost";
-            var metadata = ExtractMetadata(request.Headers);
-            var deadline = ExtractDeadline(request.Headers);
-
-            // Send request headers
-            await stream.SendRequestHeadersAsync(method, authority, metadata, deadline).ConfigureAwait(false);
-
-            // Send request body via a write-through stream that forwards each
-            // gRPC frame directly to SHM.  CopyToAsync must run in the background
-            // because PushStreamContent.SerializeToStreamAsync awaits CompleteTcs
-            // for streaming calls (it blocks until the client closes the request
-            // stream).  A single Task.Run + direct writes replaces the previous
-            // Pipe + 2×Task.Run approach, eliminating resource accumulation.
-            if (request.Content != null)
-            {
-                var writeStream = new ShmGrpcRequestStream(stream);
-                _ = Task.Run(async () =>
-                {
-                    try
-                    {
-                        await request.Content.CopyToAsync(writeStream, cancellationToken).ConfigureAwait(false);
-                        await stream.SendHalfCloseAsync().ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException) { /* Normal cancellation */ }
-                    catch (ObjectDisposedException) { /* Call disposed */ }
-                    catch (Exception ex)
-                    {
-                        System.Diagnostics.Debug.WriteLine($"ShmControlHandler body send error: {ex.Message}");
-                    }
-                }, cancellationToken);
-            }
-            else
-            {
-                await stream.SendHalfCloseAsync().ConfigureAwait(false);
-            }
-
-            // Wait for response headers (server sends these before processing messages)
-            var responseHeaders = await stream.ReceiveResponseHeadersAsync(cancellationToken).ConfigureAwait(false);
-
-            // Create response with streaming content
-            var response = new HttpResponseMessage(HttpStatusCode.OK)
-            {
-                Content = new ShmControlResponseContent(stream),
-                Version = new Version(2, 0)
-            };
-            ((ShmControlResponseContent)response.Content).SetTrailingHeaders(response.TrailingHeaders);
-
-            // Add response headers
-            if (responseHeaders.Metadata != null)
-            {
-                foreach (var kv in responseHeaders.Metadata)
-                {
-                    var values = kv.Key.EndsWith("-bin", StringComparison.OrdinalIgnoreCase)
-                        ? kv.Values.Select(Convert.ToBase64String)
-                        : kv.Values.Select(v => System.Text.Encoding.UTF8.GetString(v));
-                    response.Headers.TryAddWithoutValidation(kv.Key, values);
-                }
-            }
-
-            return response;
+            return await SendOnStreamAsync(stream, request, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -146,39 +158,140 @@ public sealed class ShmControlHandler : HttpMessageHandler
         }
     }
 
-    private async Task<ShmConnection> EnsureConnectedAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// Slow retry path for CreateStream capacity races. Allocates timeout CTS
+    /// only when needed (not on the fast path).
+    /// </summary>
+    private async Task<ShmGrpcStream> CreateStreamWithRetryAsync(CancellationToken cancellationToken)
     {
-        if (_connection != null && !_connection.IsClosed)
-        {
-            return _connection;
-        }
+        using var timeoutCts = new CancellationTokenSource(_options.ConnectTimeout);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
 
-        await _connectionLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
+        while (true)
         {
-            if (_connection != null && !_connection.IsClosed)
+            if (!_pool!.TryGetConnection(out var pooledConn))
             {
-                return _connection;
+                pooledConn = await _pool.GetConnectionAsync(linkedCts.Token).ConfigureAwait(false);
             }
 
-            // Close any existing broken connection
-            _connection?.Dispose();
-
-            // Connect via control segment protocol
-            _connection = await ConnectViaControlSegmentAsync(cancellationToken).ConfigureAwait(false);
-            return _connection;
+            try
+            {
+                return pooledConn.CreateStream();
+            }
+            catch (ShmStreamCapacityExceededException) when (!linkedCts.IsCancellationRequested)
+            {
+                // Keep retrying from pool.
+            }
+            catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                throw new TimeoutException(
+                    $"Timed out after {_options.ConnectTimeout.TotalSeconds:F0}s trying to create a stream.");
+            }
         }
-        finally
+    }
+
+    private async Task<HttpResponseMessage> SendOnStreamAsync(
+        ShmGrpcStream stream, HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        // Extract gRPC metadata
+        var method = request.RequestUri?.AbsolutePath ?? "/";
+        var authority = request.RequestUri?.Authority ?? "localhost";
+        var metadata = ExtractMetadata(request.Headers);
+        var deadline = ExtractDeadline(request.Headers);
+
+        // Send request headers
+        await stream.SendRequestHeadersAsync(method, authority, metadata, deadline).ConfigureAwait(false);
+
+        // Send request body via a write-through stream that forwards each
+        // gRPC frame directly to SHM.
+        //
+        // For unary calls: PushStreamContent writes one message and returns
+        // immediately, so CopyToAsync completes inline (no ThreadPool needed).
+        //
+        // For streaming calls: PushStreamContent awaits CompleteTcs (blocks
+        // until the client closes the request stream). CopyToAsync yields at
+        // the first real await point, returning control to this method so we
+        // can proceed to ReceiveResponseHeadersAsync. The send continues on
+        // a ThreadPool thread via the natural async continuation.
+        //
+        // Calling SendBodyAsync directly (instead of Task.Run) eliminates
+        // ~1-2ms ThreadPool scheduling delay that was the primary bottleneck
+        // at low concurrency.
+        if (request.Content != null)
         {
-            _connectionLock.Release();
+            var writeStream = new ShmGrpcRequestStream(stream);
+            _ = SendBodyAsync(writeStream, request.Content, stream, cancellationToken);
+        }
+        else
+        {
+            await stream.SendHalfCloseAsync().ConfigureAwait(false);
+        }
+
+        // Wait for response headers (server sends these before processing messages).
+        // May throw ShmStreamRefusedException if the server rejected the stream.
+        var responseHeaders = await stream.ReceiveResponseHeadersAsync(cancellationToken).ConfigureAwait(false);
+
+        // Create response with streaming content
+        var response = new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new ShmControlResponseContent(stream),
+            Version = new Version(2, 0)
+        };
+        ((ShmControlResponseContent)response.Content).SetTrailingHeaders(response.TrailingHeaders);
+
+        // Add response headers
+        if (responseHeaders.Metadata != null)
+        {
+            foreach (var kv in responseHeaders.Metadata)
+            {
+                var values = kv.Key.EndsWith("-bin", StringComparison.OrdinalIgnoreCase)
+                    ? kv.Values.Select(Convert.ToBase64String)
+                    : kv.Values.Select(v => System.Text.Encoding.UTF8.GetString(v));
+                response.Headers.TryAddWithoutValidation(kv.Key, values);
+            }
+        }
+
+        return response;
+    }
+
+    /// <summary>
+    /// Sends the request body and half-close on the given stream.
+    /// Runs inline for unary calls (completes before yielding) and
+    /// naturally yields for streaming calls via the async state machine.
+    /// </summary>
+    private static async Task SendBodyAsync(
+        ShmGrpcRequestStream writeStream,
+        HttpContent content,
+        ShmGrpcStream stream,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await content.CopyToAsync(writeStream, cancellationToken).ConfigureAwait(false);
+            await stream.SendHalfCloseAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is OperationCanceledException
+            or ObjectDisposedException
+            or RingClosedException
+            or InvalidOperationException)
+        {
+            // Expected during normal cancellation, disposal, connection close,
+            // or server-side stream reset. No action needed.
+        }
+        catch (Exception ex)
+        {
+            // Unexpected exception from HttpContent.CopyToAsync (user-supplied
+            // content) or SendHalfCloseAsync. Log it so it doesn't become an
+            // unobserved Task exception.
+            System.Diagnostics.Debug.WriteLine(
+                $"ShmControlHandler: unexpected error sending request body: {ex.GetType().Name}: {ex.Message}");
         }
     }
 
     private async Task<ShmConnection> ConnectViaControlSegmentAsync(CancellationToken cancellationToken)
     {
-        using var timeoutCts = new CancellationTokenSource(_connectTimeout);
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
-        var ct = linkedCts.Token;
+        // Timeout is handled by ShmConnectionPool (via ShmClientTransportOptions.ConnectTimeout).
+        var ct = cancellationToken;
 
         // Open the control segment
         var ctlName = _baseName + ShmConstants.ControlSegmentSuffix;
@@ -201,8 +314,11 @@ public sealed class ShmControlHandler : HttpMessageHandler
             var ctlTx = ctlSegment.RingA;
             var ctlRx = ctlSegment.RingB;
 
-            // Send CONNECT request
-            await WriteControlFrameAsync(ctlTx, FrameType.Connect, ControlWire.EncodeConnectRequest(), ct).ConfigureAwait(false);
+            // Send CONNECT request with preferred ring capacity from client options.
+            // Server will negotiate: Min(clientPreferred, serverMax). Value 0 = use server default.
+            var preferredRing = _options.RingCapacity;
+            await WriteControlFrameAsync(ctlTx, FrameType.Connect,
+                ControlWire.EncodeConnectRequest(preferredRing, preferredRing), ct).ConfigureAwait(false);
 
             // Read response
             var (responseHeader, responsePayload) = await ReadControlFrameAsync(ctlRx, ct).ConfigureAwait(false);
@@ -361,6 +477,50 @@ public sealed class ShmControlHandler : HttpMessageHandler
         return duration > TimeSpan.Zero;
     }
 
+    /// <summary>
+    /// Lazily establishes the single direct connection via the control segment.
+    /// Used when <see cref="ShmClientTransportOptions.EnableMultipleConnections"/> is <c>false</c>.
+    /// Serialized by <c>_directConnectLock</c> to prevent concurrent connect attempts.
+    /// </summary>
+    private async Task<ShmConnection> EnsureDirectConnectionAsync(CancellationToken cancellationToken)
+    {
+        System.Diagnostics.Debug.Assert(_directConnectLock != null, "EnsureDirectConnectionAsync called with pooling enabled");
+
+        await _directConnectLock!.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            // Abort if handler was disposed while we waited for the lock.
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            // Double-check after acquiring the lock.
+            var existing = _directConnection;
+            if (existing != null)
+            {
+                return existing;
+            }
+
+            var conn = await ConnectViaControlSegmentAsync(cancellationToken).ConfigureAwait(false);
+
+            // Re-check disposed after the potentially long connect.
+            if (_disposed)
+            {
+                await conn.DisposeAsync().ConfigureAwait(false);
+                throw new ObjectDisposedException(nameof(ShmControlHandler));
+            }
+
+            _directConnection = conn;
+            return conn;
+        }
+        finally
+        {
+            // Only release if not disposed — Dispose(bool) may have already
+            // disposed the semaphore. Release on a disposed SemaphoreSlim
+            // throws ObjectDisposedException, which would mask the real error.
+            try { _directConnectLock.Release(); }
+            catch (ObjectDisposedException) { }
+        }
+    }
+
     /// <inheritdoc/>
     protected override void Dispose(bool disposing)
     {
@@ -369,11 +529,53 @@ public sealed class ShmControlHandler : HttpMessageHandler
             _disposed = true;
             if (disposing)
             {
-                _connection?.Dispose();
-                _connectionLock.Dispose();
+                if (_pool != null)
+                {
+                    // ShmConnectionPool.DisposeAsync is genuinely async (awaits pending
+                    // connection disposes). HttpMessageHandler.Dispose is sync-only,
+                    // so we schedule the async cleanup and avoid blocking the caller.
+                    // The pool marks itself as disposed immediately (preventing new
+                    // GetConnectionAsync calls) before the async portion runs.
+                    _ = DisposePoolAsync();
+                }
+                else
+                {
+                    // Single-connection mode: dispose the direct connection.
+                    var conn = _directConnection;
+                    _directConnection = null;
+                    if (conn != null)
+                    {
+                        _ = DisposeDirectConnectionAsync(conn);
+                    }
+                    _directConnectLock?.Dispose();
+                }
             }
         }
         base.Dispose(disposing);
+    }
+
+    private async Task DisposePoolAsync()
+    {
+        try
+        {
+            await _pool!.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"ShmControlHandler: pool dispose error: {ex.Message}");
+        }
+    }
+
+    private static async Task DisposeDirectConnectionAsync(ShmConnection connection)
+    {
+        try
+        {
+            await connection.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"ShmControlHandler: direct connection dispose error: {ex.Message}");
+        }
     }
 }
 
@@ -442,7 +644,7 @@ internal sealed class ShmControlResponseContent : HttpContent
     private readonly ShmGrpcStream _stream;
     private HttpHeaders? _trailingHeaders;
 
-    public ShmControlResponseContent(ShmGrpcStream stream, Task? bodySendTask = null)
+    public ShmControlResponseContent(ShmGrpcStream stream)
     {
         _stream = stream;
         Headers.ContentType = new MediaTypeHeaderValue("application/grpc");
@@ -635,8 +837,23 @@ internal sealed class ShmGrpcResponseStream : Stream
     {
         if (disposing)
         {
-            _enumerator.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            // Avoid sync-over-async: schedule the async enumerator dispose
+            // instead of blocking. The enumerator's MoveNextAsync will see
+            // the stream is disposed and exit cleanly.
+            _ = DisposeEnumeratorAsync();
         }
         base.Dispose(disposing);
+    }
+
+    private async Task DisposeEnumeratorAsync()
+    {
+        try
+        {
+            await _enumerator.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"ShmGrpcResponseStream: enumerator dispose error: {ex.Message}");
+        }
     }
 }
