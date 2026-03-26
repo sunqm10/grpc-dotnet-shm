@@ -138,13 +138,13 @@ public class FrameProtocolBenchmarks
     [Benchmark(Description = "Headers encode")]
     public byte[] HeadersEncode()
     {
-        return _headers.Encode();
+        return _headers.EncodeToArray();
     }
 
     [Benchmark(Description = "Trailers encode")]
     public byte[] TrailersEncode()
     {
-        return _trailers.Encode();
+        return _trailers.EncodeToArray();
     }
 
     [Benchmark(Description = "FrameHeader encode")]
@@ -171,7 +171,7 @@ public class FrameProtocolBenchmarks
     public void FullRequestFrame()
     {
         // Write headers frame
-        var headersPayload = _headers.Encode();
+        var headersPayload = _headers.EncodeToArray();
         var headersFrame = new FrameHeader
         {
             Length = (uint)headersPayload.Length,
