@@ -127,7 +127,6 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// <param name="name">The name of the shared memory segment to connect to.</param>
     /// <param name="keepaliveOptions">Optional keepalive options.</param>
     /// <returns>A new client connection.</returns>
-    [SupportedOSPlatform("windows")]
     public static ShmConnection ConnectAsClient(string name, ShmKeepaliveOptions? keepaliveOptions = null)
     {
         var segment = Segment.Open(name);

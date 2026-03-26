@@ -48,7 +48,9 @@ internal sealed partial class LinuxRingSync : IRingSync
     private const int ContigSeqOffset = 0x28;  // 40 bytes
 
     private readonly unsafe byte* _ringHeaderPtr;
+#pragma warning disable CS0414 // Field is assigned but never read
     private bool _disposed;
+#pragma warning restore CS0414
 
     /// <summary>
     /// Creates a LinuxRingSync with pointers not yet set.
@@ -220,8 +222,25 @@ internal sealed partial class LinuxRingSync : IRingSync
 
     public void Dispose()
     {
+        if (_disposed)
+        {
+            return;
+        }
+
         _disposed = true;
-        // Futex doesn't need explicit cleanup - the memory is managed by the Segment
+
+        // Wake all threads blocked in futex before the memory mapping is released.
+        // Without this, a thread blocked in FUTEX_WAIT would access unmapped memory
+        // after the Segment disposes the MappedMemoryManager.
+        unsafe
+        {
+            if (_ringHeaderPtr != null)
+            {
+                futex((uint*)(_ringHeaderPtr + DataSeqOffset), FUTEX_WAKE, uint.MaxValue, null, null, 0);
+                futex((uint*)(_ringHeaderPtr + SpaceSeqOffset), FUTEX_WAKE, uint.MaxValue, null, null, 0);
+                futex((uint*)(_ringHeaderPtr + ContigSeqOffset), FUTEX_WAKE, uint.MaxValue, null, null, 0);
+            }
+        }
     }
 
     [StructLayout(LayoutKind.Sequential)]

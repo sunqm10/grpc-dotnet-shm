@@ -39,7 +39,6 @@ namespace Grpc.Net.SharedMemory;
 /// var client = new Greeter.GreeterClient(channel);
 /// </code>
 /// </example>
-[SupportedOSPlatform("windows")]
 public sealed class ShmHandler : HttpMessageHandler
 {
     private readonly string _segmentName;

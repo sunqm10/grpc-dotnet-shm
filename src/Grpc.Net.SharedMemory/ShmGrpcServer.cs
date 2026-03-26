@@ -38,7 +38,6 @@ namespace Grpc.Net.SharedMemory;
 /// await server.RunAsync();
 /// </code>
 /// </example>
-[SupportedOSPlatform("windows")]
 public sealed class ShmGrpcServer : IAsyncDisposable
 {
     private readonly string _segmentName;

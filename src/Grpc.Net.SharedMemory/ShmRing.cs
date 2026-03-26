@@ -732,11 +732,15 @@ public sealed class ShmRing : IDisposable
             Interlocked.Increment(ref header.DataSeq);
             Interlocked.Increment(ref header.SpaceSeq);
             Interlocked.Increment(ref header.ContigSeq);
-
-            _sync?.SignalData();
-            _sync?.SignalSpace();
-            _sync?.SignalContig();
         }
+
+        // Signal sync waiters for both owner and non-owner.
+        // Non-owner threads may be blocked in futex/WaitOnAddress;
+        // without a wake, they'd remain blocked until the memory is unmapped,
+        // causing an access violation in the finally block.
+        _sync?.SignalData();
+        _sync?.SignalSpace();
+        _sync?.SignalContig();
     }
 
     public void Dispose()
@@ -816,7 +820,10 @@ public sealed class ShmRing : IDisposable
             }
             finally
             {
-                Interlocked.Decrement(ref header.SpaceWaiters);
+                if (!_localClosed)
+                {
+                    Interlocked.Decrement(ref header.SpaceWaiters);
+                }
             }
         }
         else
@@ -840,7 +847,10 @@ public sealed class ShmRing : IDisposable
             }
             finally
             {
-                Interlocked.Decrement(ref header.ContigWaiters);
+                if (!_localClosed)
+                {
+                    Interlocked.Decrement(ref header.ContigWaiters);
+                }
             }
         }
     }
@@ -904,7 +914,10 @@ public sealed class ShmRing : IDisposable
         }
         finally
         {
-            Interlocked.Decrement(ref header.DataWaiters);
+            if (!_localClosed)
+            {
+                Interlocked.Decrement(ref header.DataWaiters);
+            }
         }
     }
 
