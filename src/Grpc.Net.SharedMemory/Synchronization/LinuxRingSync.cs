@@ -82,7 +82,7 @@ internal sealed partial class LinuxRingSync : IRingSync
     /// Sets the memory pointers for futex operations.
     /// Must be called after the shared memory is mapped if using the default constructor.
     /// </summary>
-    public unsafe void SetPointers(uint* dataSeqPtr, uint* spaceSeqPtr, uint* contigSeqPtr)
+    public static unsafe void SetPointers(uint* dataSeqPtr, uint* spaceSeqPtr, uint* contigSeqPtr)
     {
         // Legacy method - kept for compatibility but not used with MappedMemoryManager
         // The new constructor directly calculates pointers from the ring header offset

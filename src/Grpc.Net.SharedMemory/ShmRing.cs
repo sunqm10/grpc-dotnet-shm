@@ -105,6 +105,10 @@ public sealed class ShmRing : IDisposable
     private int _dataSpinCutoff = ShmConstants.SpinIterationsDefault;
     private int _spaceSpinCutoff = ShmConstants.SpinIterationsDefault;
 
+    // Batch write: suppress OS-level data signals until EndBatchWrite.
+    // DataSeq is still incremented per-frame so spin waiters see updates.
+    private int _batchWriteDepth;
+
     /// <summary>
     /// Creates a new ShmRing from a memory region.
     /// </summary>
@@ -235,7 +239,7 @@ public sealed class ShmRing : IDisposable
                 if (data.Length > 0)
                 {
                     Interlocked.Increment(ref header.DataSeq);
-                    if (Volatile.Read(ref header.DataWaiters) > 0)
+                    if (_batchWriteDepth == 0 && Volatile.Read(ref header.DataWaiters) > 0)
                     {
                         _sync?.SignalData();
                     }
@@ -431,6 +435,30 @@ public sealed class ShmRing : IDisposable
         if (bytesWritten > 0)
         {
             Interlocked.Increment(ref header.DataSeq);
+            if (_batchWriteDepth == 0 && Volatile.Read(ref header.DataWaiters) > 0)
+            {
+                _sync?.SignalData();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Begins a batch write. OS-level data signals are deferred until
+    /// <see cref="EndBatchWrite"/>. DataSeq is still incremented per commit
+    /// so spin waiters see updates immediately.
+    /// </summary>
+    internal void BeginBatchWrite() => _batchWriteDepth++;
+
+    /// <summary>
+    /// Ends a batch write and fires the deferred OS-level data signal
+    /// if any waiter is blocking.
+    /// </summary>
+    internal void EndBatchWrite()
+    {
+        if (--_batchWriteDepth <= 0)
+        {
+            _batchWriteDepth = 0;
+            ref var header = ref GetHeader();
             if (Volatile.Read(ref header.DataWaiters) > 0)
             {
                 _sync?.SignalData();

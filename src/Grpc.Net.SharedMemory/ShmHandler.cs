@@ -17,6 +17,7 @@
 #endregion
 
 using System.Buffers;
+using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Runtime.Versioning;
@@ -436,7 +437,7 @@ internal sealed class ShmResponseContent : HttpContent
         if (_stream.Trailers != null && _trailingHeaders != null)
         {
             var trailers = _stream.Trailers;
-            _trailingHeaders.TryAddWithoutValidation("grpc-status", ((int)trailers.GrpcStatusCode).ToString());
+            _trailingHeaders.TryAddWithoutValidation("grpc-status", ((int)trailers.GrpcStatusCode).ToString(CultureInfo.InvariantCulture));
             if (!string.IsNullOrEmpty(trailers.GrpcStatusMessage))
             {
                 _trailingHeaders.TryAddWithoutValidation("grpc-message", Uri.EscapeDataString(trailers.GrpcStatusMessage));

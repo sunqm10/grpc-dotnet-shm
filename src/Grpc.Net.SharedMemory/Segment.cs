@@ -663,6 +663,7 @@ public sealed partial class Segment : IDisposable
         }
     }
 
+#pragma warning disable CA1822 // Instance member accessed inside platform-conditional #if block
     private unsafe void WaitHeaderFlagWindows(int offset, CancellationToken cancellationToken)
     {
 #if WINDOWS
@@ -677,7 +678,9 @@ public sealed partial class Segment : IDisposable
         throw new PlatformNotSupportedException("Windows readiness wait is not available on this platform.");
 #endif
     }
+#pragma warning restore CA1822
 
+#pragma warning disable CA1822
     private unsafe void WaitHeaderFlagLinux(int offset, CancellationToken cancellationToken)
     {
 #if LINUX
@@ -691,6 +694,7 @@ public sealed partial class Segment : IDisposable
         throw new PlatformNotSupportedException("Linux readiness wait is not available on this platform.");
 #endif
     }
+#pragma warning restore CA1822
 
     private unsafe void SignalHeaderFlagWaiters(int offset)
     {

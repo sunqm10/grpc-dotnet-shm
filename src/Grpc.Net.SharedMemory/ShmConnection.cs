@@ -765,7 +765,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 }
 
                 // Check if we should send a ping
-                var hasActiveStreams = _streams.Count > 0;
+                var hasActiveStreams = !_streams.IsEmpty;
                 if (!hasActiveStreams && !_keepaliveOptions.PermitWithoutStream)
                 {
                     continue;
@@ -814,7 +814,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         if (!_isClient && _enforcementPolicy != null)
         {
             var now = DateTime.UtcNow;
-            var hasActiveStreams = _streams.Count > 0;
+            var hasActiveStreams = !_streams.IsEmpty;
 
             // Check if ping is allowed without streams
             if (!hasActiveStreams && !_enforcementPolicy.PermitWithoutStream)

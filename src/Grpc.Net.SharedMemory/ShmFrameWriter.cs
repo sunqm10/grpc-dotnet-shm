@@ -230,21 +230,29 @@ internal sealed class ShmFrameWriter : IDisposable
             // (ReserveWrite), we do not prevent other enqueue operations
             // from completing — avoiding a deadlock where WindowUpdate
             // frames cannot be enqueued while the ring is full.
-            for (var i = 0; i < count; i++)
+            _ring.BeginBatchWrite();
+            try
             {
-                ref var entry = ref batch[i];
-                var payload = entry.Payload.Span;
+                for (var i = 0; i < count; i++)
+                {
+                    ref var entry = ref batch[i];
+                    var payload = entry.Payload.Span;
 
-                if (entry.Type == FrameType.Message)
-                {
-                    var isLast = (entry.Flags & MessageFlags.More) == 0;
-                    FrameProtocol.WriteMessage(_ring, entry.StreamId, payload, isLast, _ct);
+                    if (entry.Type == FrameType.Message)
+                    {
+                        var isLast = (entry.Flags & MessageFlags.More) == 0;
+                        FrameProtocol.WriteMessage(_ring, entry.StreamId, payload, isLast, _ct);
+                    }
+                    else
+                    {
+                        var header = new FrameHeader(entry.Type, entry.StreamId, (uint)entry.Length, entry.Flags);
+                        FrameProtocol.WriteFrame(_ring, header, payload, _ct);
+                    }
                 }
-                else
-                {
-                    var header = new FrameHeader(entry.Type, entry.StreamId, (uint)entry.Length, entry.Flags);
-                    FrameProtocol.WriteFrame(_ring, header, payload, _ct);
-                }
+            }
+            finally
+            {
+                _ring.EndBatchWrite();
             }
         }
         finally

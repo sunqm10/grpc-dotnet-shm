@@ -201,7 +201,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         }
     }
 
-    private async Task SendRequestHeadersReturnPoolAsync(Task sendTask, byte[] payload)
+    private static async Task SendRequestHeadersReturnPoolAsync(Task sendTask, byte[] payload)
     {
         try
         {
