@@ -36,7 +36,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     private readonly Channel<ShmGrpcStream> _incomingStreamsChannel;
     private uint _nextStreamId;
     private int _disposed;
-    private volatile bool _goAwaySent;
+    private int _goAwaySent;
     private volatile bool _goAwayReceived;
     private volatile bool _draining;
     private uint _maxConcurrentStreams;
@@ -82,7 +82,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// <summary>
     /// Gets whether the connection has been closed.
     /// </summary>
-    public bool IsClosed => Volatile.Read(ref _disposed) != 0 || _goAwaySent || _goAwayReceived;
+    public bool IsClosed => Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref _goAwaySent) != 0 || _goAwayReceived;
 
     /// <summary>
     /// Gets whether the connection is draining (not accepting new streams).
@@ -346,8 +346,8 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// <param name="message">Optional debug message.</param>
     public void SendGoAway(string? message = null)
     {
-        if (_goAwaySent) return;
-        _goAwaySent = true;
+        // Atomic check-and-set: only one thread sends the GoAway frame.
+        if (Interlocked.CompareExchange(ref _goAwaySent, 1, 0) != 0) return;
 
         try
         {
@@ -582,7 +582,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             }
 
             // Check if draining
-            if (_draining || _goAwaySent || _goAwayReceived)
+            if (_draining || _goAwaySent != 0 || _goAwayReceived)
             {
                 RejectStream(streamId, "transport is draining");
                 payload.Release();
@@ -861,7 +861,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
     private void ThrowIfGoAway()
     {
-        if (_goAwaySent || _goAwayReceived)
+        if (_goAwaySent != 0 || _goAwayReceived)
         {
             throw new InvalidOperationException("Connection is being closed due to GoAway");
         }
@@ -877,9 +877,9 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
         _frameWriter?.Dispose();
 
-        if (!_goAwaySent)
+        if (_goAwaySent == 0)
         {
-            _goAwaySent = true;
+            Interlocked.Exchange(ref _goAwaySent, 1);
             try
             {
                 using var goAwayCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
@@ -920,9 +920,9 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
         _frameWriter?.Dispose();
 
-        if (!_goAwaySent)
+        if (_goAwaySent == 0)
         {
-            _goAwaySent = true;
+            Interlocked.Exchange(ref _goAwaySent, 1);
             try
             {
                 using var goAwayCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
