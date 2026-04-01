@@ -320,6 +320,37 @@ public sealed class ShmRetryState
     }
 
     /// <summary>
+    /// Determines if a retry should be attempted after a transport-level failure
+    /// (connection closed, stream refused, ring error). Unlike <see cref="ShouldRetry"/>,
+    /// this does not check retryable status codes — transport errors are always
+    /// retriable if the attempt budget and throttling allow.
+    /// </summary>
+    /// <param name="backoff">The backoff delay before the next attempt.</param>
+    /// <returns>True if a retry should be attempted.</returns>
+    public bool ShouldRetryTransport(out TimeSpan backoff)
+    {
+        backoff = TimeSpan.Zero;
+
+        if (_committed)
+        {
+            return false;
+        }
+
+        if (_attemptCount >= _policy.MaxAttempts)
+        {
+            return false;
+        }
+
+        if (_throttling != null && !_throttling.TryConsume())
+        {
+            return false;
+        }
+
+        backoff = _policy.CalculateBackoff(_attemptCount);
+        return true;
+    }
+
+    /// <summary>
     /// Increments the attempt count without checking retry conditions.
     /// Call this when starting each attempt.
     /// </summary>

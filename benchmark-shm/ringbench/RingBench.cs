@@ -92,6 +92,11 @@ string platform = platformOverride
 outDir = Path.Combine(outDir, platform);
 Directory.CreateDirectory(outDir);
 
+// Clean up stale SHM segments from previous crashed benchmark runs
+var cleaned = Segment.TryRemoveSegmentsByPrefix("bench_shm_");
+if (cleaned > 0)
+    Console.WriteLine($"Cleaned {cleaned} stale SHM segment(s) from previous runs.");
+
 // Go benchmark sizes: 0, 1, 1K, 4K, 16K, 64K, 256K, 512K, 1M, 2M
 int[] sizes = { 0, 1, 1024, 4096, 16384, 65536, 262144, 524288, 1048576, 2097152 };
 

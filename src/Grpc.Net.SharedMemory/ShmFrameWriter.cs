@@ -17,12 +17,15 @@
 #endregion
 
 using System.Buffers;
-using System.Threading.Channels;
+using System.Collections.Concurrent;
 
 namespace Grpc.Net.SharedMemory;
 
 /// <summary>
-/// Batched frame writer modelled after Kestrel's <c>Http2FrameWriter</c>.
+/// Batched frame writer inspired by Kestrel's <c>Http2FrameWriter</c>.
+/// Uses a lock-free <see cref="System.Collections.Concurrent.ConcurrentQueue{T}"/>
+/// for MPSC enqueue (multiple app threads → single writer thread) to avoid
+/// <c>Monitor.Enter</c> contention in high-concurrency streaming scenarios.
 /// Small payloads are defensively copied into pooled buffers at enqueue time.
 /// Large payloads can be enqueued zero-copy; the pooled buffer is returned
 /// after the data has been written to the ring buffer.
@@ -40,7 +43,10 @@ internal sealed class ShmFrameWriter : IDisposable
     }
 
     private readonly ShmRing _ring;
-    private readonly Channel<FrameEntry> _channel;
+    private readonly ConcurrentQueue<FrameEntry> _queue;
+    private readonly ManualResetEventSlim _readySignal;
+    private int _waiting; // 1 if writer thread is blocked in Wait; accessed via Volatile.Read/Write
+    private volatile bool _completed;
     private readonly Task _writerTask;
     private readonly CancellationTokenSource _cts;
     private readonly CancellationToken _ct;
@@ -51,16 +57,13 @@ internal sealed class ShmFrameWriter : IDisposable
         _ring = ring;
         _cts = cts;
         _ct = cts.Token;
-        _channel = Channel.CreateUnbounded<FrameEntry>(new UnboundedChannelOptions
-        {
-            SingleReader = true,
-            SingleWriter = false
-        });
+        _queue = new ConcurrentQueue<FrameEntry>();
+        _readySignal = new ManualResetEventSlim(false);
 
         _writerTask = Task.Factory.StartNew(
-            WriterLoopAsync, _ct,
+            WriterLoop, _ct,
             TaskCreationOptions.LongRunning,
-            TaskScheduler.Default).Unwrap();
+            TaskScheduler.Default);
     }
 
     /// <summary>
@@ -81,17 +84,26 @@ internal sealed class ShmFrameWriter : IDisposable
             mem = buf.AsMemory(0, len);
         }
 
-        if (!_channel.Writer.TryWrite(new FrameEntry
+        if (_completed)
         {
-            Type = type, StreamId = streamId, Flags = flags,
-            Length = len, Payload = mem, ReturnToPool = buf
-        }))
-        {
-            // Channel is completed (Dispose was called). Return the buffer and
-            // surface the failure so callers don't silently lose frames.
             if (buf != null)
                 ArrayPool<byte>.Shared.Return(buf);
             throw new InvalidOperationException("Frame writer has been disposed.");
+        }
+
+        _queue.Enqueue(new FrameEntry
+        {
+            Type = type, StreamId = streamId, Flags = flags,
+            Length = len, Payload = mem, ReturnToPool = buf
+        });
+
+        // Wake the writer thread if it is blocked waiting for data.
+        // Late enqueues (after _completed is set) are handled by the three
+        // drain layers in WriterLoop + Dispose — no dequeue here to avoid
+        // accidentally consuming another thread's frame from the queue head.
+        if (Volatile.Read(ref _waiting) != 0 && !_disposed)
+        {
+            try { _readySignal.Set(); } catch (ObjectDisposedException) { }
         }
     }
 
@@ -109,34 +121,38 @@ internal sealed class ShmFrameWriter : IDisposable
     public void EnqueueZeroCopy(FrameType type, uint streamId, byte flags,
         ReadOnlyMemory<byte> payload, byte[]? pooledBuffer)
     {
-        if (!_channel.Writer.TryWrite(new FrameEntry
+        if (_completed)
+        {
+            throw new InvalidOperationException("Frame writer has been disposed.");
+        }
+
+        _queue.Enqueue(new FrameEntry
         {
             Type = type, StreamId = streamId, Flags = flags,
             Length = payload.Length, Payload = payload,
             ReturnToPool = pooledBuffer
-        }))
+        });
+
+        if (Volatile.Read(ref _waiting) != 0 && !_disposed)
         {
-            // Channel is completed — caller still owns the buffer.
-            throw new InvalidOperationException("Frame writer has been disposed.");
+            try { _readySignal.Set(); } catch (ObjectDisposedException) { }
         }
     }
 
-    private async Task WriterLoopAsync()
+    private void WriterLoop()
     {
         const int maxBatch = 512;
         var batch = new FrameEntry[maxBatch];
 
         try
         {
-            var reader = _channel.Reader;
-
-            while (!_ct.IsCancellationRequested)
+            while (!_ct.IsCancellationRequested && !_completed)
             {
-                // Phase 1: immediate read
-                if (reader.TryRead(out batch[0]))
+                // Phase 1: immediate dequeue
+                if (_queue.TryDequeue(out batch[0]))
                 {
                     var count = 1;
-                    while (count < maxBatch && reader.TryRead(out batch[count]))
+                    while (count < maxBatch && _queue.TryDequeue(out batch[count]))
                         count++;
                     FlushBatch(batch, count);
                     continue;
@@ -148,10 +164,10 @@ internal sealed class ShmFrameWriter : IDisposable
                 while (!spinWait.NextSpinWillYield)
                 {
                     spinWait.SpinOnce(sleep1Threshold: -1);
-                    if (reader.TryRead(out batch[0]))
+                    if (_queue.TryDequeue(out batch[0]))
                     {
                         var count = 1;
-                        while (count < maxBatch && reader.TryRead(out batch[count]))
+                        while (count < maxBatch && _queue.TryDequeue(out batch[count]))
                             count++;
                         FlushBatch(batch, count);
                         found = true;
@@ -161,9 +177,41 @@ internal sealed class ShmFrameWriter : IDisposable
 
                 if (found) continue;
 
-                // Phase 3: async wait
-                if (!await reader.WaitToReadAsync(_ct).ConfigureAwait(false))
-                    break;
+                // Phase 3: blocking wait (lost-wake-safe pattern)
+                // Set _waiting BEFORE Reset to ensure writers see it and call Set().
+                Volatile.Write(ref _waiting, 1);
+                _readySignal.Reset();
+                if (_queue.TryDequeue(out batch[0]))
+                {
+                    // Data arrived between Phase 2 and Reset — no need to wait.
+                    Volatile.Write(ref _waiting, 0);
+                    var count = 1;
+                    while (count < maxBatch && _queue.TryDequeue(out batch[count]))
+                        count++;
+                    FlushBatch(batch, count);
+                    continue;
+                }
+
+                try
+                {
+                    _readySignal.Wait(_ct);
+                }
+                finally
+                {
+                    Volatile.Write(ref _waiting, 0);
+                }
+            }
+
+            // Drain remaining entries after _completed is set.
+            // This preserves the Channel semantics where items enqueued before
+            // completion are still consumed. Without this, the last frames
+            // (trailers, half-close, window updates) would be silently dropped.
+            while (_queue.TryDequeue(out batch[0]))
+            {
+                var count = 1;
+                while (count < maxBatch && _queue.TryDequeue(out batch[count]))
+                    count++;
+                FlushBatch(batch, count);
             }
         }
         catch (OperationCanceledException) { }
@@ -175,8 +223,8 @@ internal sealed class ShmFrameWriter : IDisposable
         try
         {
             // No lock needed: the writer thread is the sole consumer of the
-            // Channel (SingleReader=true) and all ring writes go through it,
-            // so there is no concurrent access to the ring.
+            // queue and all ring writes go through it, so there is no
+            // concurrent access to the ring.
             // Importantly, NOT holding a lock here means that if
             // FrameProtocol.WriteMessage blocks waiting for ring space
             // (ReserveWrite), we do not prevent other enqueue operations
@@ -217,8 +265,9 @@ internal sealed class ShmFrameWriter : IDisposable
         {
             _disposed = true;
 
-            // 1. Stop accepting new entries.
-            _channel.Writer.TryComplete();
+            // 1. Stop accepting new entries and wake the writer thread.
+            _completed = true;
+            _readySignal.Set();
 
             // 2. Give the writer thread a chance to flush remaining entries.
             var writerDone = false;
@@ -236,25 +285,36 @@ internal sealed class ShmFrameWriter : IDisposable
             if (!writerDone)
             {
                 _cts.Cancel();
+                _readySignal.Set(); // unblock if waiting again
                 try
                 {
                     writerDone = _writerTask.Wait(TimeSpan.FromMilliseconds(500));
                 }
                 catch (AggregateException)
                 {
-                    writerDone = true; // task faulted — it's done
+                    writerDone = true;
                 }
             }
 
-            // 4. Drain remaining entries only if the writer task has exited,
-            //    to avoid concurrent reads on the SingleReader channel.
+            // 4. Drain remaining entries.
             if (writerDone)
             {
-                while (_channel.Reader.TryRead(out var entry))
+                while (_queue.TryDequeue(out var entry))
                 {
                     if (entry.ReturnToPool != null)
                         ArrayPool<byte>.Shared.Return(entry.ReturnToPool);
                 }
+            }
+
+            _readySignal.Dispose();
+
+            // 5. Final drain: catch any frames enqueued between step 4 and
+            //    _readySignal.Dispose(). Concurrent Enqueue calls that passed
+            //    the _completed check before it was set may still be in-flight.
+            while (_queue.TryDequeue(out var lateEntry))
+            {
+                if (lateEntry.ReturnToPool != null)
+                    ArrayPool<byte>.Shared.Return(lateEntry.ReturnToPool);
             }
         }
     }

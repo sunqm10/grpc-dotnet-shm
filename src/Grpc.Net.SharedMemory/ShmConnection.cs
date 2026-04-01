@@ -36,9 +36,9 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     private readonly Channel<ShmGrpcStream> _incomingStreamsChannel;
     private uint _nextStreamId;
     private int _disposed;
-    private bool _goAwaySent;
-    private bool _goAwayReceived;
-    private bool _draining;
+    private volatile bool _goAwaySent;
+    private volatile bool _goAwayReceived;
+    private volatile bool _draining;
     private uint _maxConcurrentStreams;
 
     // Atomic counter for client-side max-stream enforcement.
@@ -66,8 +66,8 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     private Task? _keepaliveTask;
     private DateTime _lastPingAt;
     private DateTime _lastPingSentAt;
-    private bool _pendingPing;
-    private int _pingStrikes;
+    private volatile bool _pendingPing;
+    private int _pingStrikes; // accessed via Interlocked from multiple threads
 
     /// <summary>
     /// Gets the connection name (shared memory segment name).
@@ -819,8 +819,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             // Check if ping is allowed without streams
             if (!hasActiveStreams && !_enforcementPolicy.PermitWithoutStream)
             {
-                _pingStrikes++;
-                if (_pingStrikes > _enforcementPolicy.MaxPingStrikes)
+                if (Interlocked.Increment(ref _pingStrikes) > _enforcementPolicy.MaxPingStrikes)
                 {
                     SendGoAway("too many pings without streams");
                     return;
@@ -830,8 +829,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             // Check if ping is too frequent
             if (_lastPingAt != DateTime.MinValue && now - _lastPingAt < _enforcementPolicy.MinTime)
             {
-                _pingStrikes++;
-                if (_pingStrikes > _enforcementPolicy.MaxPingStrikes)
+                if (Interlocked.Increment(ref _pingStrikes) > _enforcementPolicy.MaxPingStrikes)
                 {
                     SendGoAway("too many pings");
                     return;

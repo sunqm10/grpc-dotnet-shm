@@ -782,6 +782,37 @@ public sealed partial class Segment : IDisposable
     }
 
     /// <summary>
+    /// Removes all segment files whose names start with the given prefix.
+    /// Useful for cleaning up stale segments left by crashed processes.
+    /// </summary>
+    public static int TryRemoveSegmentsByPrefix(string namePrefix)
+    {
+        var filePrefix = $"grpc_shm_{namePrefix}";
+        var count = 0;
+        try
+        {
+            if (OperatingSystem.IsLinux())
+            {
+                const string devShm = "/dev/shm";
+                if (Directory.Exists(devShm))
+                {
+                    foreach (var file in Directory.EnumerateFiles(devShm, filePrefix + "*"))
+                    {
+                        try { File.Delete(file); count++; } catch { }
+                    }
+                }
+            }
+            var tempDir = Path.GetTempPath();
+            foreach (var file in Directory.EnumerateFiles(tempDir, filePrefix + "*"))
+            {
+                try { File.Delete(file); count++; } catch { }
+            }
+        }
+        catch { }
+        return count;
+    }
+
+    /// <summary>
     /// Checks if a segment exists (checks both /dev/shm and /tmp on Linux).
     /// </summary>
     public static bool Exists(string name)
@@ -796,10 +827,27 @@ public sealed partial class Segment : IDisposable
     {
         var ctlName = baseName + ShmConstants.ControlSegmentSuffix;
         
-        // Clean up any stale segment from previous run
+        // Remove stale control segment from a previous instance.
+        // On Windows, File.Delete fails if the file is held by a live process.
+        // On Linux, unlink removes the directory entry; the existing mapping
+        // in the old process stays valid but new clients can no longer discover it.
+        // Stale _conn_ segments are NOT cleaned here because we cannot reliably
+        // distinguish a crashed predecessor from a live concurrent instance.
+        // Callers who know the endpoint is unused (e.g., benchmarks, test
+        // harnesses) should call TryRemoveSegmentsByPrefix() explicitly.
         TryRemoveSegment(ctlName);
         
         return Create(ctlName, ShmConstants.MinRingCapacity, 0);
+    }
+
+    /// <summary>
+    /// Removes stale connection data segment files matching {baseName}_conn_*.
+    /// Only safe to call when the corresponding control segment is known to be
+    /// inactive (no live server holds it).
+    /// </summary>
+    internal static void TryRemoveStaleConnectionSegments(string baseName)
+    {
+        TryRemoveSegmentsByPrefix(baseName + "_conn_");
     }
 
     /// <summary>

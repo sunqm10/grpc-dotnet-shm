@@ -304,14 +304,12 @@ public sealed class ShmRing : IDisposable
                 // Signal space availability
                 if (bytesRead > 0)
                 {
-                    // Contiguity: always bump after any positive read (matches Go's ReadBlocking)
-                    Interlocked.Increment(ref header.ContigSeq);
                     if (Volatile.Read(ref header.ContigWaiters) > 0)
                     {
+                        Interlocked.Increment(ref header.ContigSeq);
                         _sync?.SignalContig();
                     }
 
-                    // Space: wake waiters if any are waiting
                     if (Volatile.Read(ref header.SpaceWaiters) > 0)
                     {
                         Interlocked.Increment(ref header.SpaceSeq);
@@ -607,9 +605,9 @@ public sealed class ShmRing : IDisposable
     /// </summary>
     private void SignalSpaceAvailability(ref RingHeader header)
     {
-        Interlocked.Increment(ref header.ContigSeq);
         if (Volatile.Read(ref header.ContigWaiters) > 0)
         {
+            Interlocked.Increment(ref header.ContigSeq);
             _sync?.SignalContig();
         }
 

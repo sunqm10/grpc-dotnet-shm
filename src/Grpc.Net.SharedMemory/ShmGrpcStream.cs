@@ -153,7 +153,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// <summary>
     /// Sends request headers (client-side, must be called first).
     /// </summary>
-    public async Task SendRequestHeadersAsync(string method, string authority, Metadata? metadata = null, DateTime? deadline = null)
+    public Task SendRequestHeadersAsync(string method, string authority, Metadata? metadata = null, DateTime? deadline = null)
     {
         ThrowIfDisposed();
         if (!IsClientStream)
@@ -176,20 +176,40 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         var (payload, payloadLength) = _requestHeaders.Encode();
         if (payloadLength <= 512)
         {
+            Task task;
             try
             {
-                await SendFrameAsync(FrameType.Headers, HeadersFlags.Initial,
+                task = SendFrameAsync(FrameType.Headers, HeadersFlags.Initial,
                     payload.AsMemory(0, payloadLength));
             }
-            finally
+            catch
             {
                 ArrayPool<byte>.Shared.Return(payload);
+                throw;
             }
+            if (task.IsCompletedSuccessfully)
+            {
+                ArrayPool<byte>.Shared.Return(payload);
+                return Task.CompletedTask;
+            }
+            return SendRequestHeadersReturnPoolAsync(task, payload);
         }
         else
         {
-            await SendFrameZeroCopyAsync(FrameType.Headers, HeadersFlags.Initial,
+            return SendFrameZeroCopyAsync(FrameType.Headers, HeadersFlags.Initial,
                 payload.AsMemory(0, payloadLength), payload);
+        }
+    }
+
+    private async Task SendRequestHeadersReturnPoolAsync(Task sendTask, byte[] payload)
+    {
+        try
+        {
+            await sendTask.ConfigureAwait(false);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(payload);
         }
     }
 
@@ -433,12 +453,23 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// <summary>
     /// Signals that no more messages will be sent from this side.
     /// </summary>
-    public async Task SendHalfCloseAsync()
+    public Task SendHalfCloseAsync()
     {
         ThrowIfDisposed();
-        if (_halfCloseSent) return;
+        if (_halfCloseSent) return Task.CompletedTask;
 
-        await SendFrameAsync(FrameType.HalfClose, 0, Array.Empty<byte>());
+        var task = SendFrameAsync(FrameType.HalfClose, 0, Array.Empty<byte>());
+        if (task.IsCompletedSuccessfully)
+        {
+            _halfCloseSent = true;
+            return Task.CompletedTask;
+        }
+        return SendHalfCloseSlowAsync(task);
+    }
+
+    private async Task SendHalfCloseSlowAsync(Task sendTask)
+    {
+        await sendTask.ConfigureAwait(false);
         _halfCloseSent = true;
     }
 
@@ -551,14 +582,53 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// Thrown when the server refuses the stream (sends TRAILERS before HEADERS),
     /// typically because the maximum concurrent stream limit was reached.
     /// </exception>
-    public async Task<HeadersV1> ReceiveResponseHeadersAsync(CancellationToken cancellationToken = default)
+    public Task<HeadersV1> ReceiveResponseHeadersAsync(CancellationToken cancellationToken = default)
     {
         if (!IsClientStream)
             throw new InvalidOperationException("Only client receives response headers");
 
+        var frameTask = ReceiveFrameAsync(cancellationToken);
+        if (frameTask.IsCompletedSuccessfully)
+        {
+            var frame = frameTask.Result;
+            if (frame != null && frame.Value.Type == FrameType.Headers)
+            {
+                _responseHeaders = HeadersV1.Decode(frame.Value.Memory.Span);
+                frame.Value.ReturnToPool();
+                return Task.FromResult(_responseHeaders);
+            }
+        }
+        return ReceiveResponseHeadersSlowAsync(frameTask, cancellationToken);
+    }
+
+    private async Task<HeadersV1> ReceiveResponseHeadersSlowAsync(
+        Task<InboundFrame?> firstFrameTask, CancellationToken cancellationToken)
+    {
+        var firstFrame = await firstFrameTask.ConfigureAwait(false);
+        if (firstFrame == null)
+            throw new InvalidOperationException("Stream closed before receiving headers");
+
+        if (firstFrame.Value.Type == FrameType.Headers)
+        {
+            _responseHeaders = HeadersV1.Decode(firstFrame.Value.Memory.Span);
+            firstFrame.Value.ReturnToPool();
+            return _responseHeaders;
+        }
+
+        if (firstFrame.Value.Type == FrameType.Trailers)
+        {
+            var trailers = TrailersV1.Decode(firstFrame.Value.Memory.Span);
+            firstFrame.Value.ReturnToPool();
+            _trailers = trailers;
+            _halfCloseReceived = true;
+            throw new ShmStreamRefusedException(trailers.GrpcStatusMessage ?? "Stream refused by server");
+        }
+
+        firstFrame.Value.ReturnToPool();
+
         while (true)
         {
-            var frame = await ReceiveFrameAsync(cancellationToken);
+            var frame = await ReceiveFrameAsync(cancellationToken).ConfigureAwait(false);
             if (frame == null)
                 throw new InvalidOperationException("Stream closed before receiving headers");
 
@@ -571,7 +641,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
             // Server sent TRAILERS before HEADERS — stream was refused.
             // This happens when the server's max concurrent streams is exceeded.
-            // Analogous to HTTP/2 RST_STREAM with REFUSED_STREAM error code.
             if (frame.Value.Type == FrameType.Trailers)
             {
                 var trailers = TrailersV1.Decode(frame.Value.Memory.Span);
