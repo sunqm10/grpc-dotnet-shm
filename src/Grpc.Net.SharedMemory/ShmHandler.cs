@@ -17,6 +17,7 @@
 #endregion
 
 using System.Buffers;
+using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Runtime.Versioning;
@@ -81,7 +82,10 @@ public sealed class ShmHandler : HttpMessageHandler
             return await SendSingleAttemptAsync(request, null, cancellationToken);
         }
 
-        // Buffer request content for potential retry replay
+        // Buffer request content for potential retry replay.
+        // For streaming RPCs the caller's content stream is consumed here,
+        // which is unavoidable when retry is enabled — the request body must
+        // be replayable. Callers who need true streaming should disable retry.
         byte[]? requestBody = null;
         if (request.Content != null)
         {
@@ -93,45 +97,44 @@ public sealed class ShmHandler : HttpMessageHandler
         while (true)
         {
             retryState.IncrementAttempt();
-            var response = await SendSingleAttemptAsync(request, requestBody, cancellationToken);
 
-            if (retryState.IsCommitted)
+            HttpResponseMessage response;
+            try
             {
-                return response;
+                response = await SendSingleAttemptAsync(request, requestBody, cancellationToken);
             }
-
-            // For retry to work, we must read the full response to get trailers.
-            // Buffer the content so we can either return it or discard it on retry.
-            var contentBytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
-
-            // Check grpc-status from trailing headers (populated after reading content)
-            if (response.TrailingHeaders.TryGetValues("grpc-status", out var statusValues))
+            catch (ShmStreamRefusedException) when (!cancellationToken.IsCancellationRequested)
             {
-                var statusStr = statusValues.FirstOrDefault();
-                if (int.TryParse(statusStr, out var statusInt))
+                // Stream refused by server (max concurrent streams exceeded).
+                // This is a transport-level rejection before user data flows — safe to retry.
+                if (retryState.ShouldRetryTransport(out var backoff))
                 {
-                    var grpcStatus = (Grpc.Core.StatusCode)statusInt;
-                    if (grpcStatus == Grpc.Core.StatusCode.OK)
-                    {
-                        retryState.RecordSuccess();
-                        // Re-wrap the already-read content
-                        response.Content = new ByteArrayContent(contentBytes);
-                        response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/grpc");
-                        return response;
-                    }
-
-                    if (retryState.ShouldRetry(grpcStatus, out var backoff))
-                    {
-                        response.Dispose();
-                        await Task.Delay(backoff, cancellationToken);
-                        continue;
-                    }
+                    await Task.Delay(backoff, cancellationToken);
+                    continue;
                 }
+                throw;
+            }
+            catch (Exception ex) when (
+                !cancellationToken.IsCancellationRequested &&
+                (ex is RingClosedException or ObjectDisposedException or InvalidOperationException))
+            {
+                // Transport-level failure (connection closed, disposed, ring error).
+                // Safe to retry if the policy allows.
+                if (retryState.ShouldRetryTransport(out var backoff))
+                {
+                    await Task.Delay(backoff, cancellationToken);
+                    continue;
+                }
+                throw;
             }
 
-            // Cannot retry — return response with buffered content
-            response.Content = new ByteArrayContent(contentBytes);
-            response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/grpc");
+            // Response headers received — the call is committed per gRPC spec (A6).
+            // Return immediately without buffering the response body.
+            // For streaming RPCs this is critical: the response body must be consumed
+            // incrementally by the caller, not buffered by the retry loop.
+            // grpc-status based retry is handled by the upper grpc-dotnet retry layer.
+            retryState.Commit();
+            retryState.RecordSuccess();
             return response;
         }
     }
@@ -434,7 +437,7 @@ internal sealed class ShmResponseContent : HttpContent
         if (_stream.Trailers != null && _trailingHeaders != null)
         {
             var trailers = _stream.Trailers;
-            _trailingHeaders.TryAddWithoutValidation("grpc-status", ((int)trailers.GrpcStatusCode).ToString());
+            _trailingHeaders.TryAddWithoutValidation("grpc-status", ((int)trailers.GrpcStatusCode).ToString(CultureInfo.InvariantCulture));
             if (!string.IsNullOrEmpty(trailers.GrpcStatusMessage))
             {
                 _trailingHeaders.TryAddWithoutValidation("grpc-message", Uri.EscapeDataString(trailers.GrpcStatusMessage));

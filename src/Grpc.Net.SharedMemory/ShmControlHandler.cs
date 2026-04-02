@@ -16,6 +16,7 @@
 
 #endregion
 
+using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using Grpc.Core;
@@ -198,7 +199,7 @@ public sealed class ShmControlHandler : HttpMessageHandler
         }
     }
 
-    private async Task<HttpResponseMessage> SendOnStreamAsync(
+    private static async Task<HttpResponseMessage> SendOnStreamAsync(
         ShmGrpcStream stream, HttpRequestMessage request, CancellationToken cancellationToken)
     {
         // Extract gRPC metadata
@@ -813,7 +814,7 @@ internal sealed class ShmControlResponseContent : HttpContent
         if (_stream.Trailers != null && _trailingHeaders != null)
         {
             var trailers = _stream.Trailers;
-            _trailingHeaders.TryAddWithoutValidation("grpc-status", ((int)trailers.GrpcStatusCode).ToString());
+            _trailingHeaders.TryAddWithoutValidation("grpc-status", ((int)trailers.GrpcStatusCode).ToString(CultureInfo.InvariantCulture));
             if (!string.IsNullOrEmpty(trailers.GrpcStatusMessage))
             {
                 _trailingHeaders.TryAddWithoutValidation("grpc-message", Uri.EscapeDataString(trailers.GrpcStatusMessage));

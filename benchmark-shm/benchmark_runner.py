@@ -125,12 +125,12 @@ def extract_data(results: dict) -> dict:
         stream_lookup[(e["transport"], e["size_bytes"])] = e
 
     # --- Size groups (matching Go's split) ---
-    # Small streaming sizes  (Go: 64B-1MB; .NET: 1B-1MB)
-    sizes = [1, 1024, 4096, 16384, 65536, 262144, 524288, 1048576]
+    # Small streaming sizes  (Go: 64B-1MB; .NET: 1B-4MB)
+    sizes = [1, 1024, 4096, 16384, 65536, 262144, 524288, 1048576, 2097152, 4194304]
     size_labels = [format_size(s) for s in sizes]
 
-    # Small unary/roundtrip sizes  (Go: 64B-4KB; .NET: 1B-16KB)
-    rt_sizes = [1, 1024, 4096, 16384]
+    # Small unary/roundtrip sizes  (Go: 64B-4KB; .NET: 1B-64KB)
+    rt_sizes = [1, 1024, 4096, 16384, 65536]
     rt_labels = [format_size(s) for s in rt_sizes]
 
     # Large payload sizes  (Go: 1MB-256MB; .NET: 1MB-128MB)
@@ -554,8 +554,8 @@ def generate_consolidated_plot(data: dict):
     runtime = data.get("runtime", "")
     timestamp = data.get("timestamp", "")[:10]
 
-    fig = plt.figure(figsize=(18, 28))
-    gs = fig.add_gridspec(7, 3, hspace=0.35, wspace=0.25,
+    fig = plt.figure(figsize=(18, 36))
+    gs = fig.add_gridspec(7, 3, hspace=0.40, wspace=0.25,
                           height_ratios=[1, 1, 1, 1, 1, 1, 0.6])
 
     fig.suptitle(
@@ -946,7 +946,7 @@ def generate_consolidated_plot(data: dict):
     tcp_rt = data["tcp_rt_latency"]
     if (_has_numeric(shm_lat) and _has_numeric(tcp_lat)
             and _has_numeric(shm_rt) and _has_numeric(tcp_rt)):
-        categories = ['Unary\n(1KB)', 'Stream\n(1MB)', 'Large Stream\n(16MB)', 'Large Unary\n(16MB)']
+        categories = ['Unary\n(1KB)', 'Stream\n(1MB)', 'Large Stream\n(4MB)', 'Large Unary\n(4MB)']
         speedups_tcp = []
 
         # Unary 1KB (index 1 in rt_sizes)
@@ -959,14 +959,14 @@ def generate_consolidated_plot(data: dict):
         s_tcp = _safe_number(tcp_lat, len(tcp_lat) - 1)
         speedups_tcp.append(s_tcp / s_shm if s_shm and s_tcp else 0)
 
-        # Large Stream 16MB (index 3 in large_sizes)
-        ls_shm = _safe_number(shm_large_stream_lat, 3)
-        ls_tcp = _safe_number(tcp_large_stream_lat, 3)
+        # Large Stream 4MB (index 2 in large_sizes)
+        ls_shm = _safe_number(shm_large_stream_lat, 2)
+        ls_tcp = _safe_number(tcp_large_stream_lat, 2)
         speedups_tcp.append(ls_tcp / ls_shm if ls_shm and ls_tcp else 0)
 
-        # Large Unary 16MB (index 3 in large_sizes)
-        lu_shm = _safe_number(shm_large_rt_lat, 3)
-        lu_tcp = _safe_number(tcp_large_rt_lat, 3)
+        # Large Unary 4MB (index 2 in large_sizes)
+        lu_shm = _safe_number(shm_large_rt_lat, 2)
+        lu_tcp = _safe_number(tcp_large_rt_lat, 2)
         speedups_tcp.append(lu_tcp / lu_shm if lu_shm and lu_tcp else 0)
 
         if any(v > 0 for v in speedups_tcp):
@@ -1020,17 +1020,17 @@ def generate_consolidated_plot(data: dict):
             f"STREAMING (1KB):         SHM: {shm_lat[1]:.0f} ns    TCP: {tcp_lat[1]:.0f} ns    "
             f"Speedup: {stream_speedup:.1f}x vs TCP")
 
-    if valid_stream_idx and 3 in valid_stream_idx:
-        shm_v = shm_large_stream_tp[3] / 1000
-        tcp_v = (tcp_large_stream_tp[3] or 0) / 1000
+    if valid_stream_idx and 2 in valid_stream_idx:
+        shm_v = shm_large_stream_tp[2] / 1000
+        tcp_v = (tcp_large_stream_tp[2] or 0) / 1000
         summary_lines.append(
-            f"STREAMING (16MB):        SHM: {shm_v:.1f} GB/s    TCP: {tcp_v:.2f} GB/s")
+            f"STREAMING (4MB):         SHM: {shm_v:.2f} GB/s    TCP: {tcp_v:.2f} GB/s")
 
-    if valid_rt_idx and 3 in valid_rt_idx:
-        shm_v = shm_large_rt_tp[3] / 1000
-        tcp_v = (tcp_large_rt_tp[3] or 0) / 1000
+    if valid_rt_idx and 2 in valid_rt_idx:
+        shm_v = shm_large_rt_tp[2] / 1000
+        tcp_v = (tcp_large_rt_tp[2] or 0) / 1000
         summary_lines.append(
-            f"UNARY RPC (16MB):        SHM: {shm_v:.1f} GB/s    TCP: {tcp_v:.2f} GB/s")
+            f"UNARY RPC (4MB):         SHM: {shm_v:.2f} GB/s    TCP: {tcp_v:.2f} GB/s")
 
     summary_lines.extend(["", f"CPU: {cpu_full}    Runtime: {runtime}    Ring Buffer: 64 MiB", "\u2550" * 120])
 
@@ -1049,6 +1049,183 @@ def generate_consolidated_plot(data: dict):
     return consolidated_file
 
 
+def generate_cross_platform_plots(win_results: dict, lin_results: dict):
+    """Generate cross-platform comparison plots (Windows vs Linux)."""
+    compare_dir = OUT_ROOT / "comparison"
+    compare_dir.mkdir(parents=True, exist_ok=True)
+
+    plt.style.use('default')
+    plt.rcParams.update({
+        'figure.facecolor': 'white',
+        'axes.facecolor': 'white',
+        'axes.grid': True,
+        'grid.alpha': 0.3,
+        'font.size': 10,
+    })
+
+    all_sizes = [0, 1, 1024, 4096, 16384, 65536, 262144, 524288, 1048576, 2097152, 4194304]
+    all_labels = [format_size(s) for s in all_sizes]
+
+    def _lookup(results):
+        u, s = {}, {}
+        for e in results.get("unary", []):
+            u[(e["transport"], e["size_bytes"])] = e
+        for e in results.get("streaming", []):
+            s[(e["transport"], e["size_bytes"])] = e
+        return u, s
+
+    win_u, win_s = _lookup(win_results)
+    lin_u, lin_s = _lookup(lin_results)
+
+    def _lat(lookup, transport, size):
+        e = lookup.get((transport, size))
+        return e["avg_latency_us"] if e else None
+
+    def _tp(lookup, transport, size):
+        e = lookup.get((transport, size))
+        return e["throughput_mb_per_s"] if e else None
+
+    win_cpu = win_results.get("cpu", "Windows")[:45]
+    lin_cpu = lin_results.get("cpu", "Linux")[:45]
+
+    # ================================================================
+    # Plot 1: SHM/TCP Ratio comparison (bar chart)
+    # ================================================================
+    for rpc_type, type_label, u_win, u_lin in [
+        ("unary", "Unary Ping-Pong", win_u, lin_u),
+        ("streaming", "Streaming Ping-Pong", win_s, lin_s),
+    ]:
+        win_ratios, lin_ratios = [], []
+        valid_labels = []
+        for i, s in enumerate(all_sizes):
+            wt = _lat(u_win, "tcp", s)
+            ws = _lat(u_win, "shm", s)
+            lt = _lat(u_lin, "tcp", s)
+            ls = _lat(u_lin, "shm", s)
+            if wt and ws and lt and ls:
+                win_ratios.append(ws / wt)
+                lin_ratios.append(ls / lt)
+                valid_labels.append(all_labels[i])
+
+        if not valid_labels:
+            continue
+
+        fig, ax = plt.subplots(figsize=(14, 6))
+        x = np.arange(len(valid_labels))
+        w = 0.35
+        ax.bar(x - w/2, win_ratios, w, label=f'Windows ({win_cpu[:25]})',
+               color='#4472C4', edgecolor='black', linewidth=0.5)
+        ax.bar(x + w/2, lin_ratios, w, label=f'Linux ({lin_cpu[:25]})',
+               color='#70AD47', edgecolor='black', linewidth=0.5)
+        ax.axhline(y=1.0, color='#e74c3c', linestyle='--', linewidth=1.5, alpha=0.8, label='Break-even (1.0)')
+        ax.set_xlabel('Payload Size', fontsize=12)
+        ax.set_ylabel('SHM / TCP Ratio (lower = SHM wins)', fontsize=12)
+        ax.set_title(f'{type_label}: SHM/TCP Latency Ratio\nWindows vs Linux', fontsize=14, fontweight='bold')
+        ax.set_xticks(x); ax.set_xticklabels(valid_labels)
+        ax.legend(loc='upper right')
+
+        for i, (wr, lr) in enumerate(zip(win_ratios, lin_ratios)):
+            ax.annotate(f'{wr:.2f}', xy=(i - w/2, wr), xytext=(0, 3),
+                       textcoords='offset points', ha='center', fontsize=8, color='#4472C4', fontweight='bold')
+            ax.annotate(f'{lr:.2f}', xy=(i + w/2, lr), xytext=(0, 3),
+                       textcoords='offset points', ha='center', fontsize=8, color='#70AD47', fontweight='bold')
+
+        plt.tight_layout()
+        fname = compare_dir / f"{rpc_type}_ratio.png"
+        plt.savefig(fname, dpi=150, bbox_inches='tight', facecolor='white')
+        plt.close()
+        print(f"Created: {fname}")
+
+    # ================================================================
+    # Plot 2: Latency comparison (4-line log-scale)
+    # ================================================================
+    colors4 = {
+        'Win TCP': '#4472C4', 'Win SHM': '#C0504D',
+        'Lin TCP': '#70AD47', 'Lin SHM': '#ED7D31',
+    }
+    styles4 = {
+        'Win TCP': '-', 'Win SHM': '-',
+        'Lin TCP': '--', 'Lin SHM': '--',
+    }
+
+    for rpc_type, type_label, w_lk, l_lk in [
+        ("unary", "Unary Ping-Pong", win_u, lin_u),
+        ("streaming", "Streaming Ping-Pong", win_s, lin_s),
+    ]:
+        fig, ax = plt.subplots(figsize=(14, 7))
+        for series_name, lookup, transport in [
+            ('Win TCP', w_lk, 'tcp'), ('Win SHM', w_lk, 'shm'),
+            ('Lin TCP', l_lk, 'tcp'), ('Lin SHM', l_lk, 'shm'),
+        ]:
+            vals, labels = [], []
+            for i, s in enumerate(all_sizes):
+                v = _lat(lookup, transport, s)
+                if v and v > 0:
+                    vals.append(v)
+                    labels.append(i)
+            if vals:
+                ax.plot(labels, vals, marker='o', markersize=5,
+                       color=colors4[series_name], linestyle=styles4[series_name],
+                       linewidth=2, label=series_name)
+
+        ax.set_yscale('log')
+        ax.set_xlabel('Payload Size', fontsize=12)
+        ax.set_ylabel('Latency (µs, log scale)', fontsize=12)
+        ax.set_title(f'{type_label}: Latency Comparison\nWindows vs Linux (log scale)',
+                    fontsize=14, fontweight='bold')
+        ax.set_xticks(range(len(all_labels)))
+        ax.set_xticklabels(all_labels, fontsize=9)
+        ax.legend(loc='upper left', fontsize=10)
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        fname = compare_dir / f"{rpc_type}_latency.png"
+        plt.savefig(fname, dpi=150, bbox_inches='tight', facecolor='white')
+        plt.close()
+        print(f"Created: {fname}")
+
+    # ================================================================
+    # Plot 3: Throughput comparison (4-line)
+    # ================================================================
+    for rpc_type, type_label, w_lk, l_lk in [
+        ("unary", "Unary Ping-Pong", win_u, lin_u),
+        ("streaming", "Streaming Ping-Pong", win_s, lin_s),
+    ]:
+        fig, ax = plt.subplots(figsize=(14, 7))
+        for series_name, lookup, transport in [
+            ('Win TCP', w_lk, 'tcp'), ('Win SHM', w_lk, 'shm'),
+            ('Lin TCP', l_lk, 'tcp'), ('Lin SHM', l_lk, 'shm'),
+        ]:
+            vals, labels = [], []
+            for i, s in enumerate(all_sizes):
+                v = _tp(lookup, transport, s)
+                if v and v > 0:
+                    vals.append(v)
+                    labels.append(i)
+            if vals:
+                ax.plot(labels, vals, marker='s', markersize=5,
+                       color=colors4[series_name], linestyle=styles4[series_name],
+                       linewidth=2, label=series_name)
+
+        ax.set_yscale('log')
+        ax.set_xlabel('Payload Size', fontsize=12)
+        ax.set_ylabel('Throughput (MB/s, log scale)', fontsize=12)
+        ax.set_title(f'{type_label}: Throughput Comparison\nWindows vs Linux (log scale)',
+                    fontsize=14, fontweight='bold')
+        ax.set_xticks(range(len(all_labels)))
+        ax.set_xticklabels(all_labels, fontsize=9)
+        ax.legend(loc='upper left', fontsize=10)
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        fname = compare_dir / f"{rpc_type}_throughput.png"
+        plt.savefig(fname, dpi=150, bbox_inches='tight', facecolor='white')
+        plt.close()
+        print(f"Created: {fname}")
+
+    print(f"\nAll cross-platform plots saved to: {compare_dir}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Run .NET gRPC benchmarks (SHM vs TCP) and generate plots',
@@ -1058,16 +1235,35 @@ Examples:
   python benchmark_runner.py              # Use cached results or run if none
   python benchmark_runner.py --run        # Force rerun benchmarks
   python benchmark_runner.py --plot-only  # Only plot, fail if no cached data
+  python benchmark_runner.py --compare    # Cross-platform comparison (win vs lin)
         """
     )
     parser.add_argument('--run', action='store_true',
                        help='Force rerun benchmarks even if cached results exist')
     parser.add_argument('--plot-only', action='store_true',
                        help='Only generate plots, fail if no cached results')
+    parser.add_argument('--compare', action='store_true',
+                       help='Generate cross-platform comparison plots (Windows vs Linux)')
 
     args = parser.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Cross-platform comparison mode
+    if args.compare:
+        win_file = OUT_ROOT / "windows" / "results.json"
+        lin_file = OUT_ROOT / "linux" / "results.json"
+        if not win_file.exists() or not lin_file.exists():
+            print(f"ERROR: Need both {win_file} and {lin_file}")
+            sys.exit(1)
+        with open(win_file) as f:
+            win_results = json.load(f)
+        with open(lin_file) as f:
+            lin_results = json.load(f)
+        print(f"Windows: {win_results.get('cpu', '?')}")
+        print(f"Linux:   {lin_results.get('cpu', '?')}")
+        generate_cross_platform_plots(win_results, lin_results)
+        return 0
 
     results = None
 

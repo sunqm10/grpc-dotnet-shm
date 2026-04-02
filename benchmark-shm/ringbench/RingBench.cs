@@ -92,8 +92,13 @@ string platform = platformOverride
 outDir = Path.Combine(outDir, platform);
 Directory.CreateDirectory(outDir);
 
-// Go benchmark sizes: 0, 1, 1K, 4K, 16K, 64K, 256K, 512K, 1M, 2M
-int[] sizes = { 0, 1, 1024, 4096, 16384, 65536, 262144, 524288, 1048576, 2097152 };
+// Clean up stale SHM segments from previous crashed benchmark runs
+var cleaned = Segment.TryRemoveSegmentsByPrefix("bench_shm_");
+if (cleaned > 0)
+    Console.WriteLine($"Cleaned {cleaned} stale SHM segment(s) from previous runs.");
+
+// Go benchmark sizes: 0, 1, 1K, 4K, 16K, 64K, 256K, 512K, 1M, 2M, 4M
+int[] sizes = { 0, 1, 1024, 4096, 16384, 65536, 262144, 524288, 1048576, 2097152, 4194304 };
 
 string cpu = GetCpuInfo();
 string runtime = RuntimeInformation.FrameworkDescription;
@@ -232,7 +237,11 @@ async Task<BenchEnv> StartTcpEnv()
 
     try
     {
-        var channel = GrpcChannel.ForAddress($"http://127.0.0.1:{port}");
+        var channel = GrpcChannel.ForAddress($"http://127.0.0.1:{port}", new GrpcChannelOptions
+        {
+            MaxReceiveMessageSize = 8 * 1024 * 1024,
+            MaxSendMessageSize = 8 * 1024 * 1024
+        });
         var client = new BenchmarkService.BenchmarkServiceClient(channel);
 
         await WaitForServerReadyAsync(client, TimeSpan.FromSeconds(20));
@@ -264,7 +273,9 @@ async Task<BenchEnv> StartShmEnv()
         var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
         {
             HttpHandler = new ShmControlHandler(segmentName),
-            DisposeHttpClient = true
+            DisposeHttpClient = true,
+            MaxReceiveMessageSize = 8 * 1024 * 1024,
+            MaxSendMessageSize = 8 * 1024 * 1024
         });
 
         var client = new BenchmarkService.BenchmarkServiceClient(channel);
@@ -458,7 +469,11 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
 
         var builder = WebApplication.CreateBuilder(Array.Empty<string>());
         builder.Logging.ClearProviders();
-        builder.Services.AddGrpc();
+        builder.Services.AddGrpc(o =>
+        {
+            o.MaxReceiveMessageSize = 8 * 1024 * 1024;
+            o.MaxSendMessageSize = 8 * 1024 * 1024;
+        });
         builder.WebHost.ConfigureKestrel(k =>
         {
             k.Listen(IPAddress.Loopback, port, lo => lo.Protocols = HttpProtocols.Http2);

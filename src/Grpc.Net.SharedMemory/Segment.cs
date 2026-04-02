@@ -129,6 +129,7 @@ public sealed partial class Segment : IDisposable
     private readonly Memory<byte> _memory;
     private readonly bool _isServer;
     private int _disposed;
+    private FileStream? _lockFileStream;
 
     /// <summary>Gets the segment name.</summary>
     public string Name { get; }
@@ -663,6 +664,7 @@ public sealed partial class Segment : IDisposable
         }
     }
 
+#pragma warning disable CA1822 // Instance member accessed inside platform-conditional #if block
     private unsafe void WaitHeaderFlagWindows(int offset, CancellationToken cancellationToken)
     {
 #if WINDOWS
@@ -677,7 +679,9 @@ public sealed partial class Segment : IDisposable
         throw new PlatformNotSupportedException("Windows readiness wait is not available on this platform.");
 #endif
     }
+#pragma warning restore CA1822
 
+#pragma warning disable CA1822
     private unsafe void WaitHeaderFlagLinux(int offset, CancellationToken cancellationToken)
     {
 #if LINUX
@@ -691,6 +695,7 @@ public sealed partial class Segment : IDisposable
         throw new PlatformNotSupportedException("Linux readiness wait is not available on this platform.");
 #endif
     }
+#pragma warning restore CA1822
 
     private unsafe void SignalHeaderFlagWaiters(int offset)
     {
@@ -782,6 +787,37 @@ public sealed partial class Segment : IDisposable
     }
 
     /// <summary>
+    /// Removes all segment files whose names start with the given prefix.
+    /// Useful for cleaning up stale segments left by crashed processes.
+    /// </summary>
+    public static int TryRemoveSegmentsByPrefix(string namePrefix)
+    {
+        var filePrefix = $"grpc_shm_{namePrefix}";
+        var count = 0;
+        try
+        {
+            if (OperatingSystem.IsLinux())
+            {
+                const string devShm = "/dev/shm";
+                if (Directory.Exists(devShm))
+                {
+                    foreach (var file in Directory.EnumerateFiles(devShm, filePrefix + "*"))
+                    {
+                        try { File.Delete(file); count++; } catch { }
+                    }
+                }
+            }
+            var tempDir = Path.GetTempPath();
+            foreach (var file in Directory.EnumerateFiles(tempDir, filePrefix + "*"))
+            {
+                try { File.Delete(file); count++; } catch { }
+            }
+        }
+        catch { }
+        return count;
+    }
+
+    /// <summary>
     /// Checks if a segment exists (checks both /dev/shm and /tmp on Linux).
     /// </summary>
     public static bool Exists(string name)
@@ -795,11 +831,78 @@ public sealed partial class Segment : IDisposable
     public static Segment CreateControlSegment(string baseName)
     {
         var ctlName = baseName + ShmConstants.ControlSegmentSuffix;
-        
-        // Clean up any stale segment from previous run
-        TryRemoveSegment(ctlName);
-        
-        return Create(ctlName, ShmConstants.MinRingCapacity, 0);
+
+        // Remove stale control segment from a previous crashed instance.
+        //
+        // On Windows, File.Delete fails if the file is memory-mapped by a live
+        // process, so TryRemoveSegment is safe — only orphaned files are removed.
+        //
+        // On Linux, unlink succeeds even on mapped files. To prevent endpoint
+        // steal / split-brain we use an advisory lock file ({ctlName}.lock).
+        // The protocol is lock-first:
+        //   1. Atomically acquire exclusive ownership via the .lock file.
+        //      If another server holds it → throw "endpoint in use".
+        //   2. Only after the lock is held, remove any stale ctl file.
+        //   3. Create the new ctl segment.
+        // This eliminates the TOCTOU window: no server can see a ctl file
+        // without a lock because step 1 always precedes step 2-3.
+        FileStream? lockStream = null;
+
+        if (OperatingSystem.IsWindows())
+        {
+            TryRemoveSegment(ctlName);
+        }
+        else
+        {
+            // Step 1: Acquire exclusive lock. FileShare.None makes the open
+            // fail with IOException if any other process holds the file.
+            // FileMode.OpenOrCreate ensures the lock file is created atomically
+            // if it doesn't exist yet.
+            var lockPath = GenerateSegmentPath(ctlName) + ".lock";
+            try
+            {
+                lockStream = new FileStream(
+                    lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException)
+            {
+                // Lock held by another process → live server.
+                throw new IOException(
+                    $"SHM endpoint '{baseName}' is held by a live server. " +
+                    $"Cannot create a new control segment while another instance is active.");
+            }
+
+            // Step 2: We hold the lock. Any existing ctl file is stale (the
+            // previous holder either crashed or exited without cleanup).
+            TryRemoveSegment(ctlName);
+        }
+
+        // Step 3: Create the new control segment.
+        Segment segment;
+        try
+        {
+            segment = Create(ctlName, ShmConstants.MinRingCapacity, 0);
+        }
+        catch
+        {
+            lockStream?.Dispose();
+            try { if (lockStream != null) File.Delete(lockStream.Name); } catch { }
+            throw;
+        }
+
+        // Transfer lock ownership to the segment so it's held until Dispose().
+        segment._lockFileStream = lockStream;
+        return segment;
+    }
+
+    /// <summary>
+    /// Removes stale connection data segment files matching {baseName}_conn_*.
+    /// Only safe to call when the corresponding control segment is known to be
+    /// inactive (no live server holds it).
+    /// </summary>
+    internal static void TryRemoveStaleConnectionSegments(string baseName)
+    {
+        TryRemoveSegmentsByPrefix(baseName + "_conn_");
     }
 
     /// <summary>
@@ -848,6 +951,16 @@ public sealed partial class Segment : IDisposable
             {
                 // Best effort cleanup - file may still be in use by clients
             }
+        }
+
+        // Release the advisory lock file (Linux endpoint-steal protection).
+        // Closing the stream releases the file-share lock; then delete the file.
+        if (_lockFileStream != null)
+        {
+            var lockPath = _lockFileStream.Name;
+            try { _lockFileStream.Dispose(); } catch { }
+            try { File.Delete(lockPath); } catch { }
+            _lockFileStream = null;
         }
     }
 }

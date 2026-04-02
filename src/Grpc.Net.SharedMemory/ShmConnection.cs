@@ -36,9 +36,9 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     private readonly Channel<ShmGrpcStream> _incomingStreamsChannel;
     private uint _nextStreamId;
     private int _disposed;
-    private bool _goAwaySent;
-    private bool _goAwayReceived;
-    private bool _draining;
+    private int _goAwaySent;
+    private volatile bool _goAwayReceived;
+    private volatile bool _draining;
     private uint _maxConcurrentStreams;
 
     // Atomic counter for client-side max-stream enforcement.
@@ -66,8 +66,8 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     private Task? _keepaliveTask;
     private DateTime _lastPingAt;
     private DateTime _lastPingSentAt;
-    private bool _pendingPing;
-    private int _pingStrikes;
+    private volatile bool _pendingPing;
+    private int _pingStrikes; // accessed via Interlocked from multiple threads
 
     /// <summary>
     /// Gets the connection name (shared memory segment name).
@@ -82,7 +82,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// <summary>
     /// Gets whether the connection has been closed.
     /// </summary>
-    public bool IsClosed => Volatile.Read(ref _disposed) != 0 || _goAwaySent || _goAwayReceived;
+    public bool IsClosed => Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref _goAwaySent) != 0 || _goAwayReceived;
 
     /// <summary>
     /// Gets whether the connection is draining (not accepting new streams).
@@ -346,8 +346,8 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// <param name="message">Optional debug message.</param>
     public void SendGoAway(string? message = null)
     {
-        if (_goAwaySent) return;
-        _goAwaySent = true;
+        // Atomic check-and-set: only one thread sends the GoAway frame.
+        if (Interlocked.CompareExchange(ref _goAwaySent, 1, 0) != 0) return;
 
         try
         {
@@ -582,7 +582,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             }
 
             // Check if draining
-            if (_draining || _goAwaySent || _goAwayReceived)
+            if (_draining || _goAwaySent != 0 || _goAwayReceived)
             {
                 RejectStream(streamId, "transport is draining");
                 payload.Release();
@@ -765,7 +765,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 }
 
                 // Check if we should send a ping
-                var hasActiveStreams = _streams.Count > 0;
+                var hasActiveStreams = !_streams.IsEmpty;
                 if (!hasActiveStreams && !_keepaliveOptions.PermitWithoutStream)
                 {
                     continue;
@@ -814,13 +814,12 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         if (!_isClient && _enforcementPolicy != null)
         {
             var now = DateTime.UtcNow;
-            var hasActiveStreams = _streams.Count > 0;
+            var hasActiveStreams = !_streams.IsEmpty;
 
             // Check if ping is allowed without streams
             if (!hasActiveStreams && !_enforcementPolicy.PermitWithoutStream)
             {
-                _pingStrikes++;
-                if (_pingStrikes > _enforcementPolicy.MaxPingStrikes)
+                if (Interlocked.Increment(ref _pingStrikes) > _enforcementPolicy.MaxPingStrikes)
                 {
                     SendGoAway("too many pings without streams");
                     return;
@@ -830,8 +829,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             // Check if ping is too frequent
             if (_lastPingAt != DateTime.MinValue && now - _lastPingAt < _enforcementPolicy.MinTime)
             {
-                _pingStrikes++;
-                if (_pingStrikes > _enforcementPolicy.MaxPingStrikes)
+                if (Interlocked.Increment(ref _pingStrikes) > _enforcementPolicy.MaxPingStrikes)
                 {
                     SendGoAway("too many pings");
                     return;
@@ -863,7 +861,7 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
     private void ThrowIfGoAway()
     {
-        if (_goAwaySent || _goAwayReceived)
+        if (_goAwaySent != 0 || _goAwayReceived)
         {
             throw new InvalidOperationException("Connection is being closed due to GoAway");
         }
@@ -879,9 +877,9 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
         _frameWriter?.Dispose();
 
-        if (!_goAwaySent)
+        if (_goAwaySent == 0)
         {
-            _goAwaySent = true;
+            Interlocked.Exchange(ref _goAwaySent, 1);
             try
             {
                 using var goAwayCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
@@ -922,9 +920,9 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
 
         _frameWriter?.Dispose();
 
-        if (!_goAwaySent)
+        if (_goAwaySent == 0)
         {
-            _goAwaySent = true;
+            Interlocked.Exchange(ref _goAwaySent, 1);
             try
             {
                 using var goAwayCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
