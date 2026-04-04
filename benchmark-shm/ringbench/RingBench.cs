@@ -204,6 +204,36 @@ var jsonPath = Path.Combine(outDir, "results.json");
 File.WriteAllText(jsonPath, JsonSerializer.Serialize(results, new JsonSerializerOptions { WriteIndented = true }));
 Console.WriteLine($"Results written to: {jsonPath}");
 
+// Dump IDirectMessageReader profiling
+{
+    // Ring read profiling
+    if (FrameProtocol._rpCount > 0)
+    {
+        var freq = (double)Stopwatch.Frequency;
+        var n = FrameProtocol._rpCount;
+        Console.WriteLine();
+        Console.WriteLine($"Ring read profiling ({n} large frames):");
+        Console.WriteLine($"  ReserveRead:  {FrameProtocol._rpReserve / freq * 1e6 / n:F1} us/frame  (wait + reserve)");
+        Console.WriteLine($"  Rent+memcpy:  {FrameProtocol._rpCopy / freq * 1e6 / n:F1} us/frame  (ArrayPool + copy)");
+        Console.WriteLine($"  TOTAL ring:   {FrameProtocol._rpTotal / freq * 1e6 / n:F1} us/frame");
+    }
+
+    // IDirectMessageReader profiling
+    if (Grpc.Net.Client.DirectReaderProf.Count > 0)
+    {
+        var freq3 = (double)Stopwatch.Frequency;
+        var n3 = Grpc.Net.Client.DirectReaderProf.Count;
+        Console.WriteLine();
+        Console.WriteLine($"IDirectMessageReader profiling ({n3} large msgs):");
+        Console.WriteLine($"  ReadNextMsg: {Grpc.Net.Client.DirectReaderProf.ReadTicks / freq3 * 1e6 / n3:F1} us/msg");
+        Console.WriteLine($"  Deserialize: {Grpc.Net.Client.DirectReaderProf.DeserTicks / freq3 * 1e6 / n3:F1} us/msg");
+        Console.WriteLine($"  TOTAL:       {(Grpc.Net.Client.DirectReaderProf.ReadTicks + Grpc.Net.Client.DirectReaderProf.DeserTicks) / freq3 * 1e6 / n3:F1} us/msg");
+    }
+
+    // Sync/Slow path breakdown
+    FrameProtocol.DumpDirectReaderBreakdown();
+}
+
 var csvPath = Path.Combine(outDir, "results.csv");
 WriteCsv(csvPath, unaryResults, streamingResults);
 Console.WriteLine($"CSV written to: {csvPath}");

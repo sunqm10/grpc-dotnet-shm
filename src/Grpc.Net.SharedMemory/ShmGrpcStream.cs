@@ -1113,6 +1113,45 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Tries to dequeue a frame from the inbound channel without waiting.
+    /// Used by IDirectMessageReader sync fast path.
+    /// </summary>
+    internal bool TryReceiveFrame(out InboundFrame frame)
+    {
+        return _inboundFrames.Reader.TryRead(out frame);
+    }
+
+    /// <summary>Waits until a frame is available in the channel.</summary>
+    internal ValueTask<bool> WaitForFrameAsync(CancellationToken cancellationToken)
+    {
+        return _inboundFrames.Reader.WaitToReadAsync(cancellationToken);
+    }
+
+    /// <summary>Exposes the dispose cancellation token for direct readers.</summary>
+    internal CancellationToken DisposeCancellationToken => _disposeCts.Token;
+
+    /// <summary>Sends a stream-level window update.</summary>
+    internal void SendWindowUpdate(uint increment)
+    {
+        if (increment > 0)
+        {
+            _connection.SendStreamWindowUpdate(StreamId, increment);
+        }
+    }
+
+    /// <summary>Marks half-close as received from the remote side.</summary>
+    internal void MarkHalfCloseReceived()
+    {
+        _halfCloseReceived = true;
+    }
+
+    /// <summary>Sets trailers from a Trailers frame.</summary>
+    internal void SetTrailers(InboundFrame frame)
+    {
+        _trailers = TrailersV1.Decode(frame.Memory.Span);
+    }
+
     internal void OnWindowUpdate(uint increment)
     {
         Interlocked.Add(ref _sendWindow, increment);

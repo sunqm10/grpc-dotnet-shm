@@ -16,9 +16,11 @@
 
 #endregion
 
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Threading.Channels;
 using Grpc.Core;
 
 namespace Grpc.Net.SharedMemory;
@@ -737,10 +739,11 @@ internal sealed class ShmGrpcRequestStream : Stream
 /// directly on the caller's thread — no Pipe, no Task.Run, no resource
 /// accumulation across thousands of calls.
 /// </summary>
-internal sealed class ShmControlResponseContent : HttpContent
+internal sealed class ShmControlResponseContent : HttpContent, Grpc.Net.Client.IDirectMessageReader
 {
     private readonly ShmGrpcStream _stream;
     private HttpHeaders? _trailingHeaders;
+    private InboundFrame _currentFrame;
 
     public ShmControlResponseContent(ShmGrpcStream stream)
     {
@@ -751,6 +754,119 @@ internal sealed class ShmControlResponseContent : HttpContent
     internal void SetTrailingHeaders(HttpHeaders trailingHeaders)
     {
         _trailingHeaders = trailingHeaders;
+    }
+
+    /// <summary>
+    /// Direct message reader: returns the next complete protobuf payload
+    /// without gRPC framing or Stream.ReadAsync overhead.
+    /// Uses sync fast path when data is already in the channel to avoid
+    /// async state machine allocation (~200ns per await).
+    /// </summary>
+    // Profiling
+    internal static long _drSyncHit, _drSlowPath, _drSlowTicks, _drWaitTicks, _drProcessTicks;
+
+    public ValueTask<(ReadOnlyMemory<byte> Payload, bool EndOfStream)> ReadNextMessageAsync(
+        CancellationToken cancellationToken)
+    {
+        _currentFrame.ReturnToPool();
+        _currentFrame = default;
+
+        if (_stream.TryReceiveFrame(out var frame))
+        {
+            Interlocked.Increment(ref _drSyncHit);
+            return new ValueTask<(ReadOnlyMemory<byte>, bool)>(
+                ProcessReceivedFrame(frame));
+        }
+
+        Interlocked.Increment(ref _drSlowPath);
+        return ReadNextMessageSlowAsync(cancellationToken);
+    }
+
+    private (ReadOnlyMemory<byte> Payload, bool EndOfStream) ProcessReceivedFrame(InboundFrame frame)
+    {
+        switch (frame.Type)
+        {
+            case FrameType.Message:
+                // Send stream-level window update
+                var increment = (uint)frame.Length;
+                if (increment > 0)
+                {
+                    _stream.SendWindowUpdate(increment);
+                }
+
+                _currentFrame = frame;
+                var eos = (frame.Flags & MessageFlags.EndStream) != 0;
+                if (eos) _stream.MarkHalfCloseReceived();
+                return (frame.Memory, eos);
+
+            case FrameType.HalfClose:
+                frame.ReturnToPool();
+                _stream.MarkHalfCloseReceived();
+                ApplyTrailers();
+                return (ReadOnlyMemory<byte>.Empty, true);
+
+            case FrameType.Trailers:
+                _stream.SetTrailers(frame);
+                frame.ReturnToPool();
+                _stream.MarkHalfCloseReceived();
+                ApplyTrailers();
+                return (ReadOnlyMemory<byte>.Empty, true);
+
+            default:
+                frame.ReturnToPool();
+                return (ReadOnlyMemory<byte>.Empty, true);
+        }
+    }
+
+    private async ValueTask<(ReadOnlyMemory<byte> Payload, bool EndOfStream)> ReadNextMessageSlowAsync(
+        CancellationToken cancellationToken)
+    {
+        var _st0 = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        // Wait for the reader thread to enqueue a frame, then process it
+        // inline — avoids ReceiveNextMessageBufferAsync's extra async layers.
+        var ct = cancellationToken.CanBeCanceled
+            ? cancellationToken
+            : _stream.DisposeCancellationToken;
+
+        try
+        {
+            while (true)
+            {
+                var _wt0 = Stopwatch.GetTimestamp();
+                if (!await _stream.WaitForFrameAsync(ct).ConfigureAwait(false))
+                {
+                    ApplyTrailers();
+                    return (ReadOnlyMemory<byte>.Empty, true);
+                }
+                var _wt1 = Stopwatch.GetTimestamp();
+
+                if (_stream.TryReceiveFrame(out var frame))
+                {
+                    var result = ProcessReceivedFrame(frame);
+                    var _wt2 = Stopwatch.GetTimestamp();
+                    Interlocked.Add(ref _drSlowTicks, _wt2 - _wt0);
+                    Interlocked.Add(ref _drWaitTicks, _wt1 - _wt0);
+                    Interlocked.Add(ref _drProcessTicks, _wt2 - _wt1);
+                    return result;
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            return (ReadOnlyMemory<byte>.Empty, true);
+        }
+        catch (ChannelClosedException)
+        {
+            ApplyTrailers();
+            return (ReadOnlyMemory<byte>.Empty, true);
+        }
+    }
+
+    public void ReleaseCurrentMessage()
+    {
+        _currentFrame.ReturnToPool();
+        _currentFrame = default;
     }
 
     protected override Task<Stream> CreateContentReadStreamAsync()
