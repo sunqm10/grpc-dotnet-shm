@@ -461,76 +461,33 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 return false;
             }
 
-            // Release previous frame
-            _previousFrame.ReturnToPool();
-            _previousFrame = default;
+            // Use ReceiveNextMessageBufferAsync with the caller's per-call
+            // cancellation token. Unlike the enumerator-based approach, this
+            // ensures every MoveNext call respects the current token — not
+            // the one from the first call.
+            var (mem, frame, eos) = await _stream.ReceiveNextMessageBufferAsync(
+                _previousFrame, cancellationToken).ConfigureAwait(false);
 
-            // Fast path: try sync read from channel
-            InboundFrame frame;
-            if (_stream.TryReceiveFrame(out frame))
+            if (eos)
             {
-                return ProcessFrame(frame);
-            }
-
-            // Slow path: wait for frame with minimal async layers
-            var ct = cancellationToken.CanBeCanceled ? cancellationToken : _stream.DisposeCancellationToken;
-            try
-            {
-                while (true)
+                if (mem.Length == 0)
                 {
-                    if (!await _stream.WaitForFrameAsync(ct).ConfigureAwait(false))
-                        return false;
-
-                    if (_stream.TryReceiveFrame(out frame))
-                        return ProcessFrame(frame);
+                    _previousFrame = default;
+                    _current = default;
+                    return false;
                 }
+
+                // EndStream with a final message: parse it, then signal
+                // end-of-stream on the *next* MoveNext call.
+                _previousFrame = frame;
+                _current = _parser.ParseFrom(new ReadOnlySequence<byte>(mem));
+                _endOfStream = true;
+                return true;
             }
-            catch (OperationCanceledException)
-            {
-                return false;
-            }
-            catch (System.Threading.Channels.ChannelClosedException)
-            {
-                return false;
-            }
-        }
 
-        private bool ProcessFrame(InboundFrame frame)
-        {
-            switch (frame.Type)
-            {
-                case FrameType.Message:
-                    var increment = (uint)frame.Length;
-                    if (increment > 0)
-                        _stream.SendWindowUpdate(increment);
-
-                    _previousFrame = frame;
-                    var mem = frame.Memory;
-                    _current = _parser.ParseFrom(new System.Buffers.ReadOnlySequence<byte>(mem));
-
-                    var eos = (frame.Flags & MessageFlags.EndStream) != 0;
-                    if (eos)
-                    {
-                        _stream.MarkHalfCloseReceived();
-                        _endOfStream = true;
-                    }
-                    return true;
-
-                case FrameType.HalfClose:
-                    frame.ReturnToPool();
-                    _stream.MarkHalfCloseReceived();
-                    return false;
-
-                case FrameType.Trailers:
-                    _stream.SetTrailers(frame);
-                    frame.ReturnToPool();
-                    _stream.MarkHalfCloseReceived();
-                    return false;
-
-                default:
-                    frame.ReturnToPool();
-                    return false;
-            }
+            _previousFrame = frame;
+            _current = _parser.ParseFrom(new ReadOnlySequence<byte>(mem));
+            return true;
         }
 
         public void Dispose()
@@ -560,19 +517,10 @@ public sealed class ShmGrpcServer : IAsyncDisposable
 
         public WriteOptions? WriteOptions { get; set; }
 
-        public Task WriteAsync(T message)
+        public async Task WriteAsync(T message)
         {
-            var headersTask = _context.EnsureResponseHeadersSentAsync();
-            if (!headersTask.IsCompletedSuccessfully)
-                return WriteAsyncSlow(headersTask, message);
-
-            return SendProtobufMessageAsync(_stream, message, default);
-        }
-
-        private async Task WriteAsyncSlow(Task headersTask, T message)
-        {
-            await headersTask.ConfigureAwait(false);
-            await SendProtobufMessageAsync(_stream, message, default).ConfigureAwait(false);
+            await _context.EnsureResponseHeadersSentAsync();
+            await SendProtobufMessageAsync(_stream, message, default);
         }
     }
 
