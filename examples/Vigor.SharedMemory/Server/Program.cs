@@ -60,49 +60,46 @@ _ = Task.Run(async () =>
 
 try
 {
-    while (!cts.Token.IsCancellationRequested)
+    await foreach (var serverStream in listener.AcceptStreamsAsync(cts.Token))
     {
-        var serverStream = listener.Connection.CreateStream();
+        var method = serverStream.RequestHeaders?.Method;
+        if (method == null) continue;
 
-        if (serverStream.RequestHeaders is { Method: var method } && method != null)
+        try
         {
-            try
+            Console.WriteLine($"Received request for method: {method}");
+
+            if (method == "/grpc.health.v1.Health/Check")
             {
-                Console.WriteLine($"Received request for method: {method}");
+                // Read request (unary)
+                await foreach (var _ in serverStream.ReceiveMessagesAsync(cts.Token))
+                    break;
 
-                if (method == "/grpc.health.v1.Health/Check")
-                {
-                    await serverStream.SendResponseHeadersAsync();
-
-                    var response = healthService.Check();
-                    await serverStream.SendMessageAsync(response.ToByteArray());
-                    await serverStream.SendTrailersAsync(StatusCode.OK);
-                }
-                else if (method == "/grpc.health.v1.Health/Watch")
-                {
-                    await serverStream.SendResponseHeadersAsync();
-
-                    // Stream health updates
-                    await healthService.WatchAsync(serverStream, cts.Token);
-                }
-                else
-                {
-                    throw new RpcException(new Status(StatusCode.Unimplemented, $"Method {method} is not implemented"));
-                }
+                await serverStream.SendResponseHeadersAsync();
+                var response = healthService.Check();
+                await serverStream.SendMessageAsync(response.ToByteArray());
+                await serverStream.SendTrailersAsync(StatusCode.OK);
             }
-            catch (RpcException ex)
+            else if (method == "/grpc.health.v1.Health/Watch")
             {
-                Console.WriteLine($"RPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
-                await serverStream.SendTrailersAsync(ex.Status.StatusCode, ex.Status.Detail);
+                await serverStream.SendResponseHeadersAsync();
+                await healthService.WatchAsync(serverStream, cts.Token);
             }
-            catch (Exception ex)
+            else
             {
-                Console.WriteLine($"Error: {ex.Message}");
-                await serverStream.SendTrailersAsync(StatusCode.Internal, ex.Message);
+                throw new RpcException(new Status(StatusCode.Unimplemented, $"Method {method} is not implemented"));
             }
         }
-
-        await Task.Delay(10, cts.Token);
+        catch (RpcException ex)
+        {
+            Console.WriteLine($"RPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
+            await serverStream.SendTrailersAsync(ex.Status.StatusCode, ex.Status.Detail);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error: {ex.Message}");
+            await serverStream.SendTrailersAsync(StatusCode.Internal, ex.Message);
+        }
     }
 }
 catch (OperationCanceledException)

@@ -43,40 +43,36 @@ Console.CancelKeyPress += (_, e) =>
 
 try
 {
-    while (!cts.Token.IsCancellationRequested)
+    await foreach (var serverStream in listener.AcceptStreamsAsync(cts.Token))
     {
-        var serverStream = listener.Connection.CreateStream();
+        var method = serverStream.RequestHeaders?.Method;
+        if (method == null) continue;
 
-        if (serverStream.RequestHeaders is { Method: var method } && method != null)
+        try
         {
-            try
-            {
-                Console.WriteLine($"Received request for method: {method}");
+            Console.WriteLine($"Received request for method: {method}");
 
-                if (method == "/download.Downloader/DownloadFile")
-                {
-                    await serverStream.SendResponseHeadersAsync();
-                    await downloaderService.DownloadFileAsync(serverStream, cts.Token);
-                    await serverStream.SendTrailersAsync(StatusCode.OK);
-                }
-                else
-                {
-                    throw new RpcException(new Status(StatusCode.Unimplemented, $"Method {method} is not implemented"));
-                }
-            }
-            catch (RpcException ex)
+            if (method == "/download.Downloader/DownloadFile")
             {
-                Console.WriteLine($"RPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
-                await serverStream.SendTrailersAsync(ex.Status.StatusCode, ex.Status.Detail);
+                await serverStream.SendResponseHeadersAsync();
+                await downloaderService.DownloadFileAsync(serverStream, cts.Token);
+                await serverStream.SendTrailersAsync(StatusCode.OK);
             }
-            catch (Exception ex)
+            else
             {
-                Console.WriteLine($"Error: {ex.Message}");
-                await serverStream.SendTrailersAsync(StatusCode.Internal, ex.Message);
+                throw new RpcException(new Status(StatusCode.Unimplemented, $"Method {method} is not implemented"));
             }
         }
-
-        await Task.Delay(10, cts.Token);
+        catch (RpcException ex)
+        {
+            Console.WriteLine($"RPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
+            await serverStream.SendTrailersAsync(ex.Status.StatusCode, ex.Status.Detail);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error: {ex.Message}");
+            await serverStream.SendTrailersAsync(StatusCode.Internal, ex.Message);
+        }
     }
 }
 catch (OperationCanceledException)

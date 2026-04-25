@@ -53,7 +53,9 @@ public sealed class ShmHandler : HttpMessageHandler
     /// Creates a new ShmHandler that connects to the specified shared memory segment.
     /// </summary>
     /// <param name="segmentName">The name of the shared memory segment to connect to.</param>
-    /// <param name="compressionOptions">Optional compression options.</param>
+    /// <param name="compressionOptions">Optional compression options. When set,
+    /// the server decompresses incoming compressed frames. Client-side compression
+    /// is handled by the grpc-dotnet framework's channel compression settings.</param>
     /// <param name="retryPolicy">Optional retry policy for transient failures.</param>
     /// <param name="retryThrottling">Optional retry throttling to prevent overwhelming the server.</param>
     public ShmHandler(string segmentName, ShmCompressionOptions? compressionOptions = null,
@@ -223,11 +225,16 @@ public sealed class ShmHandler : HttpMessageHandler
             // the SHM stream also compresses, the data will be double-compressed which is
             // suboptimal but not incorrect. Typically SHM compression replaces HTTP-level compression.
 
-            // Read message body into a pooled buffer to avoid per-message heap allocation
-            var messageBuffer = ArrayPool<byte>.Shared.Rent((int)length);
+            // Read message body into a pooled buffer.
+            // Include the 5-byte gRPC LPM header so that ShmGrpcServer
+            // (which Slice(5) on receive) gets the correct data.
+            var totalLen = 5 + (int)length;
+            var messageBuffer = ArrayPool<byte>.Shared.Rent(totalLen);
             try
             {
-                var messageBytesRead = await ReadExactlyAsync(bodyStream, messageBuffer.AsMemory(0, (int)length), cancellationToken);
+                // Copy gRPC header
+                headerBuffer.AsSpan(0, 5).CopyTo(messageBuffer);
+                var messageBytesRead = await ReadExactlyAsync(bodyStream, messageBuffer.AsMemory(5, (int)length), cancellationToken);
                 if (messageBytesRead < length)
                     throw new InvalidDataException("Incomplete gRPC message body");
             }
@@ -240,7 +247,7 @@ public sealed class ShmHandler : HttpMessageHandler
             // Zero-copy: ownership of messageBuffer transfers to the writer thread
             // which returns it to the pool after the ring write completes.
             await stream.SendMessageZeroCopyAsync(
-                messageBuffer.AsMemory(0, (int)length),
+                messageBuffer.AsMemory(0, totalLen),
                 messageBuffer,
                 cancellationToken);
         }
@@ -271,7 +278,9 @@ public sealed class ShmHandler : HttpMessageHandler
                 throw new InvalidDataException("Incomplete gRPC message body");
             }
 
-            await stream.SendMessageAsync(bodyBuffer.AsMemory(offset, (int)length), cancellationToken);
+            // Include the 5-byte gRPC LPM header in the ring message so that
+            // ShmGrpcServer (which Slice(5) on receive) gets correct data.
+            await stream.SendMessageAsync(bodyBuffer.AsMemory(offset - 5, 5 + (int)length), cancellationToken);
             offset += (int)length;
         }
     }

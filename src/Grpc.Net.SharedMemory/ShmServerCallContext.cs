@@ -63,6 +63,8 @@ internal sealed class ShmServerCallContext : ServerCallContext
     private async Task EnsureResponseHeadersSentSlowAsync()
     {
         _headersSent = true;
+        // grpc-encoding is injected by ShmGrpcStream.InjectResponseEncoding()
+        // automatically in all header-sending paths.
         await _stream.SendResponseHeadersAsync();
     }
 
@@ -83,10 +85,61 @@ internal sealed class ShmServerCallContext : ServerCallContext
     }
 
     protected override Metadata RequestHeadersCore => _requestMetadata;
-    protected override CancellationToken CancellationTokenCore => _cancellationToken;
+    protected override CancellationToken CancellationTokenCore => _rpcCancellationToken ?? _cancellationToken;
     protected override Metadata ResponseTrailersCore => _responseTrailers;
     protected override Status StatusCore { get => _status; set => _status = value; }
     protected override WriteOptions? WriteOptionsCore { get => _writeOptions; set => _writeOptions = value; }
+
+    /// <summary>
+    /// The RPC-level cancellation token (linked to server shutdown + deadline).
+    /// Set by <see cref="CreateLinkedCancellationSource"/>. Before that call,
+    /// CancellationTokenCore falls back to the server shutdown token.
+    /// </summary>
+    private CancellationToken? _rpcCancellationToken;
+
+    /// <summary>
+    /// Whether the RPC deadline has been reached. Set by the linked
+    /// CancellationTokenSource created in <see cref="CreateLinkedCancellationSource"/>.
+    /// </summary>
+    internal bool DeadlineReached { get; private set; }
+
+    /// <summary>
+    /// Creates a <see cref="CancellationTokenSource"/> linked to the server
+    /// shutdown token and the RPC deadline (if set). The returned CTS should
+    /// be disposed by the caller after the RPC completes.
+    /// </summary>
+    internal CancellationTokenSource CreateLinkedCancellationSource()
+    {
+        var deadline = DeadlineCore;
+        if (deadline == DateTime.MaxValue)
+        {
+            // No deadline — just link to server shutdown
+            var cts0 = CancellationTokenSource.CreateLinkedTokenSource(_cancellationToken);
+            _rpcCancellationToken = cts0.Token;
+            return cts0;
+        }
+
+        var remaining = deadline - DateTime.UtcNow;
+        if (remaining <= TimeSpan.Zero)
+        {
+            // Already expired
+            DeadlineReached = true;
+            var expired = new CancellationTokenSource();
+            expired.Cancel();
+            _rpcCancellationToken = expired.Token;
+            return expired;
+        }
+
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(_cancellationToken);
+        cts.CancelAfter(remaining);
+        cts.Token.Register(() =>
+        {
+            if (!_cancellationToken.IsCancellationRequested)
+                DeadlineReached = true;
+        });
+        _rpcCancellationToken = cts.Token;
+        return cts;
+    }
 
     protected override AuthContext AuthContextCore =>
         new AuthContext(null, new Dictionary<string, List<AuthProperty>>());

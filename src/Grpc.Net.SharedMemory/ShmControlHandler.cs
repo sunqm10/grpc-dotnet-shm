@@ -162,7 +162,14 @@ public sealed class ShmControlHandler : HttpMessageHandler
         {
             return await SendOnStreamAsync(stream, request, cancellationToken).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException)
+        catch (OperationCanceledException)
+        {
+            // Client cancellation — notify server so it can stop processing
+            try { await stream.CancelAsync().ConfigureAwait(false); }
+            catch { /* best effort */ }
+            throw;
+        }
+        catch (Exception)
         {
             await stream.CancelAsync().ConfigureAwait(false);
             throw;
@@ -238,6 +245,13 @@ public sealed class ShmControlHandler : HttpMessageHandler
         {
             foreach (var kv in responseHeaders.Metadata)
             {
+                // Extract grpc-encoding for response decompression
+                if (string.Equals(kv.Key, "grpc-encoding", StringComparison.OrdinalIgnoreCase)
+                    && kv.Values.Count > 0)
+                {
+                    responseContent.SetResponseEncoding(
+                        System.Text.Encoding.UTF8.GetString(kv.Values[0]));
+                }
                 AddMetadataToHeaders(response.Headers, kv);
             }
         }
@@ -707,7 +721,8 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
             remaining = remaining.Slice(needed);
 
             var hdrSpan = _headerBuf.AsSpan(0, 5);
-            if (hdrSpan[0] != 0) throw new NotSupportedException("Compression not yet supported");
+            // Compressed flag (hdrSpan[0]) is preserved in the gRPC LPM header
+            // and passed through to the ring. Server decompresses if needed.
             var length = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(hdrSpan.Slice(1));
 
             if (remaining.Length < length)
@@ -752,7 +767,7 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
             }
 
             var span = remaining.Span;
-            if (span[0] != 0) throw new NotSupportedException("Compression not yet supported");
+            // Compressed flag preserved — server handles decompression.
             var msgLen = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(span.Slice(1));
 
             if (remaining.Length < 5 + msgLen)
@@ -1004,6 +1019,9 @@ internal sealed class ShmControlResponseContent : HttpContent,
     private byte[]? _assembled;
     private int _assembledPos;
 
+    // Response compression: encoding from grpc-encoding response header.
+    private string? _responseEncoding;
+
     // Cached pooled parser delegate — set once by SetPooledDeserializer.
     private Func<ReadOnlySequence<byte>, object>? _pooledDeserializer;
     public Func<ReadOnlySequence<byte>, object>? PooledDeserializer => _pooledDeserializer;
@@ -1057,6 +1075,13 @@ internal sealed class ShmControlResponseContent : HttpContent,
         Headers.ContentType = new MediaTypeHeaderValue("application/grpc");
         // Borrow cached read buffer from connection (may be null on first call).
         _assembled = stream.Connection.BorrowReadBuffer();
+    }
+
+    /// <summary>Sets the grpc-encoding for response decompression.</summary>
+    internal void SetResponseEncoding(string encoding)
+    {
+        if (!string.Equals(encoding, "identity", StringComparison.OrdinalIgnoreCase))
+            _responseEncoding = encoding;
     }
 
     internal void SetTrailingHeaders(HttpHeaders trailingHeaders)
@@ -1133,17 +1158,46 @@ internal sealed class ShmControlResponseContent : HttpContent,
 
                     var eos = (frame.Flags & MessageFlags.EndStream) != 0;
                     if (eos) _stream.MarkHalfCloseReceived();
-                    // Skip the 5-byte gRPC length-prefix header per G3 spec.
-                    var startOffset = 5;
-                    return (new ReadOnlySequence<byte>(_assembled.AsMemory(startOffset, _assembledPos - startOffset)), eos);
+                    // Check compressed flag and decompress if needed
+                    var compFlag = _assembled![0];
+                    var bodyStart = 5;
+                    if (compFlag == 1)
+                    {
+                        if (string.IsNullOrEmpty(_responseEncoding))
+                            throw new InvalidOperationException(
+                                "Received compressed response but server did not send grpc-encoding header");
+                        var decompressor = Compression.ShmCompressorRegistry.Get(_responseEncoding);
+                        if (decompressor == null)
+                            throw new InvalidOperationException(
+                                $"Received compressed response with unsupported encoding '{_responseEncoding}'");
+                        var bodyLen = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(
+                            _assembled.AsSpan(1, 4));
+                        var decompressed = decompressor.Decompress(_assembled.AsSpan(bodyStart, bodyLen));
+                        return (new ReadOnlySequence<byte>(decompressed), eos);
+                    }
+                    return (new ReadOnlySequence<byte>(_assembled.AsMemory(bodyStart, _assembledPos - bodyStart)), eos);
                 }
                 else
                 {
-                    // Single frame — direct reference (zero-copy for pre-committed).
-                    // Skip the 5-byte gRPC length-prefix header per G3 spec.
+                    // Single frame — check compressed flag
                     _currentFrame = frame;
                     var eos2 = (frame.Flags & MessageFlags.EndStream) != 0;
                     if (eos2) _stream.MarkHalfCloseReceived();
+                    var compFlag2 = frame.Memory.Span[0];
+                    if (compFlag2 == 1)
+                    {
+                        if (string.IsNullOrEmpty(_responseEncoding))
+                            throw new InvalidOperationException(
+                                "Received compressed response but server did not send grpc-encoding header");
+                        var decompressor = Compression.ShmCompressorRegistry.Get(_responseEncoding);
+                        if (decompressor == null)
+                            throw new InvalidOperationException(
+                                $"Received compressed response with unsupported encoding '{_responseEncoding}'");
+                        var bodyLen2 = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(
+                            frame.Memory.Span.Slice(1, 4));
+                        var decompressed = decompressor.Decompress(frame.Memory.Span.Slice(5, bodyLen2));
+                        return (new ReadOnlySequence<byte>(decompressed), eos2);
+                    }
                     var mem = frame.Memory.Slice(5);
                     return (new ReadOnlySequence<byte>(mem), eos2);
                 }

@@ -43,45 +43,45 @@ Console.CancelKeyPress += (_, e) =>
 
 try
 {
-    while (!cts.Token.IsCancellationRequested)
+    await foreach (var serverStream in listener.AcceptStreamsAsync(cts.Token))
     {
-        var serverStream = listener.Connection.CreateStream();
+        var method = serverStream.RequestHeaders?.Method;
+        if (method == null) continue;
 
-        if (serverStream.RequestHeaders is { Method: var method } && method != null)
+        try
         {
-            try
+            Console.WriteLine($"Received request for method: {method}");
+
+            // Read request message
+            byte[]? requestData = null;
+            await foreach (var msg in serverStream.ReceiveMessagesAsync(cts.Token))
             {
-                Console.WriteLine($"Received request for method: {method}");
-
-                // Send response headers
-                await serverStream.SendResponseHeadersAsync();
-
-                // Handle the method with validation
-                var response = await greeterService.HandleMethodAsync(
-                    serverStream,
-                    method,
-                    Array.Empty<byte>());
-
-                await serverStream.SendMessageAsync(response);
-                await serverStream.SendTrailersAsync(StatusCode.OK);
-
-                Console.WriteLine("Response sent successfully.");
+                requestData = msg;
+                break;
             }
-            catch (RpcException ex)
-            {
-                Console.WriteLine($"RPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
-                
-                // Send the error trailers
-                await serverStream.SendTrailersAsync(ex.Status.StatusCode, ex.Status.Detail);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error: {ex.Message}");
-                await serverStream.SendTrailersAsync(StatusCode.Internal, ex.Message);
-            }
+
+            // Handle the method with validation
+            var response = await greeterService.HandleMethodAsync(
+                serverStream,
+                method,
+                requestData ?? Array.Empty<byte>());
+
+            await serverStream.SendResponseHeadersAsync();
+            await serverStream.SendMessageAsync(response);
+            await serverStream.SendTrailersAsync(StatusCode.OK);
+
+            Console.WriteLine("Response sent successfully.");
         }
-
-        await Task.Delay(10, cts.Token);
+        catch (RpcException ex)
+        {
+            Console.WriteLine($"RPC error: {ex.Status.StatusCode} - {ex.Status.Detail}");
+            await serverStream.SendTrailersAsync(ex.Status.StatusCode, ex.Status.Detail);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error: {ex.Message}");
+            await serverStream.SendTrailersAsync(StatusCode.Internal, ex.Message);
+        }
     }
 }
 catch (OperationCanceledException)

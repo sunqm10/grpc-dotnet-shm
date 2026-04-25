@@ -74,6 +74,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     private HeadersV1? _requestHeaders;
     private HeadersV1? _responseHeaders;
     private TrailersV1? _trailers;
+    private string? _responseEncoding; // grpc-encoding for response compression
     private int _halfCloseSent; // 0=not sent, 1=sent; use Interlocked for thread safety
     private bool _halfCloseReceived;
     private bool _cancelled;
@@ -230,6 +231,21 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         }
     }
 
+    /// <summary>Sets the grpc-encoding for response compression.
+    /// Will be automatically included in response headers.</summary>
+    internal void SetResponseEncoding(string encoding)
+    {
+        _responseEncoding = encoding;
+    }
+
+    private Metadata? InjectResponseEncoding(Metadata? metadata)
+    {
+        if (_responseEncoding == null) return metadata;
+        metadata ??= new Metadata();
+        metadata.Add("grpc-encoding", _responseEncoding);
+        return metadata;
+    }
+
     /// <summary>
     /// Sends response headers (server-side, before first message).
     /// </summary>
@@ -240,6 +256,8 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             throw new InvalidOperationException("Only server can send response headers");
         if (_responseHeaders != null)
             throw new InvalidOperationException("Response headers already sent");
+
+        metadata = InjectResponseEncoding(metadata);
 
         _responseHeaders = new HeadersV1
         {
@@ -275,6 +293,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     internal void SendResponseHeadersInline(ShmFrameWriter writer, Metadata? metadata = null)
     {
         if (_responseHeaders != null) return;
+        metadata = InjectResponseEncoding(metadata);
         _responseHeaders = new HeadersV1 { Version = 1, HeaderType = 1, Metadata = ConvertMetadata(metadata) };
         var (payload, payloadLength) = _responseHeaders.Encode();
         try
