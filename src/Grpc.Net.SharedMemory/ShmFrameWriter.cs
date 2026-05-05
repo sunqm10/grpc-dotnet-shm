@@ -800,11 +800,12 @@ internal sealed class ShmFrameWriter : IDisposable
         {
             var totalSize = wireHdrSize + framePayloadSize;
             var reservation = _ring.ReserveWrite(totalSize, ct);
+            var isLast = (extraFlags & MessageFlags.More) == 0;
+            var flags = (byte)((isLast ? 0 : MessageFlags.More) | extraFlags);
             if (reservation.Second.IsEmpty)
             {
-                // Wire-format-aware frame header (16 B Custom16 or 9 B H2).
-                var isLast = (extraFlags & MessageFlags.More) == 0;
-                var flags = (byte)((isLast ? 0 : MessageFlags.More) | extraFlags);
+                // Contiguous slot: WriteTo(Span<byte>) serializes protobuf
+                // directly into the ring reservation. No intermediate buffer.
                 EncodeMessageWireHeader(reservation.First.Span, streamId, framePayloadSize, flags);
 
                 // 5-byte gRPC LPM header.
@@ -822,7 +823,51 @@ internal sealed class ShmFrameWriter : IDisposable
                 _ring.CommitWrite(reservation, totalSize);
                 return;
             }
-            // Wrap-around: fall through to RingFrameStream
+
+            // Wrap-around: the reservation straddles the ring boundary so
+            // WriteTo(Span) (needs contiguous memory) cannot be used. Under
+            // PR1 SPSC the original code abandoned the reservation and
+            // fell through to RingFrameStream which got a fresh one — that
+            // was a free leak because WriteIdx had not yet advanced. Under
+            // PR2 MPSC the slot is a REAL claim (_claimedWriteIdx already
+            // advanced, _publishersInFlight incremented), so it MUST be
+            // committed or every successor writer's publish-spin stalls
+            // forever.
+            //
+            // Strategy: serialize protobuf into a pooled stage buffer,
+            // then write the whole [wire header | LPM header | body] byte
+            // sequence across the slot's First+Second spans via the
+            // existing wrap-aware copy helper. One extra memcpy of
+            // ≤singleFrameThreshold bytes — only on the rare wrap path,
+            // which fires once per ring-capacity worth of writes (e.g.
+            // ~once per 64 MiB on a default ring).
+            var stageBuf = ArrayPool<byte>.Shared.Rent(totalSize);
+            try
+            {
+                var stage = stageBuf.AsSpan(0, totalSize);
+                EncodeMessageWireHeader(stage, streamId, framePayloadSize, flags);
+                stage[wireHdrSize] = 0; // no compression
+                System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+                    stage.Slice(wireHdrSize + 1, 4), (uint)payloadSize);
+                if (payloadSize > 0)
+                {
+                    message.WriteTo(stage.Slice(wireHdrSize + GrpcHeaderSize, payloadSize));
+                }
+
+                // Copy header+body across First+Second. The reservation's
+                // First holds bytes up to the ring tail; Second holds the
+                // wrap continuation at offset 0.
+                var firstSpan = reservation.First.Span;
+                var secondSpan = reservation.Second.Span;
+                stage[..firstSpan.Length].CopyTo(firstSpan);
+                stage[firstSpan.Length..].CopyTo(secondSpan);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(stageBuf);
+            }
+            _ring.CommitWrite(reservation, totalSize);
+            return;
         }
 
         // Multi-frame or wrap-around: prepend 5-byte gRPC header, then

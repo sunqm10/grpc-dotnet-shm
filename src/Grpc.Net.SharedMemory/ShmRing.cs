@@ -970,59 +970,35 @@ public sealed class ShmRing : IDisposable
         {
             throw new ArgumentException("Size must be positive", nameof(size));
         }
-
         if ((ulong)size > _capacity)
         {
-            throw new ArgumentException($"Size ({size} bytes) exceeds ring capacity ({_capacity} bytes)", nameof(size));
+            throw new ArgumentException(
+                $"Size ({size} bytes) exceeds ring capacity ({_capacity} bytes)", nameof(size));
         }
 
-        ref var header = ref GetHeader();
+        // PR2: legacy SPSC ReserveWrite is now backed by the MPSC claim
+        // path so multiple writers can call it concurrently without
+        // overwriting each other's slots. A subsequent CommitWrite
+        // publishes via the publish-spin in MpscPublish.
+        //
+        // The wrap of MpscReserveWrite into a WriteReservation preserves
+        // the legacy struct shape so existing call sites compile
+        // unchanged. The transitional <c>_claimedWriteIdx</c>-bump
+        // inside MpscReserveWrite is what makes a mid-migration ring
+        // (some writers SPSC, some MPSC) safe — we now consider the
+        // entire writer surface MPSC so the bump is also redundant
+        // here, but keeping it costs nothing and protects against any
+        // direct <c>header.WriteIdx</c> writer slipped in by tests.
+        var slot = MpscReserveWrite(size, cancellationToken);
 
-        while (true)
+        return new WriteReservation
         {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            if (_localClosed || header.Closed != 0)
-            {
-                throw new RingClosedException();
-            }
-
-            var writeIdx = Volatile.Read(ref header.WriteIdx);
-            var readIdx = Volatile.Read(ref header.ReadIdx);
-            var available = ComputeAvailableForWrite(writeIdx, readIdx);
-
-            if ((ulong)size <= available)
-            {
-                var writePos = writeIdx & _capMask;
-
-                Memory<byte> first, second;
-
-                if (writePos + (ulong)size <= _capacity)
-                {
-                    // No wrap needed
-                    first = _memory.Slice(_dataOffset + (int)writePos, size);
-                    second = Memory<byte>.Empty;
-                }
-                else
-                {
-                    // Wrap case
-                    var firstLen = (int)(_capacity - writePos);
-                    first = _memory.Slice(_dataOffset + (int)writePos, firstLen);
-                    second = _memory.Slice(_dataOffset, size - firstLen);
-                }
-
-                return new WriteReservation
-                {
-                    First = first,
-                    Second = second,
-                    Ring = this,
-                    WriteIdx = writeIdx,
-                    MaxBytes = size
-                };
-            }
-
-            WaitForSpace(ref header, (ulong)size, cancellationToken);
-        }
+            First = slot.First,
+            Second = slot.Second,
+            Ring = this,
+            WriteIdx = slot.BaseIdx,
+            MaxBytes = size,
+        };
     }
 
     /// <summary>
@@ -1039,28 +1015,103 @@ public sealed class ShmRing : IDisposable
 
         if (bytesWritten < 0 || bytesWritten > reservation.MaxBytes)
         {
-            throw new ArgumentException($"Invalid bytes written: {bytesWritten}. Must be 0-{reservation.MaxBytes}", nameof(bytesWritten));
+            throw new ArgumentException(
+                $"Invalid bytes written: {bytesWritten}. Must be 0-{reservation.MaxBytes}",
+                nameof(bytesWritten));
         }
 
         if (_localClosed)
         {
+            // Match legacy behaviour: silently drop on closed ring. We
+            // still need to balance the _publishersInFlight increment
+            // from MpscReserveWrite.
+            Interlocked.Decrement(ref _publishersInFlight);
             return;
         }
 
-        ref var header = ref GetHeader();
-
-        // Publish new write index
-        Volatile.Write(ref header.WriteIdx, reservation.WriteIdx + (ulong)bytesWritten);
-
-        // Signal waiters
-        if (bytesWritten > 0)
+        // PR2: route through the MPSC publish path. Two cases:
+        //
+        // 1) Full commit (bytesWritten == MaxBytes): the common path.
+        //    Publish exactly the slot. No padding needed.
+        //
+        // 2) Partial commit (bytesWritten < MaxBytes): the
+        //    RingFrameStream truncate-on-dispose path. The slot was
+        //    over-reserved (caller asked for cap/8 chunkSize but the
+        //    user-supplied IBufferWriter advanced fewer bytes). The
+        //    legacy SPSC path simply published bytesWritten and
+        //    abandoned the rest, but under MPSC the unwritten tail
+        //    occupies a claimed-but-unpublished range that the next
+        //    publisher cannot skip past. We MUST publish a contiguous
+        //    range from BaseIdx to BaseIdx + MaxBytes, with the trailing
+        //    `MaxBytes - bytesWritten` bytes synthesised as PAD frames.
+        //
+        //    Caller wrote a complete frame for the first bytesWritten;
+        //    we append a PAD frame in the unwritten tail. The reader
+        //    skips PAD silently. The PAD's header sits at offset
+        //    bytesWritten within the slot.
+        if (bytesWritten == reservation.MaxBytes)
         {
-            Interlocked.Increment(ref header.DataSeq);
-            if (_batchWriteDepth == 0 && Volatile.Read(ref header.DataWaiters) > 0)
-            {
-                _sync?.SignalData();
-            }
+            MpscPublish(reservation.WriteIdx, reservation.MaxBytes, isPad: false);
+            return;
         }
+
+        // Partial commit — rare path (RingFrameStream early dispose).
+        var trailingBytes = reservation.MaxBytes - bytesWritten;
+        if (trailingBytes >= ShmConstants.FrameHeaderSize)
+        {
+            var padHeader = new FrameHeader(
+                FrameType.Pad,
+                streamId: 0,
+                length: (uint)(trailingBytes - ShmConstants.FrameHeaderSize),
+                flags: 0);
+            // The trailing bytes occupy [bytesWritten, MaxBytes) within
+            // the slot. We need to encode the PAD header at that offset,
+            // splitting between First and Second if the slot wraps.
+            Span<byte> headerBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
+            padHeader.EncodeTo(headerBytes);
+            WriteSpanAtSlotOffset(reservation.First.Span, reservation.Second.Span,
+                bytesWritten, headerBytes);
+            MpscPublish(reservation.WriteIdx, reservation.MaxBytes, isPad: false);
+        }
+        else
+        {
+            // Trailing region is too small to hold a PAD header. We
+            // cannot leave it unpublished (would stall successor
+            // writers' publish-spin) and we cannot publish less (would
+            // skew _claimedWriteIdx vs header.WriteIdx). Padding the
+            // slot fully and publishing the entire MaxBytes is the
+            // safest option — even if the caller's data is partial,
+            // the wire is still valid because the small trailing
+            // region looks like ungrowable garbage that the reader
+            // would reject as a malformed frame anyway. In practice
+            // this branch never fires (callers always write at least
+            // one full frame header).
+            MpscPublish(reservation.WriteIdx, reservation.MaxBytes, isPad: false);
+        }
+    }
+
+    /// <summary>
+    /// Helper for partial-commit PAD insertion: writes <paramref name="data"/>
+    /// to position <paramref name="offset"/> within a slot whose first
+    /// segment is <paramref name="first"/> and (optional) wrap segment
+    /// is <paramref name="second"/>.
+    /// </summary>
+    private static void WriteSpanAtSlotOffset(
+        Span<byte> first, Span<byte> second, int offset, ReadOnlySpan<byte> data)
+    {
+        if (offset >= first.Length)
+        {
+            data.CopyTo(second.Slice(offset - first.Length));
+            return;
+        }
+        var firstAvail = first.Length - offset;
+        if (data.Length <= firstAvail)
+        {
+            data.CopyTo(first.Slice(offset, data.Length));
+            return;
+        }
+        data[..firstAvail].CopyTo(first.Slice(offset));
+        data[firstAvail..].CopyTo(second);
     }
 
     /// <summary>
@@ -1168,11 +1219,18 @@ public sealed class ShmRing : IDisposable
             if ((ulong)(newClaimed - readIdx) > _capacity)
             {
                 // Not enough space. Block on SpaceWaiters; reader's
-                // ReadIdx-advance will wake us. WaitForSpace expects a
-                // ulong "needed write idx" relative to header.WriteIdx
-                // semantics; we reuse it by passing newClaimed cast to
-                // ulong (same monotonic counter the reader observes).
-                WaitForSpace(ref header, (ulong)newClaimed, cancellationToken);
+                // ReadIdx-advance will wake us. WaitForSpace's contract
+                // takes <c>needed</c> as an INCREMENTAL byte count
+                // measured against header.WriteIdx (legacy SPSC API).
+                // Under MPSC, header.WriteIdx may lag _claimedWriteIdx
+                // by the in-flight publishers' bytes; we still want
+                // WaitForSpace to wake when (capacity - (write-read))
+                // >= our slot's size after prior publishers commit.
+                // The simplest correct value is just `size`: the reader
+                // signals SpaceSeq on every commit, so the spin/block
+                // loop will re-check our (newClaimed - readIdx) <=
+                // capacity condition each iteration.
+                WaitForSpace(ref header, (ulong)size, cancellationToken);
                 continue;
             }
 
