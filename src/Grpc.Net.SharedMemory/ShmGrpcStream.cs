@@ -202,30 +202,20 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         // Single-stream-mode inline-write fast path. When the connection
         // negotiated single-stream mode and only one stream is active,
-        // bypass the WriterLoop queue and write Headers directly to the
-        // ring under TryPauseWriterLoop.
+        // bypass the framework's SendFrameAsync wrapper and write
+        // Headers directly to the ring on this thread. PR2 phase 1.4
+        // made the writer fully synchronous (MPSC publish-spin
+        // serialises concurrent writers); the only cost we save here
+        // is the SendFrameAsync task plumbing.
         //
-        // This is critical for correctness, not just perf: client unary
-        // sends Headers, then (fire-and-forget) writes the body Message
-        // via WriteInlineDirectMultiFrame which is also a TryPauseWriterLoop
-        // inline write. If Headers went through the queue while Message
-        // went inline, the two write paths race against each other on
-        // the SPSC ring and produce a "Headers not delivered before
-        // Message" failure mode (~1/15 stress runs on Intel Linux).
-        // Routing Headers through the same TryPause path serialises the
-        // sends through `_inlineWriterActive` CAS; both writes go to the
-        // ring in caller-thread order, no race.
-        //
-        // Falls back to the queued path when:
-        //   * not in single-stream mode (multi-stream pipelining wants
-        //     Headers in the WriterLoop's batch), or
-        //   * TryPauseWriterLoop fails (WriterLoop busy or another inline
-        //     writer holds the CAS); the queued path is correct (single
-        //     writer = WriterLoop) and Just Slower.
+        // The multi-stream path (else branch) goes through
+        // SendFrameAsync which still writes synchronously to the ring
+        // but wraps the call in a Task — preferred there because
+        // higher layers may await ordering against other operations.
         if (_connection.SingleStreamMode && _connection.ActiveStreamCount <= 1)
         {
             var writer = _connection.FrameWriter;
-            if (writer != null && writer.TryPauseWriterLoop())
+            if (writer != null)
             {
                 try
                 {
@@ -236,7 +226,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 finally
                 {
                     ArrayPool<byte>.Shared.Return(payload);
-                    writer.ResumeWriterLoop();
                 }
             }
         }

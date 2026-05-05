@@ -394,17 +394,12 @@ public sealed class ShmControlHandler : HttpMessageHandler
                             // SingleStreamMode propagates to TxRing/RxRing
                             // (see ShmConnection.SingleStreamMode setter), so
                             // the chain-ZC budget on the data rings reflects
-                            // the negotiated mode and the client-side inline-
-                            // write fast paths are unlocked.
+                            // the negotiated mode.
                             //
-                            // Correctness depends on `SendRequestHeadersAsync`
-                            // taking the TryPauseWriterLoop inline-write path
-                            // when this flag is set so Headers, Message, and
-                            // HalfClose all serialise through the same inline
-                            // writer (no concurrent WriterLoop dequeue racing
-                            // against an inline writer on the same ring).
+                            // PR2 phase 1.4: writer is fully synchronous;
+                            // SingleStreamMode is now a metadata flag only,
+                            // no writer-side state varies on it.
                             conn.SingleStreamMode = true;
-                            conn.FrameWriter?.EnableSingleStreamMode();
                         }
                         return conn;
                     }
@@ -868,14 +863,12 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
         // serialize directly into the ring buffer via
         // WriteInlineDirectMultiFrame (zero intermediate buffer).
         //
-        // Note: NO `size > 0` guard. Empty messages (e.g., probe call
-        // with `SimpleRequest{ResponseSize=0}`) must also take this
-        // inline path so that Message and the subsequent HALFCLOSE
-        // (also TryPause inline) serialise through the same
-        // `_inlineWriterActive` CAS. If the empty message fell through
-        // to the queued path while HALFCLOSE went inline, HALFCLOSE
-        // would reach the ring before the queued empty MESSAGE
-        // (race observed at probe time on Intel Linux).
+        // PR2 phase 1.4 made the writer fully synchronous (MPSC publish-
+        // spin serialises concurrent writers), so the previous
+        // TryPauseWriterLoop CAS is gone — Headers/Message/HALFCLOSE
+        // ordering is guaranteed by ring-claim-order regardless of
+        // whether they go inline or via the (now also synchronous)
+        // SendFrame path.
         if (_shmStream.Connection.SingleStreamMode
             && _shmStream.Connection.ActiveStreamCount <= 1
             && message is Google.Protobuf.IMessage protoMsg)
@@ -884,23 +877,14 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
             if (writer != null)
             {
                 var size = protoMsg.CalculateSize();
-                if (writer.TryPauseWriterLoop())
-                {
-                    try
-                    {
-                        writer.WriteInlineDirectMultiFrame(_shmStream.StreamId, size, protoMsg, 0, default);
-                        return Task.CompletedTask;
-                    }
-                    finally
-                    {
-                        writer.ResumeWriterLoop();
-                    }
-                }
+                writer.WriteInlineDirectMultiFrame(_shmStream.StreamId, size, protoMsg, 0, default);
+                return Task.CompletedTask;
             }
         }
 
         // Standard path: serialize via the provided marshaller delegate
-        // into a pooled buffer, then send via TryPause/ExecuteInline/queue.
+        // into a pooled buffer, then send via the synchronous Enqueue
+        // chain.
         var ctx = new DirectWriteSerializationContext(_shmStream);
         serializer(message, ctx);
         return ctx.SendResult(cancellationToken);
@@ -1017,45 +1001,26 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
                     _buffer.AsSpan(1, 4), (uint)protoLen);
             }
 
-            // In singleStreamMode with one active stream, bypass the queue.
-            // - ≤ ringCapacity: TryPauseWriterLoop or ExecuteInline
-            //   (handler writes ring directly or via WriterLoop callback)
-            // - > ringCapacity: falls through to queued SendMessageZeroCopyAsync
+            // In singleStreamMode with one active stream, write directly
+            // on this thread (PR2 phase 1.4 made the writer fully
+            // synchronous; MPSC publish-spin serialises concurrent
+            // ring writers without the prior TryPause/ExecuteInline
+            // dance). Large messages (> ringCapacity) still fall
+            // through to SendMessageZeroCopyAsync which handles the
+            // multi-frame chunking via the codec layer.
             if (_stream.Connection.SingleStreamMode && _stream.Connection.ActiveStreamCount <= 1)
             {
                 var writer = _stream.Connection.FrameWriter;
                 if (writer != null)
                 {
                     var ringCap = (long)_stream.Connection.TxRing.Capacity;
-                    if (_position <= ringCap && writer.TryPauseWriterLoop())
+                    if (_position <= ringCap)
                     {
                         var buf = _buffer;
                         _buffer = null;
                         try
                         {
                             writer.WriteInline(_stream.StreamId, buf.AsSpan(0, _position), 0, default);
-                        }
-                        finally
-                        {
-                            writer.ResumeWriterLoop();
-                            ArrayPool<byte>.Shared.Return(buf);
-                        }
-                        return Task.CompletedTask;
-                    }
-
-                    // Large message or TryPause failed: ExecuteInline.
-                    if (_position <= ringCap)
-                    {
-                        var buf = _buffer;
-                        var bufLen = _position;
-                        var streamId = _stream.StreamId;
-                        _buffer = null;
-                        try
-                        {
-                            writer.ExecuteInline(() =>
-                            {
-                                writer.WriteInline(streamId, buf.AsSpan(0, bufLen), 0, default);
-                            });
                         }
                         finally
                         {
@@ -1066,8 +1031,7 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
                 }
             }
 
-            // Fallback: transfer buffer ownership to SendMessageZeroCopyAsync —
-            // WriterLoop returns it to ArrayPool after ring write.
+            // Fallback: transfer buffer ownership to SendMessageZeroCopyAsync.
             return _stream.SendMessageZeroCopyAsync(
                 _buffer.AsMemory(0, _position), _buffer, cancellationToken);
         }

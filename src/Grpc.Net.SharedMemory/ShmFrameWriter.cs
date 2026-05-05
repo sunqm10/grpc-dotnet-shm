@@ -41,14 +41,6 @@ internal sealed class ShmFrameWriter : IDisposable
     // ordering is enforced by the publish-spin against header.WriteIdx;
     // ring-full back-pressure goes directly through WaitForSpace (no
     // unbounded queue growth in user-process memory).
-    //
-    // Public Enqueue* methods are kept for back-compat with current call
-    // sites (ShmConnection.SendFrame / SendFrameZeroCopy / SendFrameAndWait).
-    // Internal WriteInline* / TryPauseWriterLoop / ResumeWriterLoop /
-    // ExecuteInline / EnableSingleStreamMode are kept as thin wrappers /
-    // no-op stubs for the 14 single-stream call sites that still use them;
-    // those call sites can migrate to direct MPSC any time without changing
-    // the writer's surface.
 
     private readonly ShmRing _ring;
     private readonly CancellationTokenSource _cts;
@@ -61,18 +53,6 @@ internal sealed class ShmFrameWriter : IDisposable
         _cts = cts;
         _ct = cts.Token;
     }
-
-    /// <summary>
-    /// Phase 1.4 stub: SingleStreamMode is now metadata-only (carried on
-    /// the connection for diagnostics). The writer no longer maintains
-    /// any state that varies on this flag.
-    /// </summary>
-#pragma warning disable CA1822 // No-op stub kept as instance method for caller back-compat
-    internal void EnableSingleStreamMode()
-    {
-        // No-op. Kept for caller back-compat.
-    }
-#pragma warning restore CA1822
 
     /// <summary>
     /// Writes a frame to the ring on the caller's thread. The payload is
@@ -160,36 +140,6 @@ internal sealed class ShmFrameWriter : IDisposable
             FrameProtocol.WriteFrame(_ring, header, payload.Span, cancellationToken);
         }
     }
-
-    /// <summary>
-    /// <summary>
-    /// Phase 1.4 stub: with the WriterLoop deleted, "inline" is the only
-    /// path. Just runs <paramref name="action"/> on the caller's thread.
-    /// MPSC publish-spin in <see cref="ShmRing.MpscPublish"/> serialises
-    /// concurrent ring writers in claim order.
-    /// </summary>
-#pragma warning disable CA1822 // No-op stub kept as instance method for caller back-compat
-    internal void ExecuteInline(Action action)
-    {
-        action();
-    }
-
-    /// <summary>
-    /// Phase 1.4 stub: with the WriterLoop deleted, no pause coordination
-    /// is needed. Always returns true; callers that conditioned on the
-    /// return value still take the inline path.
-    /// </summary>
-    internal bool TryPauseWriterLoop()
-    {
-        return true;
-    }
-
-    /// <summary>Phase 1.4 stub: no-op (no WriterLoop to resume).</summary>
-    internal void ResumeWriterLoop()
-    {
-        // No-op.
-    }
-#pragma warning restore CA1822
 
     /// <summary>
     /// Writes a message frame on the caller's thread via the MPSC writer

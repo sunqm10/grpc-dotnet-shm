@@ -180,12 +180,13 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         // Enable if BOTH server allows it AND client requested it.
         // Store the negotiated result back on the connection so handlers
         // can read it via stream.Connection.SingleStreamMode.
+        // PR2 phase 1.4: SingleStreamMode is now metadata-only on the
+        // writer side; ZeroCopyRead toggling stays as the only effect.
         var negotiated = _singleStreamMode && connection.SingleStreamMode;
         connection.SingleStreamMode = negotiated;
         if (negotiated)
         {
             connection.ZeroCopyRead = true;
-            connection.FrameWriter?.EnableSingleStreamMode();
         }
 
         var activeHandlers = new List<Task>();
@@ -464,10 +465,13 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             // intermediate byte[] for any message size.
             // WriteInlineDirectMultiFrame handles single-frame (zero-copy
             // contiguous) and multi-frame (RingFrameStream) transparently.
-            // Fallback: ExecuteInline when TryPause fails.
             // Skip inline path when compression is enabled — inline writes
             // are uncompressed (zero-copy to ring), but compressed responses
             // need the SendProtobufMessageAsync path which handles compress.
+            //
+            // PR2 phase 1.4: writer is fully synchronous, MPSC publish-spin
+            // serialises concurrent writers — TryPauseWriterLoop and the
+            // ExecuteInline buffer-and-callback fallback dance are gone.
             var _responseSize = ((IMessage)response).CalculateSize();
             var _sc = cfg.Compression?.ShouldCompress(_responseSize) == true
                 && cfg.Compression.GetSendCompressor()?.IsIdentity == false;
@@ -480,72 +484,22 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 var writer = stream.Connection.FrameWriter!;
                 var msg = (IMessage)response;
 
-                if (writer.TryPauseWriterLoop())
+                if (!context.HeadersSent)
                 {
-                    try
-                    {
-                        if (!context.HeadersSent)
-                        {
-                            stream.SendResponseHeadersInline(writer);
-                            context.MarkHeadersSent();
-                        }
-                        if (size > 0)
-                            writer.WriteInlineDirectMultiFrame(stream.StreamId, size, msg, 0, default);
-                        else
-                            writer.WriteInline(stream.StreamId, stackalloc byte[5], 0, default);
-                        stream.SendTrailersInline(writer, context.Status.StatusCode,
-                            context.Status.Detail, context.ResponseTrailers);
-                    }
-                    finally
-                    {
-                        writer.ResumeWriterLoop();
-                    }
-                    return;
+                    stream.SendResponseHeadersInline(writer);
+                    context.MarkHeadersSent();
                 }
-
-                // TryPause failed: ExecuteInline with intermediate buffer.
-                byte[] serializedBuffer;
-                int serializedSize;
-                bool returnBuffer = false;
                 if (size > 0)
-                {
-                    serializedBuffer = ArrayPool<byte>.Shared.Rent(5 + size);
-                    returnBuffer = true;
-                    serializedBuffer[0] = 0;
-                    System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
-                        serializedBuffer.AsSpan(1, 4), (uint)size);
-                    msg.WriteTo(serializedBuffer.AsSpan(5, size));
-                    serializedSize = 5 + size;
-                }
+                    writer.WriteInlineDirectMultiFrame(stream.StreamId, size, msg, 0, default);
                 else
-                {
-                    serializedBuffer = EmptyGrpcLpm;
-                    serializedSize = 5;
-                }
-
-                try
-                {
-                    writer.ExecuteInline(() =>
-                    {
-                        if (!context.HeadersSent)
-                        {
-                            stream.SendResponseHeadersInline(writer);
-                            context.MarkHeadersSent();
-                        }
-                        writer.WriteInline(stream.StreamId,
-                            serializedBuffer.AsSpan(0, serializedSize), 0, default);
-                        stream.SendTrailersInline(writer, context.Status.StatusCode,
-                            context.Status.Detail, context.ResponseTrailers);
-                    });
-                }
-                finally
-                {
-                    if (returnBuffer) ArrayPool<byte>.Shared.Return(serializedBuffer);
-                }
+                    writer.WriteInline(stream.StreamId, stackalloc byte[5], 0, default);
+                stream.SendTrailersInline(writer, context.Status.StatusCode,
+                    context.Status.Detail, context.ResponseTrailers);
                 return;
             }
 
-            // Fallback path: ensure headers sent, then use WriterLoop queue.
+            // Fallback path (multi-stream OR compression): ensure headers sent,
+            // then use the synchronous Enqueue chain via SendProtobufMessageAsync.
             await context.EnsureResponseHeadersSentAsync();
             await SendProtobufMessageAsync(stream, response, cfg.Compression, cfg.MaxSendMessageSize, ct);
             await stream.SendTrailersAsync(context.Status.StatusCode, context.Status.Detail, context.ResponseTrailers);
@@ -572,32 +526,16 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 await context.EnsureResponseHeadersSentAsync();
 
             var writer = new ShmServerStreamWriter<TResp>(stream, context, singleStream, cfg.Compression, cfg.MaxSendMessageSize);
-            try
-            {
-                await _handler(request, writer, context);
-            }
-            finally
-            {
-                writer.ReturnWriteBuffer();
-            }
+            await _handler(request, writer, context);
 
             // In singleStreamMode, inline trailers to avoid queue overhead.
+            // PR2 phase 1.4: writer is fully synchronous; no TryPause/Resume needed.
             if (singleStream && stream.Connection.ActiveStreamCount <= 1)
             {
                 var fw = stream.Connection.FrameWriter!;
-                if (fw.TryPauseWriterLoop())
-                {
-                    try
-                    {
-                        stream.SendTrailersInline(fw, context.Status.StatusCode,
-                            context.Status.Detail, context.ResponseTrailers);
-                    }
-                    finally
-                    {
-                        fw.ResumeWriterLoop();
-                    }
-                    return;
-                }
+                stream.SendTrailersInline(fw, context.Status.StatusCode,
+                    context.Status.Detail, context.ResponseTrailers);
+                return;
             }
 
             // Send trailers
@@ -638,67 +576,19 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 var writer = stream.Connection.FrameWriter!;
                 var msg = (IMessage)response;
 
-                if (writer.TryPauseWriterLoop())
+                // PR2 phase 1.4: writer is fully synchronous; previous
+                // TryPause + ExecuteInline-with-stage-buffer fallback is gone.
+                if (!context.HeadersSent)
                 {
-                    try
-                    {
-                        if (!context.HeadersSent)
-                        {
-                            stream.SendResponseHeadersInline(writer);
-                            context.MarkHeadersSent();
-                        }
-                        if (size > 0)
-                            writer.WriteInlineDirectMultiFrame(stream.StreamId, size, msg, 0, default);
-                        else
-                            writer.WriteInline(stream.StreamId, stackalloc byte[5], 0, default);
-                        stream.SendTrailersInline(writer, context.Status.StatusCode,
-                            context.Status.Detail, context.ResponseTrailers);
-                    }
-                    finally
-                    {
-                        writer.ResumeWriterLoop();
-                    }
-                    return;
+                    stream.SendResponseHeadersInline(writer);
+                    context.MarkHeadersSent();
                 }
-
-                // TryPause failed: ExecuteInline with intermediate buffer.
-                byte[] serializedBuffer;
-                int serializedSize;
-                bool returnBuffer = false;
                 if (size > 0)
-                {
-                    serializedBuffer = ArrayPool<byte>.Shared.Rent(5 + size);
-                    returnBuffer = true;
-                    serializedBuffer[0] = 0;
-                    System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
-                        serializedBuffer.AsSpan(1, 4), (uint)size);
-                    msg.WriteTo(serializedBuffer.AsSpan(5, size));
-                    serializedSize = 5 + size;
-                }
+                    writer.WriteInlineDirectMultiFrame(stream.StreamId, size, msg, 0, default);
                 else
-                {
-                    serializedBuffer = EmptyGrpcLpm;
-                    serializedSize = 5;
-                }
-
-                try
-                {
-                    writer.ExecuteInline(() =>
-                    {
-                        if (!context.HeadersSent)
-                        {
-                            stream.SendResponseHeadersInline(writer);
-                            context.MarkHeadersSent();
-                        }
-                        writer.WriteInline(stream.StreamId, serializedBuffer.AsSpan(0, serializedSize), 0, default);
-                        stream.SendTrailersInline(writer, context.Status.StatusCode,
-                            context.Status.Detail, context.ResponseTrailers);
-                    });
-                }
-                finally
-                {
-                    if (returnBuffer) ArrayPool<byte>.Shared.Return(serializedBuffer);
-                }
+                    writer.WriteInline(stream.StreamId, stackalloc byte[5], 0, default);
+                stream.SendTrailersInline(writer, context.Status.StatusCode,
+                    context.Status.Detail, context.ResponseTrailers);
                 return;
             }
 
@@ -729,32 +619,16 @@ public sealed class ShmGrpcServer : IAsyncDisposable
 
             using var reader = new ShmAsyncStreamReader<TReq>(stream, cfg);
             var writer = new ShmServerStreamWriter<TResp>(stream, context, singleStream, cfg.Compression, cfg.MaxSendMessageSize);
-            try
-            {
-                await _handler(reader, writer, context);
-            }
-            finally
-            {
-                writer.ReturnWriteBuffer();
-            }
+            await _handler(reader, writer, context);
 
             // In singleStreamMode, inline trailers to avoid queue overhead.
+            // PR2 phase 1.4: writer is fully synchronous; no TryPause/Resume needed.
             if (singleStream && stream.Connection.ActiveStreamCount <= 1)
             {
                 var fw = stream.Connection.FrameWriter!;
-                if (fw.TryPauseWriterLoop())
-                {
-                    try
-                    {
-                        stream.SendTrailersInline(fw, context.Status.StatusCode,
-                            context.Status.Detail, context.ResponseTrailers);
-                    }
-                    finally
-                    {
-                        fw.ResumeWriterLoop();
-                    }
-                    return;
-                }
+                stream.SendTrailersInline(fw, context.Status.StatusCode,
+                    context.Status.Detail, context.ResponseTrailers);
+                return;
             }
 
             await stream.SendTrailersAsync(
@@ -1404,8 +1278,6 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         private readonly bool _directRingWrite;
         private readonly Compression.ShmCompressionOptions? _compression;
         private readonly int _maxSendMessageSize;
-        // Reusable write buffer for the ExecuteInline fallback path.
-        private byte[]? _writeBuf;
 
         public ShmServerStreamWriter(ShmGrpcStream stream, ShmServerCallContext context,
             bool directRingWrite = false, Compression.ShmCompressionOptions? compression = null,
@@ -1419,16 +1291,6 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         }
 
         public WriteOptions? WriteOptions { get; set; }
-
-        /// <summary>Returns the reusable fallback buffer to ArrayPool.</summary>
-        internal void ReturnWriteBuffer()
-        {
-            if (_writeBuf != null)
-            {
-                ArrayPool<byte>.Shared.Return(_writeBuf);
-                _writeBuf = null;
-            }
-        }
 
         public Task WriteAsync(T message)
         {
@@ -1447,69 +1309,18 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 var writer = _stream.Connection.FrameWriter!;
                 IMessage msg = message;
 
-                // TryPause + WriteInlineDirectMultiFrame: serialize protobuf
-                // directly into ring, handling single-frame and multi-frame.
-                if (writer.TryPauseWriterLoop())
+                // PR2 phase 1.4: writer is fully synchronous, MPSC publish-spin
+                // serialises concurrent ring writers. The previous TryPause +
+                // ExecuteInline-with-stage-buffer fallback dance is gone.
+                if (!_context.HeadersSent)
                 {
-                    try
-                    {
-                        if (!_context.HeadersSent)
-                        {
-                            _stream.SendResponseHeadersInline(writer);
-                            _context.MarkHeadersSent();
-                        }
-                        if (size > 0)
-                            writer.WriteInlineDirectMultiFrame(_stream.StreamId, size, msg, 0, default);
-                        else
-                            writer.WriteInline(_stream.StreamId, EmptyGrpcLpm, 0, default);
-                    }
-                    finally
-                    {
-                        writer.ResumeWriterLoop();
-                    }
-                    return Task.CompletedTask;
+                    _stream.SendResponseHeadersInline(writer);
+                    _context.MarkHeadersSent();
                 }
-
-                // TryPause failed: ExecuteInline with intermediate buffer.
-                byte[] buf;
-                int bufSize;
                 if (size > 0)
-                {
-                    if (_writeBuf != null && _writeBuf.Length >= 5 + size)
-                        buf = _writeBuf;
-                    else
-                    {
-                        if (_writeBuf != null) ArrayPool<byte>.Shared.Return(_writeBuf);
-                        buf = ArrayPool<byte>.Shared.Rent(5 + size);
-                        _writeBuf = buf;
-                    }
-                    buf[0] = 0;
-                    System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
-                        buf.AsSpan(1, 4), (uint)size);
-                    msg.WriteTo(buf.AsSpan(5, size));
-                    bufSize = 5 + size;
-                }
+                    writer.WriteInlineDirectMultiFrame(_stream.StreamId, size, msg, 0, default);
                 else
-                {
-                    buf = EmptyGrpcLpm;
-                    bufSize = 5;
-                }
-
-                {
-                    var streamId = _stream.StreamId;
-                    var ctx = _context;
-                    var stream = _stream;
-                    writer.ExecuteInline(() =>
-                    {
-                        if (!ctx.HeadersSent)
-                        {
-                            stream.SendResponseHeadersInline(writer);
-                            ctx.MarkHeadersSent();
-                        }
-                        writer.WriteInline(streamId, buf.AsSpan(0, bufSize), 0, default);
-                    });
-                }
-
+                    writer.WriteInline(_stream.StreamId, EmptyGrpcLpm, 0, default);
                 return Task.CompletedTask;
             }
 
