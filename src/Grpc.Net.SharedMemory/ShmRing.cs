@@ -1057,26 +1057,27 @@ public sealed class ShmRing : IDisposable
 
         // Partial commit — rare path (RingFrameStream early dispose).
         var trailingBytes = reservation.MaxBytes - bytesWritten;
-        if (trailingBytes >= ShmConstants.FrameHeaderSize)
+        var wireHdrSize = WireHeaderSize;
+        if (trailingBytes >= wireHdrSize)
         {
-            var padHeader = new FrameHeader(
-                FrameType.Pad,
-                streamId: 0,
-                length: (uint)(trailingBytes - ShmConstants.FrameHeaderSize),
-                flags: 0);
-            // The trailing bytes occupy [bytesWritten, MaxBytes) within
-            // the slot. We need to encode the PAD header at that offset,
-            // splitting between First and Second if the slot wraps.
+            // Encode a wire-format-appropriate PAD frame header at offset
+            // `bytesWritten` within the slot. Custom16 → FrameType.Pad;
+            // H2 → PRIORITY (silently skipped by our H2 reader). The
+            // trailing bytes occupy [bytesWritten, MaxBytes) within the
+            // slot; the header is placed at offset bytesWritten and the
+            // remaining trailingBytes - wireHdrSize bytes are unused
+            // payload that the reader skips by length.
             Span<byte> headerBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
-            padHeader.EncodeTo(headerBytes);
+            headerBytes = headerBytes[..wireHdrSize];
+            EncodePadHeader(headerBytes, trailingBytes, wireHdrSize);
             WriteSpanAtSlotOffset(reservation.First.Span, reservation.Second.Span,
                 bytesWritten, headerBytes);
             MpscPublish(reservation.WriteIdx, reservation.MaxBytes, isPad: false);
         }
         else
         {
-            // Trailing region is too small to hold a PAD header. We
-            // cannot leave it unpublished (would stall successor
+            // Trailing region is too small to hold a wire frame header.
+            // We cannot leave it unpublished (would stall successor
             // writers' publish-spin) and we cannot publish less (would
             // skew _claimedWriteIdx vs header.WriteIdx). Padding the
             // slot fully and publishing the entire MaxBytes is the
@@ -1342,67 +1343,121 @@ public sealed class ShmRing : IDisposable
     /// <summary>
     /// Called from <see cref="MpscWriteSlot.Dispose"/> when the slot was
     /// never committed (caller threw or cancelled). Fills the slot with
-    /// a Custom16-format PAD frame header and publishes it. The reader
-    /// silently skips PAD frames in both Custom16 and H2 codecs (see
-    /// <see cref="FrameProtocol.ReadFramePayloadCustom16"/> and
-    /// <see cref="Wire.Http2Codec"/>).
+    /// a wire-format-appropriate PAD-equivalent frame header and
+    /// publishes it. The reader silently skips the entire slot in both
+    /// codecs (see <see cref="FrameProtocol.ReadFramePayloadCustom16"/>
+    /// and <see cref="Wire.Http2Codec"/>).
     /// </summary>
     /// <remarks>
     /// <para>
-    /// PAD format: a 16-byte <see cref="FrameHeader"/> with
+    /// Custom16 ring: emit a 16-byte <see cref="FrameHeader"/> with
     /// <see cref="FrameType.Pad"/>, <c>StreamId = 0</c>, <c>Length =
     /// size - 16</c>, <c>Flags = 0</c>. The remaining
-    /// <c>size - 16</c> bytes are payload; reader reserves+commits the
-    /// length but does not surface the payload.
+    /// <c>size - 16</c> bytes are unused payload; reader reserves+commits
+    /// the length but does not surface the payload.
     /// </para>
     /// <para>
-    /// On H2 wire format we still emit the Custom16-style PAD header
-    /// here: rationale is that PAD frames only fire on cancel/throw
-    /// paths (rare) and the H2 reader's PAD-handling actually skips
-    /// any frame typed PAD regardless of nominal H2 type. Switching to
-    /// an H2 PRIORITY frame (RFC 7540 §6.3, deprecated, ignored on
-    /// receive) would require knowing the wire format here — which
-    /// would break the ring-level abstraction. If a real H2 peer ever
-    /// receives this Custom16 PAD it would error; but real H2 peers
-    /// don't share this ring (they would speak H2 over TCP, not SHM).
+    /// H2 ring: emit a 9-byte H2 PRIORITY frame header
+    /// (<see cref="Wire.Http2FrameType.Priority"/>) with
+    /// <c>Length = size - 9</c>, <c>StreamId = 0</c>, <c>Flags = 0</c>.
+    /// PRIORITY is deprecated by RFC 9113 and our H2 reader silently
+    /// skips frames of this type with arbitrary payload length, so the
+    /// reader will read the 9-byte header, see PRIORITY, and skip the
+    /// remaining <c>size - 9</c> bytes.
+    /// </para>
+    /// <para>
+    /// PAD only fires on cancel/throw paths (rare). Both wire formats
+    /// share the same code path here so the bug-correctness invariant
+    /// (orphaned slots MUST publish a wire-legal frame) holds for both.
     /// </para>
     /// </remarks>
     internal void MpscPublishOrphanAsPad(
         ulong baseIdx, int size, Memory<byte> first, Memory<byte> second)
     {
-        // Minimum size = FrameHeaderSize. Caller guarantees this via the
-        // MpscReserveWrite size argument (every legitimate frame request
-        // is at least one header).
-        if (size >= ShmConstants.FrameHeaderSize)
+        // Minimum size = wire frame header size. Caller guarantees this
+        // via the MpscReserveWrite size argument (every legitimate frame
+        // request is at least one header).
+        var wireHdrSize = WireHeaderSize;
+        if (size >= wireHdrSize)
         {
-            var hdr = new FrameHeader(
-                FrameType.Pad,
-                streamId: 0,
-                length: (uint)(size - ShmConstants.FrameHeaderSize),
-                flags: 0);
-            // Header lives in `first` (always at least FrameHeaderSize
-            // bytes contiguous because reserves of < ring-cap can wrap
-            // but always have ≥ headerSize at the start as long as
-            // size ≥ headerSize).
-            if (first.Length >= ShmConstants.FrameHeaderSize)
+            // Encode to a stack span first, then place into the slot.
+            // Max of either header size is 16 (Custom16); H2 uses 9.
+            Span<byte> headerBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
+            headerBytes = headerBytes[..wireHdrSize];
+            EncodePadHeader(headerBytes, size, wireHdrSize);
+
+            // Header lives in `first` (always ≥ wireHdrSize bytes
+            // contiguous on most reserves); split across First+Second
+            // when the slot wraps inside the header.
+            if (first.Length >= wireHdrSize)
             {
-                hdr.EncodeTo(first.Span);
+                headerBytes.CopyTo(first.Span);
             }
             else
             {
-                // Wrap point sits inside the header. Encode to a stack
-                // span and split the copy.
-                Span<byte> headerBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
-                hdr.EncodeTo(headerBytes);
                 headerBytes[..first.Length].CopyTo(first.Span);
                 headerBytes[first.Length..].CopyTo(second.Span);
             }
         }
-        // else: caller asked for < 16 bytes — invariant violation;
+        // else: caller asked for < wireHdrSize bytes — invariant violation;
         // publish without writing anything; reader will OOB on the next
-        // Pad header parse (which is a connection-fatal error anyway).
+        // header parse (which is a connection-fatal error anyway).
 
         MpscPublish(baseIdx, size, isPad: true);
+    }
+
+    /// <summary>
+    /// On-wire frame header size for this ring. Custom16: 16 bytes;
+    /// HTTP/2: 9 bytes.
+    /// </summary>
+    private int WireHeaderSize => this.Wire == Grpc.Net.SharedMemory.Wire.WireFormat.Http2
+        ? Grpc.Net.SharedMemory.Wire.Http2FrameHeader.Size
+        : ShmConstants.FrameHeaderSize;
+
+    /// <summary>
+    /// Encodes a wire-format-appropriate PAD-equivalent frame header
+    /// into <paramref name="dest"/>. The header tells the peer reader
+    /// to skip <paramref name="slotSize"/> total bytes (header included).
+    /// </summary>
+    /// <remarks>
+    /// Custom16 → <see cref="FrameType.Pad"/>; H2 → PRIORITY frame.
+    /// H2 PRIORITY's payload is at most 24 bits (16 MiB - 1); a single
+    /// orphan reservation is bounded by per-frame max payload + 9 byte
+    /// header (RingFrameStream chunks at <c>cap/8</c> capped at
+    /// <see cref="Grpc.Net.SharedMemory.Wire.Http2FrameHeader.MaxAllowedPayloadLength"/>)
+    /// so a single PRIORITY header fits any legal slot.
+    /// </remarks>
+    private void EncodePadHeader(Span<byte> dest, int slotSize, int wireHdrSize)
+    {
+        var padPayload = slotSize - wireHdrSize;
+        if (this.Wire == Grpc.Net.SharedMemory.Wire.WireFormat.Http2)
+        {
+            // H2 PRIORITY: deprecated by RFC 9113, our H2 reader (in
+            // Http2Codec.Read.cs Priority case) accepts arbitrary
+            // payload length and silently skips the entire frame.
+            if ((uint)padPayload > Grpc.Net.SharedMemory.Wire.Http2FrameHeader.MaxAllowedPayloadLength)
+            {
+                throw new InvalidOperationException(
+                    $"Orphan slot size {slotSize} exceeds H2 single-frame max " +
+                    $"{Grpc.Net.SharedMemory.Wire.Http2FrameHeader.MaxAllowedPayloadLength + Grpc.Net.SharedMemory.Wire.Http2FrameHeader.Size}; " +
+                    "caller invariant violation (RingFrameStream chunks should cap reserves).");
+            }
+            Grpc.Net.SharedMemory.Wire.Http2FrameHeader.Encode(
+                dest,
+                Grpc.Net.SharedMemory.Wire.Http2FrameType.Priority,
+                flags: 0,
+                streamId: 0,
+                payloadLength: padPayload);
+        }
+        else
+        {
+            var hdr = new FrameHeader(
+                FrameType.Pad,
+                streamId: 0,
+                length: (uint)padPayload,
+                flags: 0);
+            hdr.EncodeTo(dest);
+        }
     }
 
     /// <summary>

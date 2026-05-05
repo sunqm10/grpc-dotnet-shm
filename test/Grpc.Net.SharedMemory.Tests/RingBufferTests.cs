@@ -17,6 +17,7 @@
 #endregion
 
 using NUnit.Framework;
+using Grpc.Net.SharedMemory.Wire;
 
 namespace Grpc.Net.SharedMemory.Tests;
 
@@ -601,6 +602,79 @@ public class RingBufferTests
             () => ring.MpscReserveWrite(0));
         Assert.Throws<ArgumentException>(
             () => ring.MpscReserveWrite(-1));
+    }
+
+    [Test]
+    public void MpscReserve_DisposeWithoutCommit_OnH2Ring_EmitsPriorityFrame()
+    {
+        // Wire-aware PAD: on an H2 ring, the orphan-as-PAD path must
+        // emit an H2 PRIORITY header (deprecated, silently skipped by
+        // our reader), NOT a Custom16 PAD header (whose first 3 bytes
+        // would be parsed as a 24-bit BE length on the H2 wire and
+        // hang the reader waiting for that many bytes).
+        const int Cap = 4096;
+        var memory = new byte[ShmConstants.RingHeaderSize + Cap];
+        using var ring = new ShmRing(memory, 0, Cap) { Wire = WireFormat.Http2 };
+
+        const int SizeA = 64;
+        {
+            using var slotA = ring.MpscReserveWrite(SizeA);
+            // Dispose without Commit → MpscPublishOrphanAsPad fires.
+        }
+
+        // Read the first 9 bytes from the ring; decode as H2 frame header.
+        var headerRes = ring.ReserveRead(Http2FrameHeader.Size);
+        Span<byte> hdrBytes = stackalloc byte[Http2FrameHeader.Size];
+        headerRes.First.Span.CopyTo(hdrBytes);
+        var (h2Type, h2Flags, payloadLen, streamId) = Http2FrameHeader.Decode(hdrBytes);
+
+        Assert.That(h2Type, Is.EqualTo(Http2FrameType.Priority),
+            "Orphan PAD on H2 ring must be a PRIORITY frame.");
+        Assert.That(payloadLen, Is.EqualTo(SizeA - Http2FrameHeader.Size),
+            "PRIORITY payload must declare the remaining slot bytes.");
+        Assert.That(h2Flags, Is.EqualTo((byte)0));
+        Assert.That(streamId, Is.EqualTo(0u));
+
+        // Skip the rest of A so a successor can claim atop a clean state.
+        ring.CommitRead(headerRes, Http2FrameHeader.Size);
+        var skip = ring.ReserveRead(payloadLen);
+        ring.CommitRead(skip, payloadLen);
+
+        // A successor MPSC claim must succeed and publish.
+        const int SizeB = 32;
+        using (var slotB = ring.MpscReserveWrite(SizeB))
+        {
+            slotB.Commit();
+        }
+        Assert.That(ring.GetState().WriteIdx, Is.EqualTo((ulong)(SizeA + SizeB)),
+            "B publishes atop A's wire-legal PRIORITY PAD without skew.");
+    }
+
+    [Test]
+    public void MpscReserve_DisposeWithoutCommit_OnCustom16Ring_EmitsPadFrame()
+    {
+        // Wire-aware PAD: on a Custom16 ring, the orphan-as-PAD path
+        // must emit a Custom16 FrameHeader with FrameType.Pad. Verifies
+        // the wire-aware EncodePadHeader dispatches correctly to the
+        // Custom16 branch.
+        const int Cap = 4096;
+        var memory = new byte[ShmConstants.RingHeaderSize + Cap];
+        using var ring = new ShmRing(memory, 0, Cap);
+
+        const int SizeA = 64;
+        {
+            using var slotA = ring.MpscReserveWrite(SizeA);
+        }
+
+        var headerRes = ring.ReserveRead(ShmConstants.FrameHeaderSize);
+        Span<byte> hdrBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
+        headerRes.First.Span.CopyTo(hdrBytes);
+        var hdr = FrameHeader.DecodeFrom(hdrBytes);
+
+        Assert.That(hdr.Type, Is.EqualTo(FrameType.Pad),
+            "Orphan PAD on Custom16 ring must be a Pad frame.");
+        Assert.That(hdr.Length, Is.EqualTo((uint)(SizeA - ShmConstants.FrameHeaderSize)));
+        Assert.That(hdr.StreamId, Is.EqualTo(0u));
     }
 }
 
