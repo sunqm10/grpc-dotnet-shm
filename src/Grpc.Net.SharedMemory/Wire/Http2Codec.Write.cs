@@ -75,6 +75,81 @@ internal static partial class Http2Codec
     }
 
     /// <summary>
+    /// MPSC variant of <see cref="WriteFrameInternal"/>. Only the frame
+    /// types currently migrated to MPSC are implemented here; the rest
+    /// fall through to the SPSC path. The migration plan flips one call
+    /// site (and its frame types) at a time so SPSC and MPSC do not race
+    /// on the same ring concurrently.
+    /// </summary>
+    private static void WriteFrameMpscInternal(
+        ShmRing ring,
+        FrameHeader header,
+        ReadOnlySpan<byte> payload,
+        CancellationToken cancellationToken)
+    {
+        switch (header.Type)
+        {
+            case FrameType.HalfClose:
+                // Empty DATA with END_STREAM — equivalent to gRPC half-close.
+                WriteH2DataRawMpsc(
+                    ring, header.StreamId, Http2Flags.EndStream,
+                    ReadOnlySpan<byte>.Empty, cancellationToken);
+                return;
+
+            // Other frame types fall through to the existing SPSC path
+            // until their owning call sites migrate. This keeps PR2
+            // commits small and isolates risk.
+            case FrameType.Message:
+            case FrameType.Headers:
+            case FrameType.Trailers:
+            case FrameType.Cancel:
+            case FrameType.GoAway:
+            case FrameType.Ping:
+            case FrameType.Pong:
+            case FrameType.WindowUpdate:
+            case FrameType.Pad:
+                WriteFrameInternal(
+                    ring, header, payload, ReadOnlySpan<byte>.Empty, cancellationToken);
+                return;
+
+            default:
+                throw new InvalidOperationException(
+                    $"HTTP/2 codec: unsupported internal frame type {header.Type}");
+        }
+    }
+
+    /// <summary>
+    /// MPSC variant of <see cref="WriteH2DataRaw"/>. Reserves a slot
+    /// of size 9 (H2 header) + payload via the ring's MPSC claim, encodes
+    /// the H2 DATA frame, commits.
+    /// </summary>
+    private static void WriteH2DataRawMpsc(
+        ShmRing ring, uint streamId, byte flags,
+        ReadOnlySpan<byte> payload, CancellationToken ct)
+    {
+        var totalSize = Http2FrameHeader.Size + payload.Length;
+        if (payload.Length > Http2FrameHeader.MaxAllowedPayloadLength)
+        {
+            throw new ArgumentOutOfRangeException(nameof(payload),
+                $"H2 frame payload {payload.Length} exceeds 24-bit max");
+        }
+
+        using var slot = ring.MpscReserveWrite(totalSize, ct);
+
+        Span<byte> hdr = stackalloc byte[Http2FrameHeader.Size];
+        Http2FrameHeader.Encode(hdr, Http2FrameType.Data, flags, streamId, payload.Length);
+
+        var firstSpan = slot.First.Span;
+        var secondSpan = slot.Second.Span;
+        var written = WriteIntoReservation(firstSpan, secondSpan, 0, hdr);
+        if (payload.Length > 0)
+        {
+            written = WriteIntoReservation(firstSpan, secondSpan, written, payload);
+        }
+        slot.Commit();
+    }
+
+    /// <summary>
     /// Writes an HTTP/2 SETTINGS frame containing the default settings
     /// (used at connection startup for spec compliance).
     /// </summary>

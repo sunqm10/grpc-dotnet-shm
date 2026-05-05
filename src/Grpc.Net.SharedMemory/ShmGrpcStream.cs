@@ -556,28 +556,24 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         if (Interlocked.CompareExchange(ref _halfCloseSent, 1, 0) != 0)
             return Task.CompletedTask;
 
-        // In singleStreamMode, write HalfClose inline to avoid queue overhead.
-        // Always use TryPause here (never ExecuteInline) because:
-        // 1. HalfClose is a zero-payload frame — ring write is ~100ns.
-        // 2. TryPause spin is bounded: WriterLoop checks _paused every Phase 2
-        //    iteration (~30ns), so pause completes within a few µs.
-        // 3. ExecuteInline would allocate a lambda closure + two kernel signals,
-        //    adding ~2-5µs overhead per unary call that dominates small payloads.
+        // PR2 phase 1.2 (POC migration): under SingleStreamMode the
+        // legacy path used TryPauseWriterLoop + WriteHalfClose. The
+        // MPSC equivalent is simpler — just claim a 16-byte slot
+        // (Custom16) or 9-byte slot (H2 DATA + END_STREAM), encode,
+        // commit. No phase coordination, no CAS spin, no fallback.
+        // Concurrent writers on the same ring (e.g., the still-SPSC
+        // WriterLoop draining a queued frame) are serialised via the
+        // MPSC publish-spin against header.WriteIdx.
+        //
+        // The TryPauseWriterLoop fallback still exists below for
+        // non-SingleStreamMode paths until those callers migrate too.
+        // Even when SingleStreamMode is FALSE, MPSC is correct as long
+        // as no other SPSC writer is concurrently active on this ring;
+        // we rely on the migration ordering to keep that invariant.
         if (_connection.SingleStreamMode && _connection.ActiveStreamCount <= 1)
         {
-            var writer = _connection.FrameWriter;
-            if (writer != null && writer.TryPauseWriterLoop())
-            {
-                try
-                {
-                    FrameProtocol.WriteHalfClose(_connection.TxRing, StreamId, default);
-                }
-                finally
-                {
-                    writer.ResumeWriterLoop();
-                }
-                return Task.CompletedTask;
-            }
+            FrameProtocol.WriteHalfCloseMpsc(_connection.TxRing, StreamId, default);
+            return Task.CompletedTask;
         }
 
         var task = SendFrameAsync(FrameType.HalfClose, 0, Array.Empty<byte>());

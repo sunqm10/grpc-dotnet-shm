@@ -92,4 +92,18 @@ internal static partial class Http2Codec
         // Implementation lives in Http2Codec.Write.cs.
         WriteFrameInternal(ring, header, payload1, payload2, cancellationToken);
     }
+
+    /// <summary>
+    /// MPSC variant: writes one logical frame in HTTP/2 wire format via
+    /// the ring's MPSC claim+publish path (safe under concurrent writers).
+    /// </summary>
+    public static void WriteFrameMpsc(
+        ShmRing ring,
+        FrameHeader header,
+        ReadOnlySpan<byte> payload,
+        CancellationToken cancellationToken)
+    {
+        // Implementation lives in Http2Codec.Write.cs.
+        WriteFrameMpscInternal(ring, header, payload, cancellationToken);
+    }
 }

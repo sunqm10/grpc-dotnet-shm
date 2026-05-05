@@ -1142,6 +1142,22 @@ public sealed class ShmRing : IDisposable
             }
 
             var current = Volatile.Read(ref _claimedWriteIdx);
+            // PR2 transitional: when SPSC ReserveWrite/CommitWrite has
+            // run on this ring before we got here, header.WriteIdx may
+            // be ahead of our local _claimedWriteIdx. Bump our cursor
+            // forward so we don't claim a slot the SPSC writer already
+            // wrote. Once SPSC paths delete (Phase 1.4) this branch is
+            // dead code and removes with the legacy SPSC API.
+            var sharedWrite = (long)Volatile.Read(ref header.WriteIdx);
+            if (sharedWrite > current)
+            {
+                if (Interlocked.CompareExchange(
+                        ref _claimedWriteIdx, sharedWrite, current) != current)
+                {
+                    continue;   // raced; reload
+                }
+                current = sharedWrite;
+            }
             var newClaimed = current + size;
             var readIdx = (long)Volatile.Read(ref header.ReadIdx);
             // used = newClaimed - readIdx in 64-bit signed difference. The

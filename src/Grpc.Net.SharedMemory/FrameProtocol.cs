@@ -481,6 +481,68 @@ public static class FrameProtocol
         return offset;
     }
 
+    // ===== MPSC writer helpers (PR2 phase 1.2+) =====
+
+    /// <summary>
+    /// MPSC equivalent of <see cref="WriteFrame(ShmRing, FrameHeader, ReadOnlySpan{byte}, CancellationToken)"/>:
+    /// dispatches to Custom16 or H2 wire format and writes the frame via
+    /// <see cref="ShmRing.MpscReserveWrite"/> + <see cref="MpscWriteSlot.Commit"/>.
+    /// Multiple writers may call this concurrently on the same ring;
+    /// each gets a non-overlapping slot. Commit ordering is enforced by
+    /// the ring's publish-spin so on-wire frames appear in claim order.
+    /// </summary>
+    public static void WriteFrameMpsc(
+        ShmRing ring, FrameHeader header,
+        ReadOnlySpan<byte> payload, CancellationToken cancellationToken = default)
+    {
+        if (ring.Wire == Wire.WireFormat.Http2)
+        {
+            Wire.Http2Codec.WriteFrameMpsc(ring, header, payload, cancellationToken);
+            return;
+        }
+        WriteFrameMpscCustom16(ring, header, payload, cancellationToken);
+    }
+
+    private static void WriteFrameMpscCustom16(
+        ShmRing ring, FrameHeader header,
+        ReadOnlySpan<byte> payload, CancellationToken cancellationToken)
+    {
+        header.Length = (uint)payload.Length;
+        header.Reserved = 0;
+        header.Reserved2 = 0;
+
+        var totalSize = ShmConstants.FrameHeaderSize + payload.Length;
+        using var slot = ring.MpscReserveWrite(totalSize, cancellationToken);
+
+        // Encode the 16-byte header into the slot, handling wrap by
+        // splitting between First and Second.
+        Span<byte> headerBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
+        header.EncodeTo(headerBytes);
+
+        var firstSpan = slot.First.Span;
+        var secondSpan = slot.Second.Span;
+        var written = WriteToReservation(firstSpan, secondSpan, 0, headerBytes);
+        if (payload.Length > 0)
+        {
+            written = WriteToReservation(firstSpan, secondSpan, written, payload);
+        }
+        slot.Commit();
+    }
+
+    /// <summary>
+    /// MPSC HALF_CLOSE: emits the wire-format-appropriate end-of-stream
+    /// frame. On Custom16: a 16-byte HALF_CLOSE-typed frame. On H2: a
+    /// 9-byte DATA frame with END_STREAM and zero payload. Equivalent
+    /// in semantics to <see cref="WriteHalfClose"/> but uses the MPSC
+    /// claim+publish path (safe for concurrent writers on the same ring).
+    /// </summary>
+    public static void WriteHalfCloseMpsc(
+        ShmRing ring, uint streamId, CancellationToken cancellationToken = default)
+    {
+        var header = new FrameHeader(FrameType.HalfClose, streamId, 0, 0);
+        WriteFrameMpsc(ring, header, ReadOnlySpan<byte>.Empty, cancellationToken);
+    }
+
     /// <summary>
     /// Reads a frame from the ring buffer, skipping PAD frames.
     /// Blocks until a frame is available.
