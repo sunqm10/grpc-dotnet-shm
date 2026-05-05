@@ -102,27 +102,48 @@ internal static partial class Http2Codec
         }
     }
 
-    /// <summary>Accumulates a single in-progress gRPC LPM message across multiple DATA frames.</summary>
+    /// <summary>
+    /// Tracks an in-progress gRPC LPM message across multiple H2 DATA
+    /// frames. PR2 phase 2.5: the accumulator no longer holds the full
+    /// LPM body in a single ArrayPool buffer; instead each DATA frame's
+    /// body bytes are emitted as a separate MESSAGE chunk (with the
+    /// <see cref="MessageFlags.More"/> flag set on all but the LPM's
+    /// final chunk). Upstream readers (ReadSingleMessageAsync and
+    /// ShmAsyncStreamReader, both lazy-chain enabled in 5dfb2db2 and
+    /// c01f5b8e) consume the chain frame-by-frame, releasing each
+    /// pool-backed chunk as the protobuf parser advances. Net pool
+    /// footprint per H2 stream drops from O(LPM body size) to
+    /// O(per-DATA-frame ~16 MiB ceiling).
+    /// </summary>
     private sealed class LpmAccumulator
     {
-        public byte[]? Buffer;          // pooled, 0..ExpectedTotal capacity
-        public int Pos;                 // bytes written so far
-        public int ExpectedTotal;       // 5 (header) + body length once header is parsed; 0 before that
+        // 5-byte LPM header parsing state. Bytes copied here from the
+        // wire as DATA frames stream in; once HeaderBytesSeen == 5 the
+        // body length is known and chunk emission begins.
+        public readonly byte[] HeaderBuf = new byte[5];
         public int HeaderBytesSeen;     // 0..5
 
-        // Reusable 5-byte LPM header buffer for partial header reads.
-        public readonly byte[] HeaderBuf = new byte[5];
+        // Body emission state. ExpectedBodyLen is the LPM body length
+        // (NOT including the 5-byte header) parsed from HeaderBuf[1..5].
+        // BodyEmitted is the cumulative count of body bytes that have
+        // been included in MESSAGE chunks emitted so far. The LPM is
+        // complete when BodyEmitted == ExpectedBodyLen.
+        public int ExpectedBodyLen;
+        public int BodyEmitted;
+
+        // True once the first chunk for this LPM has been emitted; that
+        // chunk has the 5-byte HeaderBuf prepended so the upstream
+        // reader's compFlag sniff (Memory.Span[0]) and LPM body length
+        // sniff (Memory.Span.Slice(1,4) BE32) work unchanged.
+        // Subsequent chunks contain raw body bytes only.
+        public bool HeaderEmittedAsChunk;
 
         public void Reset()
         {
-            if (Buffer != null)
-            {
-                System.Buffers.ArrayPool<byte>.Shared.Return(Buffer);
-                Buffer = null;
-            }
-            Pos = 0;
-            ExpectedTotal = 0;
             HeaderBytesSeen = 0;
+            ExpectedBodyLen = 0;
+            BodyEmitted = 0;
+            HeaderEmittedAsChunk = false;
         }
     }
 
@@ -357,8 +378,15 @@ internal static partial class Http2Codec
 
         // === Fast path: single complete LPM message in this DATA frame, ===
         // === no accumulator state, contiguous body. Eligible for zero-copy. ===
+        // PR2 phase 2.5: "hasAccumulator" means the accumulator has
+        // either started parsing the LPM header (HeaderBytesSeen > 0)
+        // or has begun emitting chunks for the current LPM
+        // (HeaderEmittedAsChunk == true). The fast path is only safe
+        // when no LPM is in progress; if the accumulator already has
+        // partial state we MUST take the slow path so the new bytes
+        // continue the in-progress LPM.
         var hasAccumulator = TryGetAcc(state, streamId, out var existingAcc)
-            && existingAcc!.Pos > 0;
+            && (existingAcc!.HeaderBytesSeen > 0 || existingAcc.HeaderEmittedAsChunk);
         if (!hasAccumulator && bodyLength >= 5 && payloadReservation.Second.IsEmpty)
         {
             var bodySpan = payloadReservation.First.Span.Slice(bodyOffset, bodyLength);
@@ -422,32 +450,43 @@ internal static partial class Http2Codec
             // back-to-back (writer-side coalescing — common when peers
             // batch small messages, and explicitly allowed by gRFC G3).
             //
-            // We loop, consuming as much of <c>bodyBytes</c> as
-            // <see cref="FeedAccumulator"/> can. Each completion produces
-            // one logical internal Message frame. The first completion is
-            // returned from this call; subsequent completions go into
-            // <see cref="Http2DecoderState.PendingFrames"/>.
+            // PR2 phase 2.5: chunk-emit semantics. Each call to
+            // <see cref="FeedAccumulator"/> emits AT MOST one MESSAGE
+            // chunk covering whatever body bytes were consumed in this
+            // call. Chunks are flagged via:
+            //
+            //   - <see cref="MessageFlags.More"/>: set on chunks that do
+            //     NOT complete an LPM (mid-LPM continuation). Cleared on
+            //     chunks that DO complete an LPM. Upstream
+            //     <see cref="ReadSingleMessageAsync"/> /
+            //     <see cref="ShmAsyncStreamReader"/> use the More flag
+            //     to drive the lazy-chain pull loop.
+            //
+            //   - <see cref="MessageFlags.EndStream"/>: set on the LAST
+            //     chunk emitted by this DATA frame, IF the H2 frame's
+            //     END_STREAM flag is set. Same buffered-tail pattern as
+            //     the legacy single-emit code.
             //
             // EndStream semantics: the H2 frame's END_STREAM flag applies
-            // logically to whichever Message is the LAST one this DATA
-            // frame produces. To stamp EndStream correctly without
-            // patching a queued entry after the fact, we hold the most
-            // recent post-first completion in <c>bufferedTail</c> and
-            // only enqueue it when we see another completion overtake
-            // it. After the loop the still-buffered tail (if any) is the
-            // true terminal Message and gets stamped with EndStream.
+            // logically to whichever chunk is the LAST one this DATA
+            // frame produces. To stamp it correctly without patching a
+            // queued entry after the fact, we hold the most recent
+            // post-first emission in <c>bufferedTail</c> and enqueue it
+            // only when another emission overtakes it.
             //
-            // Allocation profile on the dominant single-LPM-per-DATA
-            // path (typical multi-frame chunked message, or a coalescing
-            // peer that happened to land one LPM per frame): zero heap
-            // allocations beyond the FramePayload itself. Coalesced
-            // 2-LPM DATA: one Queue.Enqueue (the Queue itself is
-            // amortised; lazily grown only when first used). 3+ LPMs:
-            // one Enqueue per extra completion. No List or array on the
-            // common paths.
+            // Allocation profile is one ArrayPool.Rent per emitted chunk.
+            // For the common single-LPM-per-DATA path that's still one
+            // pool buffer per DATA frame (matches the legacy path's one
+            // big buffer per LPM, just split). For multi-DATA single-LPM
+            // it's now N small buffers vs the legacy 1 large buffer —
+            // but the upstream lazy-chain consumer releases each as the
+            // parser advances, so total in-flight pool footprint drops
+            // from O(LPM size) to ~2 chunks.
             var acc = GetOrAddAcc(state, streamId);
-            FramePayload? firstCompleted = null;
+            FramePayload? firstEmitted = null;
+            bool firstEmittedLpmComplete = false;
             FramePayload? bufferedTail = null;
+            bool bufferedTailLpmComplete = false;
             var remaining = bodyBytes;
             var ringCommitted = false;
 
@@ -455,7 +494,7 @@ internal static partial class Http2Codec
             {
                 while (remaining.Length > 0)
                 {
-                    var (completed, consumed) = FeedAccumulator(acc, remaining);
+                    var (chunk, consumed, lpmComplete) = FeedAccumulator(acc, remaining);
                     if (consumed == 0)
                     {
                         // Defensive: FeedAccumulator made no progress on a
@@ -467,28 +506,31 @@ internal static partial class Http2Codec
                     }
                     remaining = remaining.Slice(consumed);
 
-                    if (completed is { } payload)
+                    if (chunk is { } payload)
                     {
-                        if (firstCompleted == null)
+                        if (firstEmitted == null)
                         {
-                            firstCompleted = payload;
+                            firstEmitted = payload;
+                            firstEmittedLpmComplete = lpmComplete;
                         }
                         else if (bufferedTail == null)
                         {
                             bufferedTail = payload;
+                            bufferedTailLpmComplete = lpmComplete;
                         }
                         else
                         {
-                            // bufferedTail is no longer the terminal Message —
-                            // a newer completion has arrived. Flush the old
-                            // tail to the queue WITHOUT EndStream (that flag
-                            // belongs to whoever ends up final) and adopt the
-                            // new payload as the new buffered tail.
+                            // bufferedTail is no longer the terminal chunk —
+                            // a newer chunk has arrived. Flush the old tail
+                            // to the queue with the appropriate More flag
+                            // (no EndStream; that flag belongs to whoever
+                            // ends up final).
+                            byte tailFlagsMid = (byte)(bufferedTailLpmComplete ? 0 : MessageFlags.More);
                             try
                             {
                                 EnqueuePendingFrame(state,
                                     new FrameHeader(FrameType.Message, streamId,
-                                        (uint)bufferedTail.Value.Length, 0),
+                                        (uint)bufferedTail.Value.Length, tailFlagsMid),
                                     bufferedTail.Value);
                             }
                             catch
@@ -497,6 +539,7 @@ internal static partial class Http2Codec
                                 throw;
                             }
                             bufferedTail = payload;
+                            bufferedTailLpmComplete = lpmComplete;
                         }
                     }
                 }
@@ -520,63 +563,52 @@ internal static partial class Http2Codec
                     // <c>payloadLen</c> via the <see cref="ShmRing.ReserveRead"/>
                     // call above, but never published the matching
                     // <see cref="ShmRing.CommitReadRaw"/> on the shared
-                    // <c>header.ReadIdx</c>. Without this defensive
-                    // commit, the cross-process writer would see ring
-                    // capacity skewed by the unconsumed (from its view)
-                    // bytes for the rest of the connection's life — and
-                    // any future ReadFramePayload retry would re-read
-                    // the same bytes from <c>_pendingReadIdx</c>. Even
-                    // though InvalidDataException currently tears the
-                    // connection down (so the leak is bounded), defense
-                    // in depth: keep the two indices in sync at all
-                    // exit points.
+                    // <c>header.ReadIdx</c>. Defense in depth: keep the
+                    // two indices in sync at all exit points.
                     try { ring.CommitReadRaw(baseCommitReadIdx, totalBytes); }
                     catch { /* swallow during exception unwind */ }
 
-                    // Release any locally-held completions to return their
-                    // pooled buffers and (if speculative — currently never,
-                    // since FeedAccumulator only emits FromPooled) drop
-                    // their SpeculativeReservedBytes increment.
-                    //
-                    // Also drain <see cref="Http2DecoderState.PendingFrames"/>:
-                    // any exception that bubbles out here is connection-fatal
-                    // (FrameReaderLoopAsync's outer catch tears the connection
-                    // down on InvalidDataException), so no future
-                    // ReadFramePayload call will dequeue these frames. Without
-                    // <see cref="ReleasePendingFrames"/> their pooled buffers
-                    // would leak until GC. Because no future dequeue is
-                    // possible, there is no use-after-free risk in releasing
-                    // them here.
-                    firstCompleted?.Release();
+                    firstEmitted?.Release();
                     bufferedTail?.Release();
                     ReleasePendingFrames(state);
                 }
             }
 
-            if (firstCompleted is { } first)
+            if (firstEmitted is { } first)
             {
-                // Stamp EndStream on the LAST surfaced Message when the
-                // wire frame's H2 END_STREAM was set; everything before
-                // it gets plain Message flags. This is the canonical
-                // gRPC mapping: H2 END_STREAM marks the END of the
-                // stream's byte sequence, and the LAST LPM message in
-                // that sequence is the one carrying call termination
-                // semantics.
+                // Stamp EndStream on the LAST emitted chunk when the wire
+                // frame's H2 END_STREAM was set. EndStream is only valid
+                // when the LAST chunk also completes its LPM (otherwise
+                // we'd be claiming the stream ends mid-LPM, which is a
+                // protocol error caught below).
                 if (bufferedTail is { } tail)
                 {
-                    // Two or more completions: <c>first</c> goes back as
-                    // the call's response, <c>tail</c> is the genuine
-                    // terminal Message and rides the EndStream flag.
-                    var tailFlags = endStream ? MessageFlags.EndStream : (byte)0;
+                    // Two or more emissions: <c>first</c> goes back as
+                    // the call's first MESSAGE, <c>tail</c> rides the
+                    // EndStream flag (if applicable) and the More flag
+                    // for its own LPM-completeness state.
+                    byte tailFlags = (byte)(bufferedTailLpmComplete ? 0 : MessageFlags.More);
+                    if (endStream && bufferedTailLpmComplete)
+                    {
+                        tailFlags |= MessageFlags.EndStream;
+                    }
                     EnqueuePendingFrame(state,
                         new FrameHeader(FrameType.Message, streamId,
                             (uint)tail.Length, tailFlags),
                         tail);
+                    byte firstFlags = (byte)(firstEmittedLpmComplete ? 0 : MessageFlags.More);
                     var firstHdr = new FrameHeader(FrameType.Message, streamId,
-                        (uint)first.Length, 0);
+                        (uint)first.Length, firstFlags);
 
                     if (endStream)
                     {
+                        if (!bufferedTailLpmComplete)
+                        {
+                            // H2 END_STREAM with the final emitted chunk
+                            // still mid-LPM: protocol error.
+                            throw new InvalidDataException(
+                                $"H2 stream {streamId} ended mid-LPM (final chunk has More flag)");
+                        }
                         state.StreamsWithInitialHeaders.Remove(streamId);
                         if (RemoveAcc(state, streamId, out var doneAcc))
                         {
@@ -586,15 +618,21 @@ internal static partial class Http2Codec
                     return (firstHdr, first);
                 }
 
-                // Single completion (the dominant case for our own
-                // writer and for most multi-frame chunked paths): stamp
-                // EndStream directly onto <c>first</c>. Zero heap
-                // allocations beyond the FramePayload itself.
-                var msgFlags = endStream ? MessageFlags.EndStream : (byte)0;
+                // Single emission: stamp EndStream and More directly.
+                byte msgFlags = (byte)(firstEmittedLpmComplete ? 0 : MessageFlags.More);
+                if (endStream && firstEmittedLpmComplete)
+                {
+                    msgFlags |= MessageFlags.EndStream;
+                }
                 var hdr = new FrameHeader(FrameType.Message, streamId,
                     (uint)first.Length, msgFlags);
                 if (endStream)
                 {
+                    if (!firstEmittedLpmComplete)
+                    {
+                        throw new InvalidDataException(
+                            $"H2 stream {streamId} ended mid-LPM (final chunk has More flag)");
+                    }
                     state.StreamsWithInitialHeaders.Remove(streamId);
                     if (RemoveAcc(state, streamId, out var doneAcc))
                     {
@@ -614,7 +652,7 @@ internal static partial class Http2Codec
                 }
                 state.StreamsWithInitialHeaders.Remove(streamId);
                 throw new InvalidDataException(
-                    $"H2 stream {streamId} ended mid-LPM (accumulator pos={acc.Pos}, expected={acc.ExpectedTotal})");
+                    $"H2 stream {streamId} ended mid-LPM (header bytes seen={acc.HeaderBytesSeen}, body emitted={acc.BodyEmitted}, expected body={acc.ExpectedBodyLen})");
             }
             return null; // outer loop will read next frame
         }
@@ -628,28 +666,49 @@ internal static partial class Http2Codec
     }
 
     /// <summary>
-    /// Copies as many bytes from <paramref name="body"/> into <paramref name="acc"/>
-    /// as needed to either (a) complete one in-progress LPM message or
-    /// (b) reach end-of-input. Returns the completed message (or
-    /// <c>null</c> if more bytes are still needed) and the number of
-    /// bytes consumed from <paramref name="body"/>.
+    /// Consumes some bytes from <paramref name="body"/> and returns a
+    /// <see cref="FramePayload"/> chunk for the upstream reader if any
+    /// non-header bytes were consumed. The chunk represents whatever
+    /// body bytes <em>this</em> call covered; the LPM may or may not
+    /// be complete — that is signalled separately via
+    /// <c>LpmComplete</c>.
     /// </summary>
     /// <remarks>
-    /// One call advances the accumulator by AT MOST one LPM message. If
-    /// <paramref name="body"/> contains additional LPM bytes after the
-    /// first completion, the caller is expected to invoke this method
-    /// again with the residual span (see
-    /// <see cref="TryReadDataFrame"/>'s consumption loop). This split
-    /// keeps the per-LPM logic simple and lets the caller decide how to
-    /// surface multiple completed messages (head returned to the upper
-    /// layer; rest stashed in <see cref="Http2DecoderState.PendingFrames"/>).
+    /// <para>
+    /// One call advances the accumulator by AT MOST one LPM. The caller's
+    /// outer loop (<see cref="TryReadDataFrame"/>'s slow path) re-invokes
+    /// with the residual span if <c>LpmComplete</c> is true and there
+    /// are bytes left in the DATA frame; that next invocation begins
+    /// parsing the next LPM's header.
+    /// </para>
+    /// <para>
+    /// PR2 phase 2.5: this is the chunk-emit replacement for the legacy
+    /// "accumulate-into-Buffer-then-emit-once" pattern. Each call's body
+    /// bytes (whatever fits up to the LPM's remaining body length)
+    /// becomes its own pooled chunk. The first chunk for a given LPM
+    /// has the 5-byte LPM header prepended (so upstream reader's
+    /// <c>compFlag</c> sniff still works); subsequent chunks contain
+    /// raw body bytes only.
+    /// </para>
     /// </remarks>
-    private static (FramePayload? Completed, int Consumed) FeedAccumulator(LpmAccumulator acc, ReadOnlySpan<byte> body)
+    /// <returns>
+    /// <c>Completed</c>: a <see cref="FramePayload"/> chunk to surface
+    /// upstream (or <c>null</c> if only header bytes were consumed and
+    /// no body chunk was emitted). <c>Consumed</c>: bytes consumed from
+    /// <paramref name="body"/> (header + body). <c>LpmComplete</c>:
+    /// true iff the chunk emitted finishes this LPM (so the caller
+    /// should reset accumulator state for the next LPM and propagate
+    /// MORE=0 to the chunk's frame flags).
+    /// </returns>
+    private static (FramePayload? Completed, int Consumed, bool LpmComplete) FeedAccumulator(
+        LpmAccumulator acc, ReadOnlySpan<byte> body)
     {
         var src = body;
         var consumed = 0;
 
-        // Phase 1: complete the 5-byte LPM header if necessary.
+        // Phase 1: complete the 5-byte LPM header if necessary. Header
+        // bytes are NEVER counted toward chunk emission — the header is
+        // prepended to the FIRST body chunk only.
         if (acc.HeaderBytesSeen < 5)
         {
             var need = 5 - acc.HeaderBytesSeen;
@@ -661,7 +720,7 @@ internal static partial class Http2Codec
 
             if (acc.HeaderBytesSeen < 5)
             {
-                return (null, consumed); // header still partial
+                return (null, consumed, false); // header still partial
             }
 
             var bodyLen = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(
@@ -679,38 +738,74 @@ internal static partial class Http2Codec
                 throw new InvalidDataException(
                     $"gRPC LPM body length {bodyLen} exceeds receiver maximum {MaxLpmBodyLength}");
             }
-            acc.ExpectedTotal = 5 + bodyLen;
-            acc.Buffer = ArrayPool<byte>.Shared.Rent(acc.ExpectedTotal == 0 ? 1 : acc.ExpectedTotal);
-            // Stamp header at start of buffer.
-            acc.HeaderBuf.AsSpan(0, 5).CopyTo(acc.Buffer);
-            acc.Pos = 5;
+            acc.ExpectedBodyLen = bodyLen;
+            acc.BodyEmitted = 0;
+            acc.HeaderEmittedAsChunk = false;
+            // Fall through: maybe src has body bytes already (DATA frame
+            // contained both the header and at least some body).
         }
 
-        // Phase 2: copy body bytes into accumulator buffer. Stop at this
-        // LPM's expected total — any leftover belongs to the next LPM
-        // and is surfaced via <c>consumed</c> so the caller can re-invoke
-        // with the residual span.
-        if (src.Length > 0)
+        // At this point HeaderBytesSeen == 5 (header is fully parsed).
+        // Phase 2: emit a chunk covering as many of THIS LPM's body
+        // bytes as fit in src. Stop at the LPM's body boundary; any
+        // residue belongs to the next LPM and is surfaced via the
+        // returned `Consumed` count.
+        var bodyRemaining = acc.ExpectedBodyLen - acc.BodyEmitted;
+        if (bodyRemaining == 0 && acc.ExpectedBodyLen == 0 && !acc.HeaderEmittedAsChunk)
         {
-            var room = acc.ExpectedTotal - acc.Pos;
-            var take = Math.Min(room, src.Length);
-            src.Slice(0, take).CopyTo(acc.Buffer.AsSpan(acc.Pos));
-            acc.Pos += take;
-            consumed += take;
-        }
-
-        if (acc.Pos == acc.ExpectedTotal)
-        {
-            // Hand off the buffer to a FramePayload (pool ownership transfers).
-            var buf = acc.Buffer!;
-            var len = acc.ExpectedTotal;
-            acc.Buffer = null;
-            acc.Pos = 0;
-            acc.ExpectedTotal = 0;
+            // Empty-body LPM (compFlag + 0-byte body). Emit a 5-byte
+            // chunk containing just the LPM header so upstream sees a
+            // well-formed (but empty-body) MESSAGE. Reset per-LPM state
+            // so the next call begins a fresh header parse.
+            var emptyChunk = ArrayPool<byte>.Shared.Rent(5);
+            acc.HeaderBuf.AsSpan(0, 5).CopyTo(emptyChunk);
             acc.HeaderBytesSeen = 0;
-            return (FramePayload.FromPooled(buf, len), consumed);
+            acc.ExpectedBodyLen = 0;
+            acc.BodyEmitted = 0;
+            acc.HeaderEmittedAsChunk = false;
+            return (FramePayload.FromPooled(emptyChunk, 5), consumed, true);
         }
-        return (null, consumed);
+
+        if (bodyRemaining == 0)
+        {
+            // No body left for this LPM AND it was already chunk-emitted.
+            // Caller should have caught LpmComplete=true on the previous
+            // call. This path is unreachable in practice but guarded.
+            return (null, consumed, false);
+        }
+
+        if (src.Length == 0)
+        {
+            // Header parsed, but no body bytes available in this DATA
+            // frame yet. Wait for the next DATA frame.
+            return (null, consumed, false);
+        }
+
+        var chunkBodyLen = Math.Min(bodyRemaining, src.Length);
+        var chunkPayloadLen = acc.HeaderEmittedAsChunk ? chunkBodyLen : 5 + chunkBodyLen;
+        var chunk = ArrayPool<byte>.Shared.Rent(chunkPayloadLen);
+        var chunkOffset = 0;
+        if (!acc.HeaderEmittedAsChunk)
+        {
+            acc.HeaderBuf.AsSpan(0, 5).CopyTo(chunk);
+            chunkOffset = 5;
+            acc.HeaderEmittedAsChunk = true;
+        }
+        src.Slice(0, chunkBodyLen).CopyTo(chunk.AsSpan(chunkOffset, chunkBodyLen));
+        acc.BodyEmitted += chunkBodyLen;
+        consumed += chunkBodyLen;
+
+        var lpmComplete = acc.BodyEmitted == acc.ExpectedBodyLen;
+        if (lpmComplete)
+        {
+            // LPM done — reset per-LPM state so the next call starts a
+            // fresh header parse. (HeaderBuf is reusable and stays as-is.)
+            acc.HeaderBytesSeen = 0;
+            acc.ExpectedBodyLen = 0;
+            acc.BodyEmitted = 0;
+            acc.HeaderEmittedAsChunk = false;
+        }
+        return (FramePayload.FromPooled(chunk, chunkPayloadLen), consumed, lpmComplete);
     }
 
     private static (FrameHeader Header, FramePayload Payload) ReadHeadersFrame(
