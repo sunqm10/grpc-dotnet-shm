@@ -729,13 +729,47 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         // _assembled on the FIRST frame by sniffing the
                         // gRPC LPM compression flag (byte 0).
                         bool firstChunk = !usedAssembled && chainHead == null;
+
+                        // PR2 phase 2.x: multi-frame UNCOMPRESSED messages
+                        // take the LazyChainRos path. The chain pulls each
+                        // frame on demand from the inbound channel and
+                        // releases each frame to the pool as soon as the
+                        // protobuf parser advances past it. Peak pool
+                        // footprint ~2 frames vs O(message) for the legacy
+                        // chain-segment-then-MergeFrom pattern.
+                        //
+                        // Triggered iff:
+                        //   - This is the first chunk of a multi-frame message
+                        //   - LPM compression flag is 0 (uncompressed)
+                        //   - Frame has the full 5-byte LPM header
+                        //
+                        // Compressed multi-frame still falls through to the
+                        // _assembled path because the decompressor needs a
+                        // contiguous buffer.
+                        if (firstChunk && f.Length >= 5 && f.Memory.Span[0] == 0)
+                        {
+                            var lpmBodyLen = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(
+                                f.Memory.Span.Slice(1, 4));
+                            if (maxReceiveMessageSize > 0 && lpmBodyLen > maxReceiveMessageSize)
+                            {
+                                f.ReturnToPool();
+                                throw new RpcException(new Status(StatusCode.ResourceExhausted,
+                                    $"Received message exceeds the maximum configured message size " +
+                                    $"({lpmBodyLen} vs {maxReceiveMessageSize})"));
+                            }
+
+                            return ParseUncompressedMultiFrameLazy<TReq>(
+                                stream, f, lpmBodyLen, pooledDeserialization, parser, ct);
+                        }
+
                         bool useChain;
                         if (firstChunk)
                         {
                             // f.Memory has at least 5 bytes (writer
                             // always emits the LPM header in the first
-                            // frame).
-                            useChain = f.Length >= 5 && f.Memory.Span[0] == 0;
+                            // frame). Compressed first chunk falls through
+                            // to _assembled.
+                            useChain = false;
                         }
                         else
                         {
@@ -922,6 +956,84 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         for (int i = 0; i < frames.Count; i++)
             frames[i].ReturnToPool();
         frames.Clear();
+    }
+
+    /// <summary>
+    /// Lazy-streaming parse path for uncompressed multi-frame messages.
+    /// Hands the protobuf parser a <see cref="LazyChainRos"/> that pulls
+    /// each subsequent frame on demand and releases its predecessor as
+    /// soon as the parser advances.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Pool-buffer footprint during MergeFrom: ~2 frames at any instant,
+    /// regardless of message size. Critical for high-concurrency
+    /// big-message scenarios (32 streams × 256 MB messages would otherwise
+    /// hold 8 GiB of pool buffers in flight).
+    /// </para>
+    /// <para>
+    /// The synchronous <see cref="ShmGrpcStream.ReceiveFrameSync"/> pull
+    /// is safe under SHM's threadpool-based handler dispatch (no
+    /// SyncCtx capture; producer runs on a different task).
+    /// </para>
+    /// </remarks>
+    private static TReq ParseUncompressedMultiFrameLazy<TReq>(
+        ShmGrpcStream stream, InboundFrame firstFrame, int lpmBodyLen,
+        bool pooledDeserialization, MessageParser<TReq> parser,
+        CancellationToken ct)
+        where TReq : class, IMessage<TReq>, new()
+    {
+        // Sync puller: surface only Message frames; treat any other frame
+        // type (HalfClose / Cancel / Trailers / etc) as truncation.
+        // LazyChainRos converts truncation into IOException which we surface
+        // as RpcException(Internal).
+        InboundFrame? Pull(CancellationToken pullCt)
+        {
+            var pulled = stream.ReceiveFrameSync(pullCt);
+            if (pulled is null) return null;
+            if (pulled.Value.Type != FrameType.Message)
+            {
+                // Non-Message frame mid-LPM-body is a protocol error /
+                // peer cancellation. Release the frame so we don't leak
+                // pool buffer or ZC reservation.
+                pulled.Value.ReturnToPool();
+                return null;
+            }
+            return pulled.Value;
+        }
+
+        try
+        {
+            using var chain = new LazyChainRos(
+                firstFrame, firstFrameBodyOffset: 5,
+                totalBodyLen: lpmBodyLen,
+                pullNext: Pull, ct: ct);
+
+            try
+            {
+                if (pooledDeserialization)
+                {
+                    // PooledProtoParser is a span-only fast path. For multi-
+                    // frame messages we can't use it; fall through to the
+                    // standard parser which accepts ROS.
+                }
+                var msg = new TReq();
+                Google.Protobuf.MessageExtensions.MergeFrom(msg, chain.Sequence);
+                return msg;
+            }
+            catch (Google.Protobuf.InvalidProtocolBufferException ipbex)
+            {
+                throw new RpcException(new Status(StatusCode.Internal,
+                    $"Failed to parse request message: {ipbex.Message}"));
+            }
+            catch (IOException ioex)
+            {
+                throw new RpcException(new Status(StatusCode.Internal,
+                    $"Truncated request message: {ioex.Message}"));
+            }
+        }
+        catch (RpcException) { throw; }
+        catch (OperationCanceledException) { throw; }
     }
 
     /// <summary>Multi-segment chain node for the inbound frame chain.</summary>

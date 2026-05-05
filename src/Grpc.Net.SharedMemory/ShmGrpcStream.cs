@@ -617,6 +617,79 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         return ReceiveFrameSlowAsync(cancellationToken);
     }
 
+    /// <summary>
+    /// Synchronous variant of <see cref="ReceiveFrameAsync"/>. Used by
+    /// <see cref="LazyChainRos"/>'s pull callback inside protobuf's
+    /// synchronous <c>MergeFrom(ros)</c> parse loop.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Returns the next queued frame immediately if one is buffered.
+    /// Otherwise blocks the calling thread on the inbound frames channel
+    /// until a frame arrives, the stream is disposed, or
+    /// <paramref name="cancellationToken"/> fires.
+    /// </para>
+    /// <para>
+    /// Sync-over-async safety: the underlying <c>Channel&lt;InboundFrame&gt;</c>
+    /// uses <c>ManualResetValueTaskSourceCore</c> internally with no
+    /// SynchronizationContext capture; awaiting it via
+    /// <c>GetAwaiter().GetResult()</c> blocks the calling thread on a
+    /// kernel signal that the producer (the per-connection
+    /// <c>FrameReaderLoopAsync</c> running on its own dedicated task)
+    /// fires asynchronously. Cannot self-deadlock because consumer and
+    /// producer are on different threads.
+    /// </para>
+    /// </remarks>
+    public InboundFrame? ReceiveFrameSync(CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+
+        if (_inboundFrames.Reader.TryRead(out var frame))
+        {
+            return frame;
+        }
+
+        CancellationToken ct;
+        CancellationTokenSource? linkedCts = null;
+        if (cancellationToken.CanBeCanceled)
+        {
+            linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
+            ct = linkedCts.Token;
+        }
+        else
+        {
+            ct = _disposeCts.Token;
+        }
+
+        try
+        {
+            // ValueTask<bool>: if synchronously completed, read directly; else
+            // block on the underlying Task.
+            var waitTask = _inboundFrames.Reader.WaitToReadAsync(ct);
+            bool hasMore = waitTask.IsCompleted
+                ? waitTask.Result
+                : waitTask.AsTask().GetAwaiter().GetResult();
+
+            if (hasMore && _inboundFrames.Reader.TryRead(out frame))
+            {
+                return frame;
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (ChannelClosedException)
+        {
+        }
+        finally
+        {
+            linkedCts?.Dispose();
+        }
+
+        return null;
+    }
+
     private async Task<InboundFrame?> ReceiveFrameSlowAsync(CancellationToken cancellationToken)
     {
         // Only create LinkedCTS when the caller provided a cancellable token.
