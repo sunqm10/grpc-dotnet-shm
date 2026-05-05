@@ -1156,10 +1156,38 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         // _assembled on the FIRST frame by sniffing the
                         // gRPC LPM compression flag (byte 0).
                         bool firstChunk = _chainHead == null && _assembledPos == 0;
+
+                        // PR2 phase 2.x: multi-frame UNCOMPRESSED messages
+                        // take the LazyChainRos path. Synchronously pulls
+                        // subsequent frames from the channel via
+                        // ShmGrpcStream.ReceiveFrameSync as MergeFrom
+                        // advances. Pool buffer footprint drops from
+                        // O(message-size) to ~2 frames regardless of
+                        // message size.
+                        //
+                        // This branch handles the first-chunk case;
+                        // compressed multi-frame falls through to the
+                        // _assembled accumulation buffer because the
+                        // decompressor needs contiguous storage.
+                        if (firstChunk && frame.Length >= 5 && frame.Memory.Span[0] == 0)
+                        {
+                            var lpmBodyLen = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(
+                                frame.Memory.Span.Slice(1, 4));
+                            if (_maxReceiveMessageSize > 0 && lpmBodyLen > _maxReceiveMessageSize)
+                            {
+                                frame.ReturnToPool();
+                                throw new RpcException(new Status(StatusCode.ResourceExhausted,
+                                    $"Received message exceeds the maximum configured message size " +
+                                    $"({lpmBodyLen} vs {_maxReceiveMessageSize})"));
+                            }
+
+                            return ParseUncompressedMultiFrameLazy(frame, lpmBodyLen);
+                        }
+
                         bool useChain;
                         if (firstChunk)
                         {
-                            useChain = frame.Length >= 5 && frame.Memory.Span[0] == 0;
+                            useChain = false;  // compressed first chunk falls through to _assembled
                         }
                         else
                         {
@@ -1358,6 +1386,79 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                     frame.ReturnToPool();
                     return false;
             }
+        }
+
+        /// <summary>
+        /// Lazy-streaming parse helper: synchronously parses an
+        /// uncompressed multi-frame logical message via
+        /// <see cref="LazyChainRos"/> + <c>MergeFrom(ros)</c>. Pulls
+        /// subsequent frames from the channel via
+        /// <see cref="ShmGrpcStream.ReceiveFrameSync"/>; pool buffer
+        /// footprint is ~2 frames at any instant.
+        /// </summary>
+        /// <returns><c>true</c> always (a complete message was parsed).</returns>
+        private bool ParseUncompressedMultiFrameLazy(
+            InboundFrame firstFrame, int lpmBodyLen)
+        {
+            // Capture EndStream from the LAST pulled frame. The last
+            // frame is the one whose body bytes complete lpmBodyLen.
+            // The puller below tracks this by checking each frame's
+            // Flags and the running cumulative length.
+            bool sawEndStream = false;
+
+            InboundFrame? Pull(CancellationToken pullCt)
+            {
+                var pulled = _stream.ReceiveFrameSync(pullCt);
+                if (pulled is null) return null;
+                if (pulled.Value.Type != FrameType.Message)
+                {
+                    // Non-Message frame mid-LPM-body indicates premature
+                    // termination. Release and treat as truncation.
+                    pulled.Value.ReturnToPool();
+                    return null;
+                }
+                if ((pulled.Value.Flags & MessageFlags.EndStream) != 0)
+                    sawEndStream = true;
+                return pulled.Value;
+            }
+
+            try
+            {
+                using var chain = new LazyChainRos(
+                    firstFrame, firstFrameBodyOffset: 5,
+                    totalBodyLen: lpmBodyLen,
+                    pullNext: Pull,
+                    ct: _stream.DisposeCancellationToken);
+
+                T msg;
+                try
+                {
+                    msg = new T();
+                    Google.Protobuf.MessageExtensions.MergeFrom(msg, chain.Sequence);
+                }
+                catch (Google.Protobuf.InvalidProtocolBufferException ipbex)
+                {
+                    throw new RpcException(new Status(StatusCode.Internal,
+                        $"Failed to parse request message: {ipbex.Message}"));
+                }
+                catch (IOException ioex)
+                {
+                    throw new RpcException(new Status(StatusCode.Internal,
+                        $"Truncated request message: {ioex.Message}"));
+                }
+
+                _current = msg;
+                _previousFrame = default;
+
+                if (sawEndStream)
+                {
+                    _stream.MarkHalfCloseReceived();
+                    _endOfStream = true;
+                }
+                return true;
+            }
+            catch (RpcException) { throw; }
+            catch (OperationCanceledException) { throw; }
         }
 
         public void Dispose()
