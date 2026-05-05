@@ -51,6 +51,90 @@ public readonly struct WriteReservation
 }
 
 /// <summary>
+/// MPSC (multi-producer single-consumer) write slot. Returned by
+/// <see cref="ShmRing.MpscReserveWrite"/>; multiple writers across threads
+/// can hold non-overlapping slots simultaneously and serialize their writes
+/// without synchronisation INSIDE the slot region. Publication order
+/// is enforced at <see cref="Commit"/>.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Lifecycle:
+/// <list type="number">
+///   <item><description><see cref="ShmRing.MpscReserveWrite"/> atomically claims a
+///     <c>[base, base+size)</c> region via CAS on a process-local
+///     <c>_claimedWriteIdx</c>. Returns when the claim succeeds (and ring
+///     space is available; otherwise loops on <see cref="ShmRing.WaitForSpace"/>
+///     against <c>header.ReadIdx</c>).</description></item>
+///   <item><description>Caller writes payload bytes into <see cref="First"/>
+///     / <see cref="Second"/>. No synchronisation needed; the slot is
+///     exclusive to this writer.</description></item>
+///   <item><description>Caller invokes <see cref="Commit"/>. This spins until
+///     <c>header.WriteIdx == base</c> (i.e., all prior claims have published)
+///     and then publishes <c>header.WriteIdx = base + size</c>. The last
+///     writer to leave the in-flight cohort fires <see cref="ShmRing.SignalDataIfNeeded"/>
+///     once for the whole cohort (deferred-signal batching).</description></item>
+///   <item><description>If the caller throws or returns without calling
+///     <see cref="Commit"/>, <see cref="Dispose"/> writes a PAD frame into
+///     the slot and publishes it. Successor writers' publish-spin observes
+///     forward progress; reader skips PAD silently.</description></item>
+/// </list>
+/// </para>
+/// <para>
+/// The struct is mutable to flip <c>_committed</c> from false to true at
+/// commit time, so it must be used via <c>using var</c> or
+/// <c>using (...)</c>; copying it inadvertently would let multiple
+/// consumers race on Commit/Dispose.
+/// </para>
+/// </remarks>
+public struct MpscWriteSlot : IDisposable
+{
+    /// <summary>First contiguous slice (from claimed start to end of ring or requested size).</summary>
+    public Memory<byte> First { get; internal set; }
+
+    /// <summary>Second contiguous slice (from start of ring) — empty when no wrap.</summary>
+    public Memory<byte> Second { get; internal set; }
+
+    /// <summary>Total claimed bytes.</summary>
+    public int Length => First.Length + Second.Length;
+
+    internal ShmRing? Ring { get; set; }
+    internal ulong BaseIdx { get; set; }
+    internal int Size { get; set; }
+    private bool _committed;
+    private bool _disposed;
+
+    /// <summary>
+    /// Publishes the slot to the ring, in claim order.
+    /// Spins until <c>header.WriteIdx == BaseIdx</c>, then advances it by
+    /// <see cref="Size"/>. After the last in-flight publisher returns,
+    /// fires <see cref="ShmRing.SignalDataIfNeeded"/> if any waiters
+    /// registered.
+    /// </summary>
+    public void Commit()
+    {
+        if (_committed) return;
+        if (Ring is null) throw new InvalidOperationException("Slot has no associated ring.");
+        Ring.MpscPublish(BaseIdx, Size, isPad: false);
+        _committed = true;
+    }
+
+    /// <summary>
+    /// Releases the slot. If <see cref="Commit"/> was not called (caller
+    /// threw or cancelled), fills the slot with a PAD frame and publishes
+    /// it so successor writers can advance past this orphan claim.
+    /// </summary>
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        if (_committed) return;
+        if (Ring is null) return;
+        Ring.MpscPublishOrphanAsPad(BaseIdx, Size, First, Second);
+    }
+}
+
+/// <summary>
 /// Represents a read reservation for zero-copy reads from the ring buffer.
 /// </summary>
 public readonly struct ReadReservation
@@ -101,6 +185,37 @@ public sealed class ShmRing : IDisposable
     // DataSeq is still incremented per-frame so spin waiters see updates.
     private int _batchWriteDepth;
 
+    // ===== MPSC writer state (PR2 in progress) =====
+    //
+    // The legacy SPSC writer path (ReserveWrite + CommitWrite +
+    // BeginBatchWrite/EndBatchWrite) presumes a single writer at a time.
+    // The new MPSC path (MpscReserveWrite + MpscWriteSlot.Commit/Dispose)
+    // lets N writers across threads claim non-overlapping slots
+    // concurrently; publication is serialized in claim order via the
+    // publish-spin in MpscPublish.
+    //
+    // Two paths coexist temporarily during PR2 migration. After all
+    // call sites move, the SPSC ReserveWrite/CommitWrite/BatchWrite
+    // surface deletes.
+    //
+    // _claimedWriteIdx: process-local atomic counter. CAS-advanced by
+    //   each MpscReserveWrite. `header.WriteIdx <= _claimedWriteIdx`
+    //   always (writers may have claimed but not yet published).
+    //
+    // _publishersInFlight: count of writers between MpscReserveWrite
+    //   and the corresponding Commit/Dispose+publish. The last writer
+    //   to leave the cohort (`Decrement → 0`) fires the deferred
+    //   SignalData if any was deferred. Same batched-signal semantics
+    //   as today's WriterLoop FlushBatch with one SignalData per batch.
+    //
+    // _pendingSignal: 0 or 1. Set by MpscPublish when a writer commits
+    //   real data (i.e., not a pure PAD). Cleared+fired by the last
+    //   writer out (publishers-in-flight reaches 0) if any waiters are
+    //   registered (header.DataWaiters > 0).
+    private long _claimedWriteIdx;
+    private int _publishersInFlight;
+    private int _pendingSignal;
+
     // Callback invoked during WaitForSpace before blocking, allowing the
     // WriterLoop to drain control frames (e.g. WindowUpdate) that can
     // free space on the remote side and break bidirectional deadlocks.
@@ -139,6 +254,11 @@ public sealed class ShmRing : IDisposable
         // Initialize pending read index from current shared read index
         ref var header = ref GetHeader();
         _pendingReadIdx = Volatile.Read(ref header.ReadIdx);
+
+        // Initialize MPSC claim cursor from the shared write index. On a
+        // fresh segment both are 0; on reconnect the segment may carry
+        // a non-zero value and we must continue past it.
+        _claimedWriteIdx = (long)Volatile.Read(ref header.WriteIdx);
     }
 
     /// <summary>
@@ -965,6 +1085,250 @@ public sealed class ShmRing : IDisposable
                 _sync?.SignalData();
             }
         }
+    }
+
+    // ===== MPSC writer path (PR2) =====
+
+    /// <summary>
+    /// Atomically claims a contiguous <paramref name="size"/>-byte slot in
+    /// the ring for an MPSC writer. Multiple threads may call this
+    /// concurrently; each gets a non-overlapping slot.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The claim cursor (<see cref="_claimedWriteIdx"/>) is process-local
+    /// and CAS-advanced. Ring-space availability is checked against the
+    /// shared <c>header.ReadIdx</c>; if the ring is full, this method
+    /// blocks the calling thread on <see cref="WaitForSpace"/> until the
+    /// reader frees enough bytes.
+    /// </para>
+    /// <para>
+    /// Returned <see cref="MpscWriteSlot"/> MUST be either committed
+    /// (<see cref="MpscWriteSlot.Commit"/>) or disposed
+    /// (<see cref="MpscWriteSlot.Dispose"/>); use the C#
+    /// <c>using var</c> idiom so cancel/throw paths fall through to a
+    /// PAD-frame fill that successor writers' publish-spin can advance
+    /// past. Forgetting to commit-or-dispose pins
+    /// <c>header.WriteIdx</c> at this slot's base forever and stalls
+    /// the connection.
+    /// </para>
+    /// <para>
+    /// Minimum slot size: <see cref="ShmConstants.FrameHeaderSize"/>
+    /// (16 bytes Custom16; H2 callers should size their reservations
+    /// accordingly). The orphan-cleanup path needs at least one
+    /// header's worth of space to write a PAD frame.
+    /// </para>
+    /// </remarks>
+    public MpscWriteSlot MpscReserveWrite(int size, CancellationToken cancellationToken = default)
+    {
+        if (size <= 0)
+        {
+            throw new ArgumentException("Size must be positive", nameof(size));
+        }
+        if ((ulong)size > _capacity)
+        {
+            throw new ArgumentException(
+                $"Size ({size} bytes) exceeds ring capacity ({_capacity} bytes)", nameof(size));
+        }
+
+        ref var header = ref GetHeader();
+
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_localClosed || header.Closed != 0)
+            {
+                throw new RingClosedException();
+            }
+
+            var current = Volatile.Read(ref _claimedWriteIdx);
+            var newClaimed = current + size;
+            var readIdx = (long)Volatile.Read(ref header.ReadIdx);
+            // used = newClaimed - readIdx in 64-bit signed difference. The
+            // reader and writer both wrap at 2^64 in shared shm, but our
+            // local cursor is signed long; on a fresh ring readIdx == 0
+            // and current == 0 and we never reach the half-range needed
+            // to cross the sign boundary in any realistic deployment.
+            if ((ulong)(newClaimed - readIdx) > _capacity)
+            {
+                // Not enough space. Block on SpaceWaiters; reader's
+                // ReadIdx-advance will wake us. WaitForSpace expects a
+                // ulong "needed write idx" relative to header.WriteIdx
+                // semantics; we reuse it by passing newClaimed cast to
+                // ulong (same monotonic counter the reader observes).
+                WaitForSpace(ref header, (ulong)newClaimed, cancellationToken);
+                continue;
+            }
+
+            if (Interlocked.CompareExchange(
+                    ref _claimedWriteIdx, newClaimed, current) != current)
+            {
+                // Another writer raced us; retry.
+                continue;
+            }
+
+            // Claim succeeded. Register as in-flight publisher BEFORE
+            // returning the slot — the matching Decrement happens in
+            // MpscPublish (called by Commit or Dispose).
+            Interlocked.Increment(ref _publishersInFlight);
+
+            var writePos = (ulong)current & _capMask;
+            Memory<byte> first, second;
+            if (writePos + (ulong)size <= _capacity)
+            {
+                first = _memory.Slice(_dataOffset + (int)writePos, size);
+                second = Memory<byte>.Empty;
+            }
+            else
+            {
+                var firstLen = (int)(_capacity - writePos);
+                first = _memory.Slice(_dataOffset + (int)writePos, firstLen);
+                second = _memory.Slice(_dataOffset, size - firstLen);
+            }
+
+            return new MpscWriteSlot
+            {
+                First = first,
+                Second = second,
+                Ring = this,
+                BaseIdx = (ulong)current,
+                Size = size,
+            };
+        }
+    }
+
+    /// <summary>
+    /// Publishes an MPSC slot. Called by <see cref="MpscWriteSlot.Commit"/>
+    /// (real data) or <see cref="MpscWriteSlot.Dispose"/> through
+    /// <see cref="MpscPublishOrphanAsPad"/> (PAD frame on uncommitted
+    /// slot). Spins until <c>header.WriteIdx == baseIdx</c>, then
+    /// advances it by <paramref name="size"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Publish ordering: each writer waits for ALL prior claims to publish.
+    /// Publish-spin is short — each step is a <see cref="Volatile.Write"/>
+    /// of <c>header.WriteIdx</c> (~50 ns). 32 concurrent writers see
+    /// average ~16 × 50 ns = 800 ns wait. <see cref="SpinWait.SpinOnce"/>
+    /// degrades to <c>Thread.Yield</c> and <c>Thread.Sleep(0)</c> on
+    /// stalls (e.g., a publisher pre-empted before publish), so we do
+    /// not livelock under OS preemption.
+    /// </para>
+    /// <para>
+    /// Deferred signal: <c>_pendingSignal</c> is set on every commit
+    /// that wrote real data (PAD-only commits skip it because reader
+    /// already silently skips PAD; signalling for PAD adds a wakeup
+    /// the reader cannot use). The last writer to leave the in-flight
+    /// cohort (<c>_publishersInFlight → 0</c>) drains the pending
+    /// signal once. Equivalent to today's WriterLoop.FlushBatch's
+    /// per-batch SignalData but across ALL concurrent writers, not
+    /// just within a single thread's batch.
+    /// </para>
+    /// </remarks>
+    internal void MpscPublish(ulong baseIdx, int size, bool isPad)
+    {
+        ref var header = ref GetHeader();
+
+        // Spin until prior publishers have advanced WriteIdx to our base.
+        var sw = new SpinWait();
+        while (Volatile.Read(ref header.WriteIdx) != baseIdx)
+        {
+            sw.SpinOnce();
+        }
+
+        // Advance WriteIdx and bump DataSeq so spinning readers see the
+        // change without a kernel signal. PAD frames also bump DataSeq
+        // — the reader will read the PAD header and skip it; the wasted
+        // wakeup is rare (only on cancel/throw paths).
+        Volatile.Write(ref header.WriteIdx, baseIdx + (ulong)size);
+        Interlocked.Increment(ref header.DataSeq);
+
+        // Defer the kernel-level SignalData to the cohort tail. PAD-only
+        // commits do NOT defer a signal: there is no logically new data
+        // for a blocked reader to consume.
+        if (!isPad)
+        {
+            Volatile.Write(ref _pendingSignal, 1);
+        }
+
+        // Last publisher out flushes the deferred signal. The atomic
+        // pair (Decrement → 0, Exchange pendingSignal → 0) ensures
+        // exactly one signal fires per cohort even under N concurrent
+        // writers all decrementing through 0 (only ONE of them sees
+        // _publishersInFlight transition to 0 under Interlocked).
+        var inFlight = Interlocked.Decrement(ref _publishersInFlight);
+        if (inFlight == 0
+            && Interlocked.Exchange(ref _pendingSignal, 0) != 0
+            && Volatile.Read(ref header.DataWaiters) > 0)
+        {
+            _sync?.SignalData();
+        }
+    }
+
+    /// <summary>
+    /// Called from <see cref="MpscWriteSlot.Dispose"/> when the slot was
+    /// never committed (caller threw or cancelled). Fills the slot with
+    /// a Custom16-format PAD frame header and publishes it. The reader
+    /// silently skips PAD frames in both Custom16 and H2 codecs (see
+    /// <see cref="FrameProtocol.ReadFramePayloadCustom16"/> and
+    /// <see cref="Wire.Http2Codec"/>).
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// PAD format: a 16-byte <see cref="FrameHeader"/> with
+    /// <see cref="FrameType.Pad"/>, <c>StreamId = 0</c>, <c>Length =
+    /// size - 16</c>, <c>Flags = 0</c>. The remaining
+    /// <c>size - 16</c> bytes are payload; reader reserves+commits the
+    /// length but does not surface the payload.
+    /// </para>
+    /// <para>
+    /// On H2 wire format we still emit the Custom16-style PAD header
+    /// here: rationale is that PAD frames only fire on cancel/throw
+    /// paths (rare) and the H2 reader's PAD-handling actually skips
+    /// any frame typed PAD regardless of nominal H2 type. Switching to
+    /// an H2 PRIORITY frame (RFC 7540 §6.3, deprecated, ignored on
+    /// receive) would require knowing the wire format here — which
+    /// would break the ring-level abstraction. If a real H2 peer ever
+    /// receives this Custom16 PAD it would error; but real H2 peers
+    /// don't share this ring (they would speak H2 over TCP, not SHM).
+    /// </para>
+    /// </remarks>
+    internal void MpscPublishOrphanAsPad(
+        ulong baseIdx, int size, Memory<byte> first, Memory<byte> second)
+    {
+        // Minimum size = FrameHeaderSize. Caller guarantees this via the
+        // MpscReserveWrite size argument (every legitimate frame request
+        // is at least one header).
+        if (size >= ShmConstants.FrameHeaderSize)
+        {
+            var hdr = new FrameHeader(
+                FrameType.Pad,
+                streamId: 0,
+                length: (uint)(size - ShmConstants.FrameHeaderSize),
+                flags: 0);
+            // Header lives in `first` (always at least FrameHeaderSize
+            // bytes contiguous because reserves of < ring-cap can wrap
+            // but always have ≥ headerSize at the start as long as
+            // size ≥ headerSize).
+            if (first.Length >= ShmConstants.FrameHeaderSize)
+            {
+                hdr.EncodeTo(first.Span);
+            }
+            else
+            {
+                // Wrap point sits inside the header. Encode to a stack
+                // span and split the copy.
+                Span<byte> headerBytes = stackalloc byte[ShmConstants.FrameHeaderSize];
+                hdr.EncodeTo(headerBytes);
+                headerBytes[..first.Length].CopyTo(first.Span);
+                headerBytes[first.Length..].CopyTo(second.Span);
+            }
+        }
+        // else: caller asked for < 16 bytes — invariant violation;
+        // publish without writing anything; reader will OOB on the next
+        // Pad header parse (which is a connection-fatal error anyway).
+
+        MpscPublish(baseIdx, size, isPad: true);
     }
 
     /// <summary>

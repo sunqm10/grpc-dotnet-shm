@@ -463,4 +463,144 @@ public class RingBufferTests
 
         ring.SingleStreamMode = true;
         Assert.That(ring.ChainZcBudget, Is.GreaterThanOrEqualTo(0L));
-    }}
+    }
+
+    // ===== MPSC writer primitives (PR2) =====
+
+    [Test]
+    public void MpscReserve_SingleWriter_PublishesAndAdvancesWriteIdx()
+    {
+        // Smoke: a single MpscReserveWrite + Commit advances header.WriteIdx
+        // by exactly the requested size, with no contention.
+        const int Cap = 4096;
+        var memory = new byte[ShmConstants.RingHeaderSize + Cap];
+        using var ring = new ShmRing(memory, 0, Cap);
+
+        const int Size = 128;
+        using (var slot = ring.MpscReserveWrite(Size))
+        {
+            Assert.That(slot.Length, Is.EqualTo(Size));
+            // Caller would write framing bytes here. For this primitive
+            // test we just verify the slot is well-formed and Commit
+            // advances state.
+            slot.Commit();
+        }
+        Assert.That(ring.GetState().WriteIdx, Is.EqualTo((ulong)Size));
+    }
+
+    [Test]
+    public void MpscReserve_TwoConcurrentWriters_PublishInClaimOrder()
+    {
+        // Two threads claim concurrently; verify that header.WriteIdx
+        // advances to the SUM of their sizes (no double-publish, no
+        // gap, no regression). The publish-order spin in MpscPublish
+        // should serialize their commits.
+        const int Cap = 64 * 1024;
+        var memory = new byte[ShmConstants.RingHeaderSize + Cap];
+        using var ring = new ShmRing(memory, 0, Cap);
+
+        const int SizeA = 256;
+        const int SizeB = 512;
+        var startGate = new System.Threading.ManualResetEventSlim(false);
+
+        var taskA = System.Threading.Tasks.Task.Run(() =>
+        {
+            startGate.Wait();
+            using var s = ring.MpscReserveWrite(SizeA);
+            // Simulate work: just commit.
+            s.Commit();
+        });
+        var taskB = System.Threading.Tasks.Task.Run(() =>
+        {
+            startGate.Wait();
+            using var s = ring.MpscReserveWrite(SizeB);
+            s.Commit();
+        });
+        startGate.Set();
+        Assert.That(System.Threading.Tasks.Task.WhenAll(taskA, taskB)
+            .Wait(TimeSpan.FromSeconds(5)), Is.True);
+
+        Assert.That(ring.GetState().WriteIdx, Is.EqualTo((ulong)(SizeA + SizeB)),
+            "Both publishers must have advanced WriteIdx; serial order is enforced by publish-spin.");
+    }
+
+    [Test]
+    public void MpscReserve_DisposeWithoutCommit_FillsPadAndAllowsSuccessor()
+    {
+        // Writer A reserves but throws/cancels before Commit. Dispose
+        // must fill the slot with a PAD frame and publish so writer B
+        // can advance. This is the cancel/throw recovery path.
+        const int Cap = 4096;
+        var memory = new byte[ShmConstants.RingHeaderSize + Cap];
+        using var ring = new ShmRing(memory, 0, Cap);
+
+        // Slot A: claim and dispose without commit (simulates throw).
+        const int SizeA = 64;
+        {
+            using var slotA = ring.MpscReserveWrite(SizeA);
+            // No Commit — `using` triggers Dispose → PAD + publish.
+        }
+
+        // Slot B: claim should succeed and publish atop A's PAD.
+        const int SizeB = 32;
+        using (var slotB = ring.MpscReserveWrite(SizeB))
+        {
+            slotB.Commit();
+        }
+
+        Assert.That(ring.GetState().WriteIdx, Is.EqualTo((ulong)(SizeA + SizeB)),
+            "B must commit immediately after A's PAD without retrying.");
+
+        // Reader must observe a PAD frame at offset 0 (skipped silently
+        // by FrameProtocol.ReadFramePayloadCustom16) and then B's
+        // bytes. We don't fully drive the reader here — that path is
+        // exercised in other tests; we just verify ring state.
+    }
+
+    [Test]
+    public void MpscPublish_DeferredSignal_OneSignalForCohort()
+    {
+        // Multiple writers commit in quick succession; verify that the
+        // ring's DataSeq advances per commit (so spin readers see each
+        // frame) but the kernel-level SignalData fires AT MOST ONCE for
+        // the whole cohort when no waiter is registered. We assert
+        // DataSeq advance count == commit count, i.e., per-commit
+        // visibility is preserved (spin readers function).
+        //
+        // The "at most one signal" assertion is harder to test from
+        // here without instrumenting IRingSync; covered by integration
+        // / micro-bench in Phase 3.
+        const int Cap = 64 * 1024;
+        var memory = new byte[ShmConstants.RingHeaderSize + Cap];
+        using var ring = new ShmRing(memory, 0, Cap);
+
+        var seq0 = ring.GetState().DataSeq;
+        const int NumWrites = 5;
+        const int Size = 100;
+        for (int i = 0; i < NumWrites; i++)
+        {
+            using var s = ring.MpscReserveWrite(Size);
+            s.Commit();
+        }
+        var seqAfter = ring.GetState().DataSeq;
+        Assert.That(seqAfter - seq0, Is.EqualTo((uint)NumWrites),
+            "DataSeq advances once per commit so spin readers observe progress.");
+        Assert.That(ring.GetState().WriteIdx, Is.EqualTo((ulong)(NumWrites * Size)));
+    }
+
+    [Test]
+    public void MpscReserve_OversizedClaim_Throws()
+    {
+        const int Cap = 256;
+        var memory = new byte[ShmConstants.RingHeaderSize + Cap];
+        using var ring = new ShmRing(memory, 0, Cap);
+
+        Assert.Throws<ArgumentException>(
+            () => ring.MpscReserveWrite(Cap + 1));
+        Assert.Throws<ArgumentException>(
+            () => ring.MpscReserveWrite(0));
+        Assert.Throws<ArgumentException>(
+            () => ring.MpscReserveWrite(-1));
+    }
+}
+
