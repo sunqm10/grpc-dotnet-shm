@@ -31,8 +31,11 @@ public readonly struct FramePayload
     private readonly byte[]? _pooledBuffer;
 
     // Speculative: ring ref + reserved bytes for safety margin release.
+    // Phase Y per-frame ZC: ring + slot index (>= 0). Legacy single-anchor
+    // ZC: ring + reservedBytes; _anchorSlot = -1.
     private readonly ShmRing? _speculativeRing;
     private readonly int _speculativeBytes;
+    private readonly int _anchorSlot;   // Phase Y FIFO slot, or -1 for legacy/non-ZC
 
     public ReadOnlyMemory<byte> Memory { get; }
 
@@ -47,12 +50,13 @@ public readonly struct FramePayload
     public bool IsSpeculativeZeroCopy => _speculativeRing != null;
 
     private FramePayload(ReadOnlyMemory<byte> memory, byte[]? pooledBuffer,
-        ShmRing? speculativeRing = null, int speculativeBytes = 0)
+        ShmRing? speculativeRing = null, int speculativeBytes = 0, int anchorSlot = -1)
     {
         Memory = memory;
         _pooledBuffer = pooledBuffer;
         _speculativeRing = speculativeRing;
         _speculativeBytes = speculativeBytes;
+        _anchorSlot = anchorSlot;
     }
 
     public static FramePayload FromPooled(byte[] buffer, int length)
@@ -61,13 +65,36 @@ public readonly struct FramePayload
     }
 
     /// <summary>
-    /// Creates a speculative zero-copy payload. CommitRead has already been
-    /// called and SpeculativeReservedBytes incremented. Release decrements
-    /// SpeculativeReservedBytes to restore writer capacity.
+    /// Creates a speculative zero-copy payload using the LEGACY single-anchor
+    /// protocol. CommitRead has already been called and
+    /// SpeculativeReservedBytes incremented. Release decrements
+    /// SpeculativeReservedBytes and fires EndZcReservation when the chain
+    /// is closed and the count hits zero.
     /// </summary>
+    /// <remarks>
+    /// Phase Y migration: codec sites should switch to
+    /// <see cref="FromRingZcAnchor"/>. This factory remains for the chain-
+    /// anchor paths still in flight (Custom16 / H2 chain-ZC) until Y.3-Y.4
+    /// migrate them.
+    /// </remarks>
     internal static FramePayload FromRingMemorySpeculative(ReadOnlyMemory<byte> memory, ShmRing ring, int reservedBytes)
     {
-        return new FramePayload(memory, null, speculativeRing: ring, speculativeBytes: reservedBytes);
+        return new FramePayload(memory, null,
+            speculativeRing: ring, speculativeBytes: reservedBytes, anchorSlot: -1);
+    }
+
+    /// <summary>
+    /// Phase Y per-frame ZC payload. <paramref name="anchorSlot"/> is the
+    /// FIFO slot index returned by <see cref="ShmRing.TryBeginPerFrameZc"/>;
+    /// <see cref="Release"/> calls <see cref="ShmRing.ReleasePerFrameZc"/>
+    /// which marks the slot released and triggers FIFO drain. Cross-process
+    /// <c>header.ReadIdx</c> only advances after the FIFO head drains,
+    /// preserving the no-wrap-onto-held-bytes invariant.
+    /// </summary>
+    internal static FramePayload FromRingZcAnchor(ReadOnlyMemory<byte> memory, ShmRing ring, int anchorSlot)
+    {
+        return new FramePayload(memory, null,
+            speculativeRing: ring, speculativeBytes: 0, anchorSlot: anchorSlot);
     }
 
     public void Release()
@@ -77,39 +104,25 @@ public readonly struct FramePayload
             ArrayPool<byte>.Shared.Return(_pooledBuffer);
         }
 
-        // Restore writer capacity by releasing the speculative reservation.
-        if (_speculativeRing != null)
+        if (_speculativeRing == null) return;
+
+        if (_anchorSlot >= 0)
         {
-            // Decrement the per-ring speculative byte count first. This is
-            // an atomic operation; the value returned is the post-decrement
-            // count.
-            //
-            // EndZcReservation must fire EXACTLY ONCE per chain anchor —
-            // once <c>SpeculativeReservedBytes</c> hits 0 AND the codec
-            // has already closed the chain (<c>!IsChainOpen</c>). Two
-            // possibilities at the moment we fire:
-            //
-            //   - Single-frame ZC (no chain opened): <c>IsChainOpen</c> is
-            //     false at all times; we always EndZc when the only frame's
-            //     bytes are released.
-            //   - Multi-frame chain ZC: codec opened the chain on the first
-            //     frame (<c>IsChainOpen=true</c>), closes it on the final
-            //     frame's emit. Consumer Releases fire in arbitrary order.
-            //     Without the <c>!IsChainOpen</c> gate, the FIRST Release
-            //     would tear down the anchor (clearing <c>_zcActive</c>),
-            //     stranding the still-in-flight chain frames whose data
-            //     would be overwritten by the cross-process writer.
-            //
-            // The <c>(remaining == 0 &amp;&amp; !IsChainOpen)</c> condition
-            // is checked atomically per Release; only one Release will see
-            // both true (the last one chronologically that is also after
-            // codec's CloseZcChain).
-            var remaining = Interlocked.Add(
-                ref _speculativeRing.SpeculativeReservedBytes, -_speculativeBytes);
-            if (remaining == 0 && !_speculativeRing.IsChainOpen)
-            {
-                _speculativeRing.EndZcReservation();
-            }
+            // Phase Y per-frame ZC: release the FIFO slot. Drain logic
+            // CAS-advances header.ReadIdx in FIFO order; out-of-order
+            // releases are stashed until the head drains.
+            _speculativeRing.ReleasePerFrameZc(_anchorSlot);
+            return;
+        }
+
+        // Legacy single-anchor: decrement SpeculativeReservedBytes; the
+        // last-out release fires EndZcReservation iff the codec has also
+        // closed any in-flight chain (chain-ZC for multi-frame messages).
+        var remaining = Interlocked.Add(
+            ref _speculativeRing.SpeculativeReservedBytes, -_speculativeBytes);
+        if (remaining == 0 && !_speculativeRing.IsChainOpen)
+        {
+            _speculativeRing.EndZcReservation();
         }
     }
 }
