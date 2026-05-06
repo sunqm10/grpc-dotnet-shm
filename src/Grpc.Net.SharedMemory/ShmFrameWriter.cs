@@ -220,9 +220,29 @@ internal sealed class ShmFrameWriter : IDisposable
         // Single-frame threshold: payload ≤ cap/3 → WriteTo(Span) direct ring write.
         // Kept high to maximize speculative zero-copy on the reader side.
         var singleFrameThreshold = Math.Max(1, cap / 3);
-        // Multi-frame chunk size: cap/8 for deeper pipeline (~8 chunks in-flight).
-        // More reader/writer overlap reduces WaitForSpace stalls on large messages.
-        var chunkSize = Math.Max(1, cap / 8);
+        // Multi-frame chunk size = cap / chunkDiv. Default chunkDiv=8
+        // gives 8 frames in flight — enough to absorb LazyChainRos's
+        // 3-anchor sliding window plus producer headroom on a 1MiB ring.
+        //
+        // CRITICAL safety floor: chunkDiv must be >= 6 (giving ≥6 frames
+        // in flight). With LazyChainRos holding 3 anchors during multi-
+        // frame parsing, anchor-bound frames consume 3 of the ring's slots
+        // and the producer needs at least 2-3 slots of headroom; smaller
+        // divisors deadlock when message size > ring (producer waits for
+        // space, anchors hold readIdx, parser waits for next frame from
+        // producer — circular wait). See benchmark/dump analysis on
+        // 64MB / 1MiB / chunkDiv=4.
+        //
+        // RINGBENCH_CHUNK_DIVISOR override is allowed only for >=6 to
+        // explore smaller chunks (deeper pipeline + smaller per-frame
+        // overhead) — the regime where pipeline depth helps most.
+        var chunkDiv = 8;
+        var envDiv = Environment.GetEnvironmentVariable("RINGBENCH_CHUNK_DIVISOR");
+        if (!string.IsNullOrEmpty(envDiv) && int.TryParse(envDiv, out var d) && d >= 6 && d <= 256)
+        {
+            chunkDiv = d;
+        }
+        var chunkSize = Math.Max(1, cap / chunkDiv);
 
         // HTTP/2 hard limit (RFC 7540 §4.2 / §6.5.2): per-frame payload must
         // fit in 24 bits (≤ 2^24 - 1). Cap both thresholds below that so a
