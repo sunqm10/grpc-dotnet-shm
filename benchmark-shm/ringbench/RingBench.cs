@@ -306,6 +306,7 @@ async Task<BenchEnv> StartShmEnvCore(bool preferHttp2, string transportTag)
                 {
                     SingleStreamMode = ShmBenchConfig.SingleStream,
                     PreferHttp2 = preferHttp2,
+                    RingCapacity = GetRingCapacity(),
                 }),
             DisposeHttpClient = true,
             MaxReceiveMessageSize = 512 * 1024 * 1024,
@@ -559,7 +560,7 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
     Segment.TryRemoveSegment(segmentName);
     Segment.TryRemoveSegment(segmentName + "_ctl");
 
-    var server = new ShmGrpcServer(segmentName, ringCapacity: 64 * 1024 * 1024, singleStreamMode: ShmBenchConfig.SingleStream, pooledDeserialization: true,
+    var server = new ShmGrpcServer(segmentName, ringCapacity: GetRingCapacity(), singleStreamMode: ShmBenchConfig.SingleStream, pooledDeserialization: true,
         maxReceiveMessageSize: 0); // unlimited for benchmark
 
     server.MapUnary<SimpleRequest, SimpleResponse>(
@@ -578,7 +579,7 @@ static async Task RunServerModeAsync(string transport, int port, string? segment
             }
         });
 
-    Console.WriteLine($"[SERVER] SHM ready on segment: {segmentName}");
+    Console.WriteLine($"[SERVER] SHM ready on segment: {segmentName} ringCap={GetRingCapacity() / (1024 * 1024)}MiB");
     try
     {
         await server.RunAsync(cts.Token).ConfigureAwait(false);
@@ -703,6 +704,21 @@ static async Task UnaryCallWithHardTimeoutAsync(
 
 const int IterationMultiplier = 3;
 const int LargePayloadIterationMultiplier = 2;
+
+// SHM ring capacity (per direction, so total per connection = 2 × this).
+// RINGBENCH_RING_BYTES env var overrides the default for ring-size sweeps.
+// Both server-side ShmGrpcServer and client-side ShmClientTransportOptions
+// pick this up so cross-process MAP_SHARED dimensions match.
+static ulong GetRingCapacity()
+{
+    var s = Environment.GetEnvironmentVariable("RINGBENCH_RING_BYTES");
+    if (!string.IsNullOrWhiteSpace(s)
+        && ulong.TryParse(s, out var v) && v >= 4096)
+    {
+        return v;
+    }
+    return 64UL * 1024 * 1024;
+}
 
 static int IterationsForSize(int size)
 {
