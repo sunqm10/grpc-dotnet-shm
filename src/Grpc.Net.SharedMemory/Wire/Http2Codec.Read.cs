@@ -426,18 +426,34 @@ internal static partial class Http2Codec
 
         var totalBytes = Http2FrameHeader.Size + payloadLen;
 
+        // === Phase X: chain-ZC continuation. ===
+        //
+        // Checked BEFORE the fast path so chain-mode streams short-
+        // circuit straight to <see cref="ReadChainContinuation"/>; once
+        // the chain anchor is open, every continuation DATA must ride
+        // it to LPM completion (fast-path single-DATA inspection would
+        // be wrong here because the anchor lifecycle is per-LPM, not
+        // per-DATA).
+        var hasAcc = TryGetAcc(state, streamId, out var existingAcc);
+        if (hasAcc && existingAcc!.ChainMode)
+        {
+            return ReadChainContinuation(
+                ring, baseCommitReadIdx, payloadReservation, existingAcc,
+                streamId, padded, bodyOffset, bodyLength,
+                totalBytes, endStream, state);
+        }
+
         // === Fast path: single complete LPM message in this DATA frame, ===
         // === no accumulator state, contiguous body. Eligible for zero-copy. ===
-        // PR2 phase 2.5: "hasAccumulator" means the accumulator has
-        // either started parsing the LPM header (HeaderBytesSeen > 0)
-        // or has begun emitting chunks for the current LPM
-        // (HeaderEmittedAsChunk == true). The fast path is only safe
-        // when no LPM is in progress; if the accumulator already has
-        // partial state we MUST take the slow path so the new bytes
-        // continue the in-progress LPM.
-        var hasAccumulator = TryGetAcc(state, streamId, out var existingAcc)
+        // <c>hasSlowPathAcc</c> indicates a slow-path LPM is in progress
+        // (the peer fragmented the 5-byte LPM header across DATA frames
+        // — extremely rare given our writer always emits the header
+        // intact in the first chunk, but possible with non-SHM peers).
+        // Chain-mode accumulators were already routed above, so they
+        // never reach this check.
+        var hasSlowPathAcc = hasAcc
             && (existingAcc!.HeaderBytesSeen > 0 || existingAcc.HeaderEmittedAsChunk);
-        if (!hasAccumulator && bodyLength >= 5 && payloadReservation.Second.IsEmpty)
+        if (!hasSlowPathAcc && bodyLength >= 5 && payloadReservation.Second.IsEmpty)
         {
             var bodySpan = payloadReservation.First.Span.Slice(bodyOffset, bodyLength);
             var declaredLpmBody = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(bodySpan.Slice(1, 4));
@@ -458,10 +474,8 @@ internal static partial class Http2Codec
                 if (zeroCopy && bodyOffset == 0
                     && ring.IsSpeculativeZcEligible(bodyLength, contiguous: payloadReservation.Second.IsEmpty))
                 {
-                    // Fused single-frame ZC: see FrameProtocol hot-path
-                    // comment. H2 reader only does single-frame ZC (multi-
-                    // frame H2 messages always go through the LpmAccumulator
-                    // copy path), so the fused commit is always safe here.
+                    // Single-frame ZC on the call's only DATA. Phase X's
+                    // chain-ZC handles multi-DATA LPMs separately below.
                     ring.BeginSingleFrameZcCommit(baseCommitReadIdx, totalBytes);
                     Interlocked.Add(ref ring.SpeculativeReservedBytes, totalBytes);
                     return (hdr, FramePayload.FromRingMemorySpeculative(
@@ -473,10 +487,11 @@ internal static partial class Http2Codec
                 ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
                 return (hdr, FramePayload.FromPooled(pooled, bodyLength));
             }
-            // Falls through to slow path: more bytes needed, or multiple LPMs in this frame.
+            // Falls through: the DATA carries a partial LPM (chain-ZC
+            // first-frame candidate) or coalesced multi-LPM (slow path).
         }
 
-        // === Phase X: chain-ZC for multi-frame LPM. ===
+        // === Phase X: chain-ZC first frame for a multi-DATA LPM. ===
         //
         // Mirrors Custom16's chain-ZC mechanism: open ONE anchor on the
         // LPM's first DATA frame, every continuation DATA piggy-backs
@@ -494,40 +509,18 @@ internal static partial class Http2Codec
         // the pool-copy slow path. No deadlock; just a graceful
         // performance degradation for the second concurrent stream.
         //
-        // Continuation handling (<c>existingAcc.ChainMode == true</c>)
-        // is mandatory once the anchor is open: switching mid-LPM to
-        // pool copy would still work for byte delivery (CommitReadRaw
-        // routes additively into the anchor's deferred target while
-        // IsZcChainActive), but switching to the FeedAccumulator
-        // chunk-emit slow path would NOT — it manages its own state
-        // disjoint from the chain anchor's. So mid-LPM in chain mode
-        // we stay on the chain path even if a particular DATA wraps
-        // (degraded copy below).
-        if (existingAcc != null && existingAcc.ChainMode)
-        {
-            return ReadChainContinuation(
-                ring, baseCommitReadIdx, payloadReservation, existingAcc,
-                streamId, padded, bodyOffset, bodyLength,
-                totalBytes, endStream, state);
-        }
-
-        // First DATA of a multi-frame LPM: try to open a chain anchor.
-        //
         // Eligibility (all must hold):
         //   - ZC enabled for this read
         //   - !padded (PADDED DATA's body is non-contiguous within the
         //     reservation; cleanly unsupported in chain mode)
-        //   - !hasAccumulator (no prior in-progress LPM state)
-        //   - bodyLength >= 5 (full LPM length-prefix in this DATA;
-        //     peer-fragmented header is a slow-path case)
+        //   - !hasSlowPathAcc (no peer-fragmented LPM header in flight)
+        //   - bodyLength >= 5 (full LPM length-prefix in this DATA)
         //   - First-slice contiguous (Second.IsEmpty)
-        //   - bodyLength < totalLpm: the LPM does NOT fit in one DATA,
-        //     so chain mode is needed (single-DATA LPMs go via the
-        //     fast path above)
+        //   - bodyLength < totalLpm: the LPM does NOT fit in one DATA
         //   - totalLpm <= ChainZcBudget: prevents starving the writer
         //   - IsSpeculativeZcEligible(payloadLen): adaptive thresholds,
         //     back-pressure auto-degrade, and the at-most-one-ZC gate
-        if (zeroCopy && !padded && !hasAccumulator
+        if (zeroCopy && !padded && !hasSlowPathAcc
             && bodyLength >= 5
             && payloadReservation.Second.IsEmpty)
         {
@@ -552,17 +545,15 @@ internal static partial class Http2Codec
                     }
 
                     var acc = GetOrAddAcc(state, streamId);
+                    // Phase X tracking: BodyEmitted counts body bytes
+                    // (excluding the 5-byte LPM header) delivered so far;
+                    // ChainMode flips the per-stream branch into chain
+                    // continuation mode. Slow-path fields (HeaderBuf /
+                    // HeaderBytesSeen / HeaderEmittedAsChunk) are NOT
+                    // touched: chain mode short-circuits all slow-path
+                    // logic via the ChainMode check at function entry.
                     acc.ExpectedBodyLen = (int)declaredLpmBody;
                     acc.BodyEmitted = bodyLength - 5;
-                    // Mark the accumulator as in-progress so any future
-                    // re-entry into TryReadDataFrame for this stream takes
-                    // the ChainMode continuation branch above. The slow-path
-                    // fields (HeaderBytesSeen, HeaderEmittedAsChunk) are
-                    // also set so that a later ChainMode reset (e.g. after
-                    // a wrap-degraded close) leaves the slow-path
-                    // bookkeeping in a consistent state.
-                    acc.HeaderBytesSeen = 5;
-                    acc.HeaderEmittedAsChunk = true;
                     acc.ChainMode = true;
 
                     ring.BeginZcReservation(baseCommitReadIdx);
@@ -604,10 +595,22 @@ internal static partial class Http2Codec
             // back-to-back (writer-side coalescing — common when peers
             // batch small messages, and explicitly allowed by gRFC G3).
             //
-            // PR2 phase 2.5: chunk-emit semantics. Each call to
-            // <see cref="FeedAccumulator"/> emits AT MOST one MESSAGE
-            // chunk covering whatever body bytes were consumed in this
-            // call. Chunks are flagged via:
+            // This is the FALLBACK path. Phase X handles the dominant
+            // multi-DATA single-LPM case via chain-ZC above (zero codec
+            // memcpys); we reach this slow path only when:
+            //   - sub-1MiB ring: ZC adaptive threshold disables ZC
+            //     entirely (see ShmRing.IsSpeculativeZcEligible)
+            //   - chain anchor already held by another concurrent
+            //     stream (at-most-one-ZC gate)
+            //   - peer fragments the 5-byte LPM length-prefix across
+            //     multiple DATA frames (rare; our writer never does this)
+            //   - peer coalesces multiple LPMs in one DATA frame
+            //   - first DATA arrives with PADDED flag (SHM peer never
+            //     emits these; only relevant for non-SHM interop)
+            //
+            // Chunk-emit semantics. Each call to <see cref="FeedAccumulator"/>
+            // emits AT MOST one MESSAGE chunk covering whatever body
+            // bytes were consumed in this call. Chunks are flagged via:
             //
             //   - <see cref="MessageFlags.More"/>: set on chunks that do
             //     NOT complete an LPM (mid-LPM continuation). Cleared on
@@ -618,24 +621,15 @@ internal static partial class Http2Codec
             //
             //   - <see cref="MessageFlags.EndStream"/>: set on the LAST
             //     chunk emitted by this DATA frame, IF the H2 frame's
-            //     END_STREAM flag is set. Same buffered-tail pattern as
-            //     the legacy single-emit code.
-            //
-            // EndStream semantics: the H2 frame's END_STREAM flag applies
-            // logically to whichever chunk is the LAST one this DATA
-            // frame produces. To stamp it correctly without patching a
-            // queued entry after the fact, we hold the most recent
-            // post-first emission in <c>bufferedTail</c> and enqueue it
-            // only when another emission overtakes it.
+            //     END_STREAM flag is set. To stamp it correctly without
+            //     patching a queued entry after the fact, we hold the
+            //     most recent post-first emission in <c>bufferedTail</c>
+            //     and enqueue it only when another emission overtakes it.
             //
             // Allocation profile is one ArrayPool.Rent per emitted chunk.
-            // For the common single-LPM-per-DATA path that's still one
-            // pool buffer per DATA frame (matches the legacy path's one
-            // big buffer per LPM, just split). For multi-DATA single-LPM
-            // it's now N small buffers vs the legacy 1 large buffer —
-            // but the upstream lazy-chain consumer releases each as the
-            // parser advances, so total in-flight pool footprint drops
-            // from O(LPM size) to ~2 chunks.
+            // The upstream lazy-chain consumer releases each as the
+            // parser advances, keeping in-flight pool footprint to ~2
+            // chunks regardless of LPM size.
             var acc = GetOrAddAcc(state, streamId);
             FramePayload? firstEmitted = null;
             bool firstEmittedLpmComplete = false;
