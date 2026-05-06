@@ -436,6 +436,30 @@ public sealed class ShmRing : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal int TryBeginPerFrameZc(ulong baseIdx, int size)
     {
+        // Compatibility overload: derive endIdx from caller-supplied
+        // baseIdx + size. Callers in the production codec paths pass
+        // headerReservation.CommitReadIdx + totalBytes, which is WRONG
+        // when earlier ZC anchors hold the publish (CommitReadIdx is
+        // stale). Production callers must use the new
+        // <see cref="TryBeginPerFrameZc(ulong)"/> overload that takes the
+        // exact post-frame ring position. This shape remains for unit
+        // tests that directly stage anchor lifecycle scenarios without
+        // going through ReserveRead.
+        return TryBeginPerFrameZc(baseIdx + (ulong)size);
+    }
+
+    /// <summary>
+    /// Allocates a per-frame ZC anchor whose EndIdx is
+    /// <paramref name="endIdx"/> (the exact ring position immediately
+    /// after this frame's bytes). Production callers obtain this from
+    /// <see cref="PeekPendingReadIdx"/> after both header and payload
+    /// reservations have advanced the local pending cursor; this avoids
+    /// the staleness of <c>headerReservation.CommitReadIdx</c> while
+    /// earlier anchors hold the published <c>header.ReadIdx</c>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal int TryBeginPerFrameZc(ulong endIdx)
+    {
         var slots = _zcSlots;
         if (slots == null) return -1; // not initialised
 
@@ -459,16 +483,15 @@ public sealed class ShmRing : IDisposable
         // in-flight anchors.
         ref var hdr = ref GetHeader();
         var readIdx = Volatile.Read(ref hdr.ReadIdx);
-        var newEndIdx = baseIdx + (ulong)size;
-        // newEndIdx >= readIdx is invariant (anchors commit forward).
+        // endIdx >= readIdx is invariant (anchors commit forward).
         // Strict > so the boundary case (exactly 75%) is allowed,
         // mirroring the slot-count gate which permits 75% of slot
         // capacity to be in-flight before refusing.
-        var anchoredBytes = newEndIdx - readIdx;
+        var anchoredBytes = endIdx - readIdx;
         if (anchoredBytes * 4 > _capacity * 3) return -1;
 
         var slot = (int)(tail & (uint)_slotMask);
-        slots[slot].EndIdx = newEndIdx;
+        slots[slot].EndIdx = endIdx;
         Volatile.Write(ref slots[slot].Released, false);
         Volatile.Write(ref _zcSlotsTail, tail + 1);
         return slot;
@@ -489,17 +512,30 @@ public sealed class ShmRing : IDisposable
     /// </remarks>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal void CommitReadAnchored(ulong baseIdx, int size)
+        => CommitReadAnchoredCore(baseIdx + (ulong)size);
+
+    /// <summary>
+    /// Production-path entry: caller has already advanced
+    /// <c>_pendingReadIdx</c> via ReserveRead, and the frame's exact
+    /// post-bytes ring position is <paramref name="endIdx"/>. This avoids
+    /// the staleness of <c>headerReservation.CommitReadIdx</c> when
+    /// earlier ZC anchors hold the published <c>header.ReadIdx</c>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void CommitReadAnchored(ulong endIdx) => CommitReadAnchoredCore(endIdx);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void CommitReadAnchoredCore(ulong target)
     {
         var head = Volatile.Read(ref _zcSlotsHead);
         var tail = Volatile.Read(ref _zcSlotsTail);
         if (head == tail)
         {
             ref var hdr = ref GetHeader();
-            PublishTarget(ref hdr, baseIdx + (ulong)size);
+            PublishTarget(ref hdr, target);
             SignalSpaceAvailability(ref hdr);
             return;
         }
-        var target = baseIdx + (ulong)size;
         while (true)
         {
             var cur = Volatile.Read(ref _pendingNonZcMax);

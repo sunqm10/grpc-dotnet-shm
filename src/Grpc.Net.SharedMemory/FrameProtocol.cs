@@ -92,7 +92,7 @@ public static class FrameProtocol
             // allocations or block forever trying to read from the ring.
             if (header.Length > MaxFramePayloadSize)
             {
-                ring.CommitReadAnchored(baseCommitReadIdx, ShmConstants.FrameHeaderSize);
+                ring.CommitReadAnchored(ring.PeekPendingReadIdx());
                 throw new InvalidDataException(
                     $"Frame payload length {header.Length} exceeds maximum {MaxFramePayloadSize}. " +
                     "This may indicate data corruption in the shared memory ring buffer.");
@@ -100,7 +100,7 @@ public static class FrameProtocol
 
             if (!Enum.IsDefined(header.Type) && header.Type != FrameType.Pad)
             {
-                ring.CommitReadAnchored(baseCommitReadIdx, ShmConstants.FrameHeaderSize);
+                ring.CommitReadAnchored(ring.PeekPendingReadIdx());
                 throw new InvalidDataException(
                     $"Unknown frame type 0x{(byte)header.Type:X2} with length {header.Length}. " +
                     "This may indicate data corruption in the shared memory ring buffer.");
@@ -112,18 +112,18 @@ public static class FrameProtocol
                 if (header.Length > 0)
                 {
                     var padReservation = ring.ReserveRead((int)header.Length, cancellationToken);
-                    ring.CommitReadAnchored(baseCommitReadIdx, ShmConstants.FrameHeaderSize + (int)header.Length);
+                    ring.CommitReadAnchored(ring.PeekPendingReadIdx());
                 }
                 else
                 {
-                    ring.CommitReadAnchored(baseCommitReadIdx, ShmConstants.FrameHeaderSize);
+                    ring.CommitReadAnchored(ring.PeekPendingReadIdx());
                 }
                 continue;
             }
 
             if (header.Length == 0)
             {
-                ring.CommitReadAnchored(baseCommitReadIdx, ShmConstants.FrameHeaderSize);
+                ring.CommitReadAnchored(ring.PeekPendingReadIdx());
                 return (header, FramePayload.Empty);
             }
 
@@ -149,7 +149,16 @@ public static class FrameProtocol
             if (zeroCopy && contiguous && ring.IsZcEligibleForAnchor(payloadLength, contiguous: true))
             {
                 ring.EnsureZcAnchorFifo();
-                var slot = ring.TryBeginPerFrameZc(baseCommitReadIdx, totalBytes);
+                // Pass the EXACT post-frame ring position (from
+                // _pendingReadIdx, advanced by both ReserveRead calls
+                // above). Using baseCommitReadIdx + totalBytes is wrong
+                // when earlier ZC anchors hold header.ReadIdx — the stale
+                // baseCommitReadIdx silently shrinks slot.EndIdx and the
+                // FIFO drain under-advances readIdx, leaking ring bytes
+                // each iteration until the writer blocks forever in
+                // WaitForSpace.
+                var endIdx = ring.PeekPendingReadIdx();
+                var slot = ring.TryBeginPerFrameZc(endIdx);
                 if (slot >= 0)
                 {
                     return (header, FramePayload.FromRingZcAnchor(
@@ -174,7 +183,7 @@ public static class FrameProtocol
             {
                 CopyFromReservation(payloadReservation, pooled.AsSpan(0, payloadLength));
             }
-            ring.CommitReadAnchored(baseCommitReadIdx, totalBytes);
+            ring.CommitReadAnchored(ring.PeekPendingReadIdx());
             return (header, FramePayload.FromPooled(pooled, payloadLength));
         }
     }
