@@ -946,6 +946,12 @@ public class Http2CodecTests
     }
 
     [Test]
+    [Ignore("Phase X chain-ZC test asserting IsZcChainActive / chain-anchor lifecycle. " +
+            "Phase Y replaces chain-anchor with per-frame ZC anchor FIFO; the " +
+            "specific anchor-state semantics this test verifies are no longer present. " +
+            "Will be deleted in Y.5 (legacy code removal). The functional case (multi-" +
+            "frame LPM each chunk surfaces with correct More flag) is covered by " +
+            "Http2WireFormatE2ETests.")]
     public void Data_MultiFrameLpm_OpensChainZcAndSurfacesAllChunks()
     {
         // Phase X: a gRPC LPM whose body exceeds the H2 frame limit (or
@@ -1079,6 +1085,10 @@ public class Http2CodecTests
     }
 
     [Test]
+    [Ignore("Phase X test asserting CloseZcChain semantics on RST_STREAM mid-LPM. " +
+            "Phase Y has no chain anchor; per-frame anchors release independently " +
+            "via the FIFO. RST cleanup correctness is covered by DiscardStreamState " +
+            "+ FIFO drain. Will be deleted in Y.5.")]
     public void Data_ChainZc_RstStreamMidLpm_ClosesAnchorCleanly()
     {
         // Phase X cleanup invariant: an RST_STREAM that arrives while a

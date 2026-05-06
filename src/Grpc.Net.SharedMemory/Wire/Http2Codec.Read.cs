@@ -238,24 +238,20 @@ internal static partial class Http2Codec
     /// abandons an in-progress LPM.
     /// </summary>
     /// <remarks>
-    /// <see cref="ShmRing.CloseZcChain"/> is idempotent and gated on
-    /// <c>chainOpen</c>, so calling it when the stream's accumulator is
-    /// not in <see cref="LpmAccumulator.ChainMode"/> is a safe no-op.
-    /// We only fire it when <c>ChainMode == true</c> to avoid spurious
-    /// races against another stream's anchor (the ring serialises
-    /// anchors via the at-most-one-ZC gate, but cross-process ordering
-    /// is still cheaper to skip when not needed).
+    /// Phase Y: per-frame ZC anchors are independently released by their
+    /// FramePayload.Release; there is no shared chain anchor to close
+    /// here. We just wipe the per-stream state and let the consumer's
+    /// outstanding FramePayloads drain the FIFO naturally as they release.
+    /// (The legacy <c>CloseZcChain</c> path was needed because chain-ZC
+    /// gated readIdx publish on <c>!IsChainOpen</c>; per-frame ZC has no
+    /// such gate.)
     /// </remarks>
     private static void DiscardStreamState(ShmRing ring, Http2DecoderState state, uint streamId)
     {
         state.StreamsWithInitialHeaders.Remove(streamId);
         if (RemoveAcc(state, streamId, out var stale))
         {
-            if (stale!.ChainMode)
-            {
-                ring.CloseZcChain();
-            }
-            stale.Reset();
+            stale!.Reset();
         }
     }
 
@@ -290,7 +286,7 @@ internal static partial class Http2Codec
 
             if (payloadLen > MaxH2FramePayloadSize)
             {
-                ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size);
+                ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size);
                 throw new InvalidDataException(
                     $"H2 frame payload length {payloadLen} exceeds maximum {MaxH2FramePayloadSize}");
             }
@@ -338,7 +334,7 @@ internal static partial class Http2Codec
                     {
                         var _ = ring.ReserveRead((int)payloadLen, cancellationToken);
                     }
-                    ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+                    ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
                     throw new InvalidDataException(
                         "H2 CONTINUATION frame received outside a HEADERS sequence (RFC 7540 §6.10)");
 
@@ -347,16 +343,16 @@ internal static partial class Http2Codec
                     if (payloadLen > 0)
                     {
                         var skipReservation = ring.ReserveRead((int)payloadLen, cancellationToken);
-                        ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+                        ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
                     }
                     else
                     {
-                        ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size);
+                        ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size);
                     }
                     continue;
 
                 default:
-                    ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+                    ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
                     throw new InvalidDataException($"Unknown H2 frame type 0x{(byte)h2Type:X}");
             }
         }
@@ -389,7 +385,7 @@ internal static partial class Http2Codec
 
         if (payloadLen == 0)
         {
-            ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size);
+            ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size);
             // Empty DATA: only meaningful when END_STREAM is set (closes stream).
             // No body to feed to the LPM accumulator.
             if (endStream)
@@ -419,7 +415,7 @@ internal static partial class Http2Codec
             bodyLength = payloadLen - 1 - padLenByte;
             if (bodyLength < 0)
             {
-                ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+                ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
                 throw new InvalidDataException("H2 DATA pad length exceeds payload");
             }
         }
@@ -472,54 +468,42 @@ internal static partial class Http2Codec
                 }
 
                 if (zeroCopy && bodyOffset == 0
-                    && ring.IsSpeculativeZcEligible(bodyLength, contiguous: payloadReservation.Second.IsEmpty))
+                    && ring.IsZcEligibleForAnchor(bodyLength, contiguous: payloadReservation.Second.IsEmpty))
                 {
-                    // Single-frame ZC on the call's only DATA. Phase X's
-                    // chain-ZC handles multi-DATA LPMs separately below.
-                    ring.BeginSingleFrameZcCommit(baseCommitReadIdx, totalBytes);
-                    Interlocked.Add(ref ring.SpeculativeReservedBytes, totalBytes);
-                    return (hdr, FramePayload.FromRingMemorySpeculative(
-                        payloadReservation.First.Slice(0, bodyLength), ring, totalBytes));
+                    // Phase Y: per-frame ZC anchor. The FIFO's drain
+                    // protocol guarantees header.ReadIdx never advances
+                    // past held bytes (see ShmRing.DrainReleasedAnchors).
+                    ring.EnsureZcAnchorFifo();
+                    var slot = ring.TryBeginPerFrameZc(baseCommitReadIdx, totalBytes);
+                    if (slot >= 0)
+                    {
+                        return (hdr, FramePayload.FromRingZcAnchor(
+                            payloadReservation.First.Slice(0, bodyLength), ring, slot));
+                    }
+                    // FIFO at >=75% capacity: fall through to copy.
                 }
 
                 var pooled = ArrayPool<byte>.Shared.Rent(bodyLength);
                 bodySpan.CopyTo(pooled);
-                ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
+                ring.CommitReadAnchored(baseCommitReadIdx, totalBytes);
                 return (hdr, FramePayload.FromPooled(pooled, bodyLength));
             }
             // Falls through: the DATA carries a partial LPM (chain-ZC
             // first-frame candidate) or coalesced multi-LPM (slow path).
         }
 
-        // === Phase X: chain-ZC first frame for a multi-DATA LPM. ===
+        // === Phase Y: per-frame ZC for first DATA of a multi-DATA LPM. ===
         //
-        // Mirrors Custom16's chain-ZC mechanism: open ONE anchor on the
-        // LPM's first DATA frame, every continuation DATA piggy-backs
-        // the same anchor (no per-frame BeginZcReservation), close on
-        // the last DATA. Eligibility is decided ONCE on the first DATA;
-        // <see cref="LpmAccumulator.ChainMode"/> carries the decision
-        // through the rest of the LPM.
+        // Replaces Phase X's chain-anchor pattern with per-frame anchors:
+        // each DATA frame independently decides ZC vs copy via the FIFO,
+        // no shared anchor lifecycle. This unlocks ZC for cases that
+        // chain-ZC could not handle (totalLpm > ChainZcBudget — e.g.
+        // 256 MB LPM on a 1 MiB ring).
         //
-        // Multi-stream concurrency: ShmRing supports a single in-flight
-        // ZC anchor per ring (the "at-most-one-ZC" check inside
-        // <see cref="ShmRing.IsSpeculativeZcEligible"/> rejects on
-        // SpeculativeReservedBytes > 0). When stream A holds a chain
-        // anchor and stream B's first multi-frame DATA arrives, B's
-        // <c>IsSpeculativeZcEligible</c> returns false, B falls back to
-        // the pool-copy slow path. No deadlock; just a graceful
-        // performance degradation for the second concurrent stream.
-        //
-        // Eligibility (all must hold):
-        //   - ZC enabled for this read
-        //   - !padded (PADDED DATA's body is non-contiguous within the
-        //     reservation; cleanly unsupported in chain mode)
-        //   - !hasSlowPathAcc (no peer-fragmented LPM header in flight)
-        //   - bodyLength >= 5 (full LPM length-prefix in this DATA)
-        //   - First-slice contiguous (Second.IsEmpty)
-        //   - bodyLength < totalLpm: the LPM does NOT fit in one DATA
-        //   - totalLpm <= ChainZcBudget: prevents starving the writer
-        //   - IsSpeculativeZcEligible(payloadLen): adaptive thresholds,
-        //     back-pressure auto-degrade, and the at-most-one-ZC gate
+        // Eligibility: ZC enabled, contiguous, !padded, full LPM header
+        // visible (bodyLength >= 5), this DATA is NOT the entire LPM
+        // (bodyLength < totalLpm — single-LPM-in-DATA goes through the
+        // fast path above), and the per-frame ZC threshold is met.
         if (zeroCopy && !padded && !hasSlowPathAcc
             && bodyLength >= 5
             && payloadReservation.Second.IsEmpty)
@@ -530,45 +514,46 @@ internal static partial class Http2Codec
             {
                 var totalLpm = (long)declaredLpmBody + 5L;
                 if (totalLpm > bodyLength
-                    && totalLpm <= ring.ChainZcBudget
-                    && ring.IsSpeculativeZcEligible(payloadLength: payloadLen, contiguous: true))
+                    && ring.IsZcEligibleForAnchor(payloadLength: payloadLen, contiguous: true))
                 {
                     // END_STREAM on the LPM's first DATA frame, but the LPM
                     // declares more body than this DATA delivers, is a peer
-                    // protocol error. Reject before allocating a chain anchor.
+                    // protocol error.
                     if (endStream)
                     {
-                        ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
+                        ring.CommitReadAnchored(baseCommitReadIdx, totalBytes);
                         throw new InvalidDataException(
                             $"H2 stream {streamId}: END_STREAM set on first DATA but LPM declares " +
                             $"{declaredLpmBody} body bytes, only {bodyLength - 5} delivered.");
                     }
 
-                    var acc = GetOrAddAcc(state, streamId);
-                    // Phase X tracking: BodyEmitted counts body bytes
-                    // (excluding the 5-byte LPM header) delivered so far;
-                    // ChainMode flips the per-stream branch into chain
-                    // continuation mode. Slow-path fields (HeaderBuf /
-                    // HeaderBytesSeen / HeaderEmittedAsChunk) are NOT
-                    // touched: chain mode short-circuits all slow-path
-                    // logic via the ChainMode check at function entry.
-                    acc.ExpectedBodyLen = (int)declaredLpmBody;
-                    acc.BodyEmitted = bodyLength - 5;
-                    acc.ChainMode = true;
+                    // Try to allocate a FIFO slot for this frame. If the
+                    // FIFO is back-pressure-disabled (>=75% full), fall
+                    // through to the slow copy path so readIdx stays
+                    // unblocked.
+                    ring.EnsureZcAnchorFifo();
+                    var slot = ring.TryBeginPerFrameZc(baseCommitReadIdx, totalBytes);
+                    if (slot >= 0)
+                    {
+                        var acc = GetOrAddAcc(state, streamId);
+                        // Phase Y: per-stream LPM progress tracking. ChainMode
+                        // historically meant "chain anchor open"; under per-frame
+                        // ZC it means "an LPM is in progress for this stream"
+                        // — used by the continuation branch above to short-
+                        // circuit fast-path inspection.
+                        acc.ExpectedBodyLen = (int)declaredLpmBody;
+                        acc.BodyEmitted = bodyLength - 5;
+                        acc.ChainMode = true;
 
-                    ring.BeginZcReservation(baseCommitReadIdx);
-                    ring.OpenZcChain();
-                    Interlocked.Add(ref ring.SpeculativeReservedBytes, totalBytes);
-                    ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
-
-                    var chainHdr = new FrameHeader(FrameType.Message, streamId,
-                        (uint)bodyLength, MessageFlags.More);
-                    return (chainHdr, FramePayload.FromRingMemorySpeculative(
-                        payloadReservation.First.Slice(0, bodyLength), ring, totalBytes));
+                        var chainHdr = new FrameHeader(FrameType.Message, streamId,
+                            (uint)bodyLength, MessageFlags.More);
+                        return (chainHdr, FramePayload.FromRingZcAnchor(
+                            payloadReservation.First.Slice(0, bodyLength), ring, slot));
+                    }
                 }
             }
-            // Falls through to slow path: budget exceeded, ring saturated,
-            // anchor already held by another stream, or coalesced multi-LPM.
+            // Falls through to slow path: bigger-than-frame budget OK,
+            // ring saturated, FIFO full, or coalesced multi-LPM.
         }
 
         // === Slow path: copy body into the per-stream LPM accumulator. ===
@@ -699,7 +684,7 @@ internal static partial class Http2Codec
                 }
 
                 // Commit the ring read regardless — we've materialised everything we need.
-                ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
+                ring.CommitReadAnchored(baseCommitReadIdx, totalBytes);
                 ringCommitted = true;
             }
             finally
@@ -713,7 +698,7 @@ internal static partial class Http2Codec
                     // <see cref="ShmRing.CommitReadRaw"/> on the shared
                     // <c>header.ReadIdx</c>. Defense in depth: keep the
                     // two indices in sync at all exit points.
-                    try { ring.CommitReadRaw(baseCommitReadIdx, totalBytes); }
+                    try { ring.CommitReadAnchored(baseCommitReadIdx, totalBytes); }
                     catch { /* swallow during exception unwind */ }
 
                     firstEmitted?.Release();
@@ -988,74 +973,65 @@ internal static partial class Http2Codec
         var newEmitted = acc.BodyEmitted + bodyLength;
         if (5L + newEmitted > totalLpm)
         {
-            // Peer wrote bytes beyond the declared LPM body. Splitting a
-            // single ring reservation across multiple Message frames is
-            // not supported in chain mode (ZC ring slices are
-            // single-release), so this is a hard error. Close the
-            // anchor before throwing so the ring's readIdx can resume
-            // advancing.
-            ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
-            // Order matters: close the chain anchor BEFORE wiping the
-            // accumulator, so DiscardStreamState's CloseZcChain check
-            // does not fire a second time. ChainMode flips to false
-            // inside acc.Reset() (called by DiscardStreamState).
-            ring.CloseZcChain();
-            acc.ChainMode = false; // prevent double-close in DiscardStreamState
+            // Peer sent more body bytes than the LPM declared. Hard error;
+            // wipe state and surface InvalidDataException.
+            ring.CommitReadAnchored(baseCommitReadIdx, totalBytes);
             DiscardStreamState(ring, state, streamId);
             throw new InvalidDataException(
-                $"H2 stream {streamId}: chain DATA frame extends beyond LPM body " +
+                $"H2 stream {streamId}: continuation DATA frame extends beyond LPM body " +
                 $"({5L + newEmitted} > {totalLpm} expected).");
         }
 
         var isLast = (5L + newEmitted) == totalLpm;
         var contiguous = payloadReservation.Second.IsEmpty;
 
-        // === Contiguous (ZC) continuation — common case ===
-        if (contiguous && !padded)
+        // === Phase Y: per-frame ZC continuation. ===
+        // Each continuation DATA independently allocates its own FIFO slot.
+        // No shared chain anchor; release order is enforced by the FIFO
+        // drain logic, not by a "must close chain on last frame" contract.
+        if (contiguous && !padded
+            && ring.IsZcEligibleForAnchor(bodyLength, contiguous: true))
         {
-            Interlocked.Add(ref ring.SpeculativeReservedBytes, totalBytes);
-            ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
-
-            if (isLast)
+            ring.EnsureZcAnchorFifo();
+            var slot = ring.TryBeginPerFrameZc(baseCommitReadIdx, totalBytes);
+            if (slot >= 0)
             {
-                ring.CloseZcChain();
-                acc.Reset();
-                if (endStream)
+                if (isLast)
                 {
-                    state.StreamsWithInitialHeaders.Remove(streamId);
+                    acc.Reset();
+                    if (endStream)
+                    {
+                        state.StreamsWithInitialHeaders.Remove(streamId);
+                    }
                 }
-            }
-            else if (endStream)
-            {
-                // Capture diagnostic state BEFORE Reset clears the fields
-                // referenced in the error message (PR2 bug A).
-                var diagExpected = acc.ExpectedBodyLen;
-                ring.CloseZcChain();
-                acc.Reset();
-                state.StreamsWithInitialHeaders.Remove(streamId);
-                throw new InvalidDataException(
-                    $"H2 stream {streamId} ended mid-LPM (chain ZC continuation, " +
-                    $"body {newEmitted}/{diagExpected}).");
-            }
-            else
-            {
-                acc.BodyEmitted = newEmitted;
-            }
+                else if (endStream)
+                {
+                    var diagExpected = acc.ExpectedBodyLen;
+                    acc.Reset();
+                    state.StreamsWithInitialHeaders.Remove(streamId);
+                    // Already allocated the slot; release it before throwing
+                    // so its bytes don't permanently hold the FIFO head.
+                    ring.ReleasePerFrameZc(slot);
+                    throw new InvalidDataException(
+                        $"H2 stream {streamId} ended mid-LPM (per-frame ZC continuation, " +
+                        $"body {newEmitted}/{diagExpected}).");
+                }
+                else
+                {
+                    acc.BodyEmitted = newEmitted;
+                }
 
-            byte msgFlags = (byte)(isLast ? 0 : MessageFlags.More);
-            if (isLast && endStream) msgFlags |= MessageFlags.EndStream;
-            var hdr = new FrameHeader(FrameType.Message, streamId,
-                (uint)bodyLength, msgFlags);
-            return (hdr, FramePayload.FromRingMemorySpeculative(
-                payloadReservation.First.Slice(0, bodyLength), ring, totalBytes));
+                byte msgFlags = (byte)(isLast ? 0 : MessageFlags.More);
+                if (isLast && endStream) msgFlags |= MessageFlags.EndStream;
+                var hdr = new FrameHeader(FrameType.Message, streamId,
+                    (uint)bodyLength, msgFlags);
+                return (hdr, FramePayload.FromRingZcAnchor(
+                    payloadReservation.First.Slice(0, bodyLength), ring, slot));
+            }
+            // FIFO at >=75% capacity: fall through to copy.
         }
 
-        // === Degraded (pool copy) continuation — wrap or PADDED ===
-        // Anchor stays open; CommitReadRaw under IsZcChainActive routes
-        // additively into _deferredReadIdxTarget so the anchor's
-        // post-chain target accumulates correctly. CloseZcChain on the
-        // last DATA still triggers EndZcReservation when the upstream
-        // consumer's last Release brings SpeculativeReservedBytes to 0.
+        // === Copy continuation — wrap, PADDED, or FIFO back-pressured ===
         var pooled = ArrayPool<byte>.Shared.Rent(bodyLength == 0 ? 1 : bodyLength);
         try
         {
@@ -1067,11 +1043,10 @@ internal static partial class Http2Codec
             {
                 CopyFromReservationSlice(payloadReservation, bodyOffset, pooled.AsSpan(0, bodyLength));
             }
-            ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
+            ring.CommitReadAnchored(baseCommitReadIdx, totalBytes);
 
             if (isLast)
             {
-                ring.CloseZcChain();
                 acc.Reset();
                 if (endStream)
                 {
@@ -1080,14 +1055,11 @@ internal static partial class Http2Codec
             }
             else if (endStream)
             {
-                // Capture diagnostic state BEFORE Reset clears the fields
-                // referenced in the error message (PR2 bug A).
                 var diagExpected = acc.ExpectedBodyLen;
-                ring.CloseZcChain();
                 acc.Reset();
                 state.StreamsWithInitialHeaders.Remove(streamId);
                 throw new InvalidDataException(
-                    $"H2 stream {streamId} ended mid-LPM (chain copy continuation, " +
+                    $"H2 stream {streamId} ended mid-LPM (per-frame copy continuation, " +
                     $"body {newEmitted}/{diagExpected}).");
             }
             else
@@ -1120,7 +1092,7 @@ internal static partial class Http2Codec
         // Empty HEADERS w/ END_HEADERS: trivial path.
         if (endHeaders && payloadLen == 0)
         {
-            ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size);
+            ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size);
             return EmitDecodedHeaders(ReadOnlySpan<byte>.Empty, streamId, state, endStream);
         }
 
@@ -1137,7 +1109,7 @@ internal static partial class Http2Codec
                 var payloadReservation = ring.ReserveRead(payloadLen, ct);
                 CopyFromReservationSlice(payloadReservation, 0, firstFragment.AsSpan(0, payloadLen));
             }
-            ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+            ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
 
             firstHeaderBlockOffset = 0;
             firstHeaderBlockLength = payloadLen;
@@ -1215,7 +1187,7 @@ internal static partial class Http2Codec
 
                 if (contPayloadLen > MaxH2FramePayloadSize)
                 {
-                    ring.CommitReadRaw(contBaseIdx, Http2FrameHeader.Size);
+                    ring.CommitReadAnchored(contBaseIdx, Http2FrameHeader.Size);
                     throw new InvalidDataException(
                         $"H2 frame payload length {contPayloadLen} exceeds maximum {MaxH2FramePayloadSize}");
                 }
@@ -1227,7 +1199,7 @@ internal static partial class Http2Codec
                     {
                         var _ = ring.ReserveRead(contPayloadLen, ct);
                     }
-                    ring.CommitReadRaw(contBaseIdx, Http2FrameHeader.Size + contPayloadLen);
+                    ring.CommitReadAnchored(contBaseIdx, Http2FrameHeader.Size + contPayloadLen);
                     throw new InvalidDataException(
                         $"H2 expected CONTINUATION (type=9) for stream {streamId}, got type=0x{(byte)contType:X2}");
                 }
@@ -1237,7 +1209,7 @@ internal static partial class Http2Codec
                     {
                         var _ = ring.ReserveRead(contPayloadLen, ct);
                     }
-                    ring.CommitReadRaw(contBaseIdx, Http2FrameHeader.Size + contPayloadLen);
+                    ring.CommitReadAnchored(contBaseIdx, Http2FrameHeader.Size + contPayloadLen);
                     throw new InvalidDataException(
                         $"H2 CONTINUATION streamId mismatch (expected {streamId}, got {contStreamId})");
                 }
@@ -1249,7 +1221,7 @@ internal static partial class Http2Codec
                     {
                         var _ = ring.ReserveRead(contPayloadLen, ct);
                     }
-                    ring.CommitReadRaw(contBaseIdx, Http2FrameHeader.Size + contPayloadLen);
+                    ring.CommitReadAnchored(contBaseIdx, Http2FrameHeader.Size + contPayloadLen);
                     throw new InvalidDataException(
                         $"H2 HEADERS+CONTINUATION cumulative payload exceeds {MaxHeaderListSize} bytes");
                 }
@@ -1272,7 +1244,7 @@ internal static partial class Http2Codec
                         contReservation, 0,
                         assembled.AsSpan(assembledLen, contPayloadLen));
                 }
-                ring.CommitReadRaw(contBaseIdx, Http2FrameHeader.Size + contPayloadLen);
+                ring.CommitReadAnchored(contBaseIdx, Http2FrameHeader.Size + contPayloadLen);
                 assembledLen += contPayloadLen;
 
                 if ((contFlags & Http2Flags.EndHeaders) != 0)
@@ -1380,14 +1352,14 @@ internal static partial class Http2Codec
             {
                 var _ = ring.ReserveRead(payloadLen, ct);
             }
-            ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+            ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
             throw new InvalidDataException(
                 $"H2 RST_STREAM malformed (streamId={streamId}, payloadLen={payloadLen}; require streamId != 0 && payloadLen == 4)");
         }
 
         // Drain payload (4 bytes error code; we don't propagate the code).
         var _drain = ring.ReserveRead(payloadLen, ct);
-        ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+        ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
 
         // Clean up all per-stream state. A pending LPM accumulator may still
         // hold a pooled buffer; calling Reset() returns it to ArrayPool to
@@ -1415,7 +1387,7 @@ internal static partial class Http2Codec
             {
                 var _ = ring.ReserveRead(payloadLen, ct);
             }
-            ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+            ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
             throw new InvalidDataException(
                 $"H2 SETTINGS frame must have streamId=0 (got {streamId})");
         }
@@ -1441,11 +1413,11 @@ internal static partial class Http2Codec
                 {
                     var _ = ring.ReserveRead(payloadLen, ct);
                 }
-                ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+                ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
                 throw new InvalidDataException(
                     $"H2 SETTINGS ACK frame must have empty payload (got {payloadLen} bytes)");
             }
-            ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size);
+            ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size);
             return;
         }
 
@@ -1457,7 +1429,7 @@ internal static partial class Http2Codec
             {
                 var _ = ring.ReserveRead(payloadLen, ct);
             }
-            ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+            ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
             throw new InvalidDataException(
                 $"H2 SETTINGS frame payload length {payloadLen} is not a multiple of 6");
         }
@@ -1468,7 +1440,7 @@ internal static partial class Http2Codec
         {
             var _ = ring.ReserveRead(payloadLen, ct);
         }
-        ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+        ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
 
         // SETTINGS ACK is intentionally NOT emitted from this read path.
         //
@@ -1498,7 +1470,7 @@ internal static partial class Http2Codec
             {
                 var _ = ring.ReserveRead(payloadLen, ct);
             }
-            ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+            ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
             throw new InvalidDataException(
                 $"H2 PING malformed (streamId={streamId}, payloadLen={payloadLen}; require streamId == 0 && payloadLen == 8)");
         }
@@ -1506,7 +1478,7 @@ internal static partial class Http2Codec
         var payloadReservation = ring.ReserveRead(payloadLen, ct);
         var pooled = ArrayPool<byte>.Shared.Rent(payloadLen);
         CopyFromReservationSlice(payloadReservation, 0, pooled.AsSpan(0, payloadLen));
-        ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+        ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
 
         var ack = (h2Flags & Http2Flags.Ack) != 0;
         var hdr = new FrameHeader(ack ? FrameType.Pong : FrameType.Ping, 0, (uint)payloadLen, 0);
@@ -1526,7 +1498,7 @@ internal static partial class Http2Codec
             {
                 var _ = ring.ReserveRead(payloadLen, ct);
             }
-            ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+            ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
             throw new InvalidDataException(
                 $"H2 GOAWAY malformed (streamId={streamId}, payloadLen={payloadLen}; require streamId == 0 && payloadLen >= 8)");
         }
@@ -1534,7 +1506,7 @@ internal static partial class Http2Codec
         var payloadReservation = ring.ReserveRead(payloadLen, ct);
         var pooled = ArrayPool<byte>.Shared.Rent(payloadLen);
         CopyFromReservationSlice(payloadReservation, 0, pooled.AsSpan(0, payloadLen));
-        ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+        ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
 
         // Internal GoAway payload is just a UTF-8 debug string. Skip the 8-byte header.
         var debugLen = payloadLen - 8;
@@ -1559,14 +1531,14 @@ internal static partial class Http2Codec
             {
                 var _ = ring.ReserveRead(payloadLen, ct);
             }
-            ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+            ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
             throw new InvalidDataException($"H2 WINDOW_UPDATE frame payload length {payloadLen} != 4");
         }
 
         var payloadReservation = ring.ReserveRead(payloadLen, ct);
         Span<byte> raw = stackalloc byte[4];
         CopyFromReservationSlice(payloadReservation, 0, raw);
-        ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+        ring.CommitReadAnchored(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
 
         // RFC 7540 §6.9.1: increment MUST be a non-zero 31-bit value.
         // Zero is a stream-error / connection-error PROTOCOL_ERROR (a peer
