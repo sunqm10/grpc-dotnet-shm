@@ -443,14 +443,32 @@ public sealed class ShmRing : IDisposable
         var head = Volatile.Read(ref _zcSlotsHead);
         var inUse = (int)(tail - head);
 
-        // Back-pressure self-disable: if FIFO is >=75% full, refuse ZC.
-        // This bounds the worst-case "consumer holds head, producer can't
-        // advance readIdx" scenario to 75% of ring capacity; beyond that we
-        // force copy-path so readIdx keeps advancing.
+        // Back-pressure self-disable (slot count): if FIFO is >=75% full,
+        // refuse ZC. Bounds in-flight slot count even if frames are tiny.
         if (inUse * 4 >= _slotCapacity * 3) return -1;
 
+        // Back-pressure self-disable (bytes): if granting this anchor would
+        // hold ring bytes >= capacity * 3/4 between header.ReadIdx and the
+        // new anchor's EndIdx, refuse ZC. Without this gate, large frames
+        // (e.g. 128 KiB chunks on a 1 MiB ring or 8 MiB chunks on a 64 MiB
+        // ring) can fill the entire ring with held anchors, leaving the
+        // writer with no space to commit the next frame and the consumer
+        // waiting for that next frame — a circular deadlock. The legacy
+        // single-anchor design had this bound implicitly (always 1 frame
+        // held); Phase Y's FIFO must enforce it explicitly across multiple
+        // in-flight anchors.
+        ref var hdr = ref GetHeader();
+        var readIdx = Volatile.Read(ref hdr.ReadIdx);
+        var newEndIdx = baseIdx + (ulong)size;
+        // newEndIdx >= readIdx is invariant (anchors commit forward).
+        // Strict > so the boundary case (exactly 75%) is allowed,
+        // mirroring the slot-count gate which permits 75% of slot
+        // capacity to be in-flight before refusing.
+        var anchoredBytes = newEndIdx - readIdx;
+        if (anchoredBytes * 4 > _capacity * 3) return -1;
+
         var slot = (int)(tail & (uint)_slotMask);
-        slots[slot].EndIdx = baseIdx + (ulong)size;
+        slots[slot].EndIdx = newEndIdx;
         Volatile.Write(ref slots[slot].Released, false);
         Volatile.Write(ref _zcSlotsTail, tail + 1);
         return slot;
