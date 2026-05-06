@@ -220,20 +220,9 @@ internal sealed class ShmFrameWriter : IDisposable
         // Single-frame threshold: payload ≤ cap/3 → WriteTo(Span) direct ring write.
         // Kept high to maximize speculative zero-copy on the reader side.
         var singleFrameThreshold = Math.Max(1, cap / 3);
-        // Multi-frame chunk size: cap/N for ~N chunks in-flight pipeline.
-        // Default N=8 is a balance of pipeline depth (more = better
-        // producer/consumer overlap, fewer WaitForSpace stalls) vs per-
-        // frame fixed overhead (futex wake, async state machine, FIFO
-        // bookkeeping ~= constant per frame regardless of payload size).
-        // RINGBENCH_CHUNK_DIVISOR env var overrides for sweep experiments;
-        // unset → default 8.
-        var chunkDiv = 8;
-        var envDiv = Environment.GetEnvironmentVariable("RINGBENCH_CHUNK_DIVISOR");
-        if (!string.IsNullOrEmpty(envDiv) && int.TryParse(envDiv, out var d) && d >= 2 && d <= 256)
-        {
-            chunkDiv = d;
-        }
-        var chunkSize = Math.Max(1, cap / chunkDiv);
+        // Multi-frame chunk size: cap/8 for deeper pipeline (~8 chunks in-flight).
+        // More reader/writer overlap reduces WaitForSpace stalls on large messages.
+        var chunkSize = Math.Max(1, cap / 8);
 
         // HTTP/2 hard limit (RFC 7540 §4.2 / §6.5.2): per-frame payload must
         // fit in 24 bits (≤ 2^24 - 1). Cap both thresholds below that so a
