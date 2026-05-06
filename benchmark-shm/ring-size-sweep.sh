@@ -34,11 +34,15 @@ OUT_DIR="${1:-/tmp/ring-sweep}"
 BENCH_DLL="$REPO_ROOT/benchmark-shm/ringbench/bin/Release/net10.0/RingBench.dll"
 REPEAT="${RINGBENCH_REPEAT:-1}"
 
-# Sizes spanning small (single-frame fast path) through ChainZcBudget
-# boundary cases. 64KB / 1MB stresses single-frame ZC; 16MB stresses
-# multi-DATA H2 chunking and tests Phase X chain-ZC; 64MB exceeds
-# many ring caps and exercises the per-frame-copy fallback.
-PAYLOAD_SIZES="65536,1048576,16777216,67108864"
+# Sizes spanning small (single-frame fast path) through worst-case
+# message-size-vastly-exceeds-ring-capacity (256 MB on a 4 MiB ring
+# stresses the chunk-emit slow path with deep chunking — the consumer
+# must drain the ring fast enough to keep the writer from stalling on
+# WaitForSpace). 64KB / 1MB stresses single-frame ZC; 16MB stresses
+# multi-DATA H2 chunking and tests Phase X chain-ZC; 64MB / 256MB
+# exceeds most ring caps and exercises the per-frame-copy fallback
+# under sustained pressure.
+PAYLOAD_SIZES="65536,1048576,16777216,67108864,268435456"
 
 # Ring capacities: 1MiB is the ZC adaptive-threshold floor — anything
 # below disables ZC entirely. 64MiB is today's default. 256MiB explores
