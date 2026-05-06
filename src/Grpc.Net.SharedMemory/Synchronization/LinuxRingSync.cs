@@ -150,6 +150,30 @@ internal sealed partial class LinuxRingSync : IRingSync
             return true; // Value already changed, no need to wait
         }
 
+        // Wake-on-cancel: the futex syscall blocks until the value
+        // changes (FUTEX_WAKE from our paired SignalData/Space/Contig)
+        // or the optional timeout elapses. Without this registration a
+        // CancellationToken with no timeout would never propagate into
+        // the syscall — Cancel() only sets a managed flag, no
+        // FUTEX_WAKE is emitted, so the waiter parks forever. Register
+        // a callback that fires FUTEX_WAKE on this address; the wait
+        // returns 0 (woken) and the caller's
+        // <c>IsCancellationRequested</c> guard upstream throws.
+        // <see cref="CancellationToken.UnsafeRegister"/> skips
+        // ExecutionContext capture (we don't allocate inside the
+        // callback, so flow-suppress is safe and a few ns faster).
+        var addrPtr = (IntPtr)addr;
+        using var registration = cancellationToken.CanBeCanceled
+            ? cancellationToken.UnsafeRegister(static state =>
+            {
+                unsafe
+                {
+                    var a = (uint*)((IntPtr)state!).ToPointer();
+                    futex(a, FUTEX_WAKE, 1, null, null, 0);
+                }
+            }, addrPtr)
+            : default;
+
         if (timeout.HasValue)
         {
             var ts = new Timespec
