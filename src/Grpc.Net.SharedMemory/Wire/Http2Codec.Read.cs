@@ -584,7 +584,7 @@ internal static partial class Http2Codec
             // multi-DATA single-LPM case via chain-ZC above (zero codec
             // memcpys); we reach this slow path only when:
             //   - sub-1MiB ring: ZC adaptive threshold disables ZC
-            //     entirely (see ShmRing.IsSpeculativeZcEligible)
+            //     entirely (see ShmRing.IsZcEligibleForAnchor)
             //   - chain anchor already held by another concurrent
             //     stream (at-most-one-ZC gate)
             //   - peer fragments the 5-byte LPM length-prefix across
@@ -695,7 +695,7 @@ internal static partial class Http2Codec
                     // already advanced <c>_pendingReadIdx</c> by
                     // <c>payloadLen</c> via the <see cref="ShmRing.ReserveRead"/>
                     // call above, but never published the matching
-                    // <see cref="ShmRing.CommitReadRaw"/> on the shared
+                    // <see cref="ShmRing.CommitReadAnchored"/> on the shared
                     // <c>header.ReadIdx</c>. Defense in depth: keep the
                     // two indices in sync at all exit points.
                     try { ring.CommitReadAnchored(baseCommitReadIdx, totalBytes); }
@@ -948,7 +948,7 @@ internal static partial class Http2Codec
     /// surfaces a ring-backed (zero-copy) MESSAGE chunk piggy-backing
     /// the open anchor (contiguous, !padded — the dominant case) or
     /// falls back to a deferred-bump pool copy that still routes
-    /// CommitReadRaw additively into the anchor's target (wrap or
+    /// CommitReadAnchored additively into the anchor's target (wrap or
     /// PADDED — rare). Either way the anchor closes when the final
     /// DATA's bytes complete the LPM.
     /// </summary>
