@@ -472,6 +472,10 @@ public class ShmGrpcRequestStreamTests
     #region Zero-Copy Read Tests
 
     [Test]
+    [Ignore("Phase Y replaces single-anchor protocol with per-frame ZC anchor FIFO. " +
+            "This test asserts SpeculativeReservedBytes > 0 during ZC hold, but the new " +
+            "protocol does not use that field — back-pressure is tracked via the FIFO " +
+            "slot count instead. Will be deleted in Y.5 along with the legacy protocol.")]
     public void ZeroCopyRead_Speculative_CommitsReadIdx()
     {
         // Speculative path: CommitRead immediately, return ring memory.
@@ -497,6 +501,9 @@ public class ShmGrpcRequestStreamTests
     }
 
     [Test]
+    [Ignore("Phase Y removes the at-most-one-ZC restriction this test verified: " +
+            "multiple ZC frames may be in flight concurrently via the anchor FIFO. " +
+            "Will be deleted in Y.5.")]
     public void ZeroCopyRead_Deferred_HoldsReadIdx()
     {
         // When too many speculative bytes are reserved, use deferred.
@@ -539,6 +546,8 @@ public class ShmGrpcRequestStreamTests
     }
 
     [Test]
+    [Ignore("Phase Y removes the deferred-bump CommitReadRaw path replaced by the " +
+            "FIFO drain protocol. Will be deleted in Y.5.")]
     public void ZeroCopyRead_DeferredBeforeSpeculative_NoSkip()
     {
         // Core safety test: if a deferred frame exists, subsequent frames
@@ -609,6 +618,10 @@ public class ShmGrpcRequestStreamTests
     }
 
     [Test]
+    [Ignore("Phase Y removes the chain-ZC concept entirely; per-frame anchors release " +
+            "independently. The 'continuation wraps' edge case is no longer a special " +
+            "case — wrap simply falls back to copy on a per-frame basis. Will be " +
+            "deleted in Y.5.")]
     public void ZeroCopyRead_ChainZc_ReleasesAnchor_WhenContinuationWraps()
     {
         // Repro: chain-ZC anchor must close even when the chain's final
@@ -727,6 +740,8 @@ public class ShmGrpcRequestStreamTests
     }
 
     [Test]
+    [Ignore("Phase Y removes chain-ZC. Per-frame anchors decouple wrap-handling from " +
+            "chain semantics. Will be deleted in Y.5.")]
     public void ZeroCopyRead_ChainZc_ReleasesAnchor_WhenLastWrapsAndPriorZcFramesPreReleased()
     {
         // Race regression: chain ZC opens on a contiguous first frame.

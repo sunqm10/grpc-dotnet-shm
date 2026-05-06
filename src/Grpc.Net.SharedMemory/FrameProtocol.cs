@@ -92,7 +92,7 @@ public static class FrameProtocol
             // allocations or block forever trying to read from the ring.
             if (header.Length > MaxFramePayloadSize)
             {
-                ring.CommitReadRaw(baseCommitReadIdx, ShmConstants.FrameHeaderSize);
+                ring.CommitReadAnchored(baseCommitReadIdx, ShmConstants.FrameHeaderSize);
                 throw new InvalidDataException(
                     $"Frame payload length {header.Length} exceeds maximum {MaxFramePayloadSize}. " +
                     "This may indicate data corruption in the shared memory ring buffer.");
@@ -100,7 +100,7 @@ public static class FrameProtocol
 
             if (!Enum.IsDefined(header.Type) && header.Type != FrameType.Pad)
             {
-                ring.CommitReadRaw(baseCommitReadIdx, ShmConstants.FrameHeaderSize);
+                ring.CommitReadAnchored(baseCommitReadIdx, ShmConstants.FrameHeaderSize);
                 throw new InvalidDataException(
                     $"Unknown frame type 0x{(byte)header.Type:X2} with length {header.Length}. " +
                     "This may indicate data corruption in the shared memory ring buffer.");
@@ -112,253 +112,70 @@ public static class FrameProtocol
                 if (header.Length > 0)
                 {
                     var padReservation = ring.ReserveRead((int)header.Length, cancellationToken);
-                    ring.CommitReadRaw(baseCommitReadIdx, ShmConstants.FrameHeaderSize + (int)header.Length);
+                    ring.CommitReadAnchored(baseCommitReadIdx, ShmConstants.FrameHeaderSize + (int)header.Length);
                 }
                 else
                 {
-                    ring.CommitReadRaw(baseCommitReadIdx, ShmConstants.FrameHeaderSize);
+                    ring.CommitReadAnchored(baseCommitReadIdx, ShmConstants.FrameHeaderSize);
                 }
                 continue;
             }
 
             if (header.Length == 0)
             {
-                ring.CommitReadRaw(baseCommitReadIdx, ShmConstants.FrameHeaderSize);
+                ring.CommitReadAnchored(baseCommitReadIdx, ShmConstants.FrameHeaderSize);
                 return (header, FramePayload.Empty);
             }
 
             var payloadLength = (int)header.Length;
             var payloadReservation = ring.ReserveRead(payloadLength, cancellationToken);
-            var isMore = (header.Flags & MessageFlags.More) != 0;
             var totalBytes = ShmConstants.FrameHeaderSize + payloadLength;
             var contiguous = payloadReservation.Second.IsEmpty;
 
-            // ===== Hot path: single-frame, no chain in flight, no copy-mode in progress =====
+            // ===== Phase Y: per-frame ZC anchor FIFO =====
             //
-            // Covers the dominant case: every single-frame ping-pong / unary
-            // RPC. Reads only IsChainOpen and ChainCopyMode (Volatile.Reads
-            // the slow path would have read anyway, so this is no extra cost
-            // on cold path) and short-circuits BOTH the ZC happy path and the
-            // sub-threshold copy fallback. The slow path's chain-decision
-            // tree is bypassed entirely here.
+            // Replaces the legacy chain-anchor + ChainCopyMode dispatch
+            // tree with a single decision: per-frame ZC vs copy. The
+            // FIFO supports any number of in-flight anchors, releasing
+            // independently — there is no "chain" concept and no
+            // budget-vs-message-size eligibility step. Each frame stands
+            // on its own.
             //
-            // Falls through to the slow path when:
-            //   - isMore=true (multi-frame continuation)
-            //   - IsChainOpen=true (the !isMore frame is the FINAL frame of
-            //     an active chain ZC, which must call CloseZcChain)
-            //   - ChainCopyMode=true (the !isMore frame is the FINAL frame
-            //     of a copy-mode multi-frame message, which must reset the
-            //     ChainCopyMode flag)
-            if (!isMore && !ring.IsChainOpen && !ring.ChainCopyMode)
+            // Cross-process correctness: the FIFO drain (in ReleasePerFrameZc)
+            // CAS-advances header.ReadIdx only as far as the earliest
+            // unreleased anchor's BaseIdx. Out-of-order releases stash
+            // until the head drains, preserving the invariant that the
+            // writer never wraps onto held bytes.
+            if (zeroCopy && contiguous && ring.IsZcEligibleForAnchor(payloadLength, contiguous: true))
             {
-                if (zeroCopy && contiguous
-                    && ring.IsSpeculativeZcEligible(payloadLength, contiguous: true))
+                ring.EnsureZcAnchorFifo();
+                var slot = ring.TryBeginPerFrameZc(baseCommitReadIdx, totalBytes);
+                if (slot >= 0)
                 {
-                    // Fused single-frame ZC: BeginSingleFrameZcCommit sets
-                    // _deferredReadIdxTarget to its post-frame value
-                    // directly, saving 1 Volatile.Read + 1 Volatile.Write
-                    // vs the BeginZc + CommitReadRaw two-step.
-                    ring.BeginSingleFrameZcCommit(baseCommitReadIdx, totalBytes);
-                    Interlocked.Add(ref ring.SpeculativeReservedBytes, totalBytes);
-                    return (header, FramePayload.FromRingMemorySpeculative(
-                        payloadReservation.First.Slice(0, payloadLength), ring, totalBytes));
+                    return (header, FramePayload.FromRingZcAnchor(
+                        payloadReservation.First.Slice(0, payloadLength), ring, slot));
                 }
-
-                // Single-frame copy: sub-ZC-threshold, ZC disabled, or
-                // wrap. CommitReadRaw advances the shared ReadIdx
-                // immediately (no chain anchor in flight under this gate).
-                var pooled = ArrayPool<byte>.Shared.Rent(payloadLength);
-                if (contiguous)
-                {
-                    payloadReservation.First.Span.Slice(0, payloadLength).CopyTo(pooled);
-                }
-                else
-                {
-                    CopyFromReservation(payloadReservation, pooled.AsSpan(0, payloadLength));
-                }
-                ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
-                return (header, FramePayload.FromPooled(pooled, payloadLength));
+                // FIFO at >=75% capacity: fall through to copy. The drain
+                // back-pressure gate keeps consumers from pinning the head
+                // long enough to indefinitely block the producer.
             }
 
-            // ===== Slow path: multi-frame chain, copy-mode continuation, or chain-final =====
-            //
-            // Modes for a multi-frame logical message:
-            //
-            //   2) Multi-frame chain ZC (isMore on first frame): every
-            //      frame ZC. Eligibility decided ONCE on the first frame:
-            //      <c>totalMsg ≤ ring.ChainZcBudget</c>. Anchor opens on
-            //      frame 1, releases on consumer's final Release for the
-            //      chain. CommitReadRaw is deferred throughout;
-            //      EndZcReservation fires from the consumer's LAST
-            //      Release (gated by SpeculativeReservedBytes==0 AND
-            //      !IsChainOpen).
-            //
-            //      The chain stays in ZC mode through every contiguous
-            //      continuation. If a continuation frame's payload
-            //      reservation happens to wrap the ring boundary
-            //      (contiguous=false), it falls to the copy path; the
-            //      copied frame's bytes are still routed through the
-            //      deferred-bump CommitReadRaw, so the chain anchor's
-            //      target accumulates correctly. The chain's final frame
-            //      MUST close the anchor (CloseZcChain) regardless of
-            //      whether it took the ZC or copy branch — otherwise
-            //      <c>IsChainOpen=true</c> persists and the held ZC
-            //      frames' Releases cannot fire EndZcReservation,
-            //      deadlocking the writer.
-            //
-            //      The budget is <c>cap/2</c> (see <see cref="ShmRing.ChainZcBudget"/>):
-            //      under back-to-back streaming the writer must have
-            //      enough headroom (≈ another <c>cap/2</c>) to start
-            //      emitting the next message while the current chain
-            //      anchor is still held by the consumer. Any larger
-            //      budget risks deadlock.
-            //
-            //   3) Pure copy: every frame copies (chain anchor never
-            //      opens). Used when the first frame fails eligibility
-            //      (totalMsg too big, wrap, ZC disabled, or sub-MinZc).
-            // chainActive: codec is in the middle of a multi-frame chain
-            // (isMore=true on first frame opened it; not yet closed).
-            // Note: we use IsChainOpen, NOT IsZcChainActive. The latter
-            // is also true for in-flight single-frame ZC anchors, which
-            // do not impose "must ZC the next frame" semantics.
-            var chainActive = ring.IsChainOpen;
-            var copyMode = ring.ChainCopyMode;
-
-            bool tryZc = false;
-            bool startChain = false;
-
-            if (zeroCopy && contiguous)
-            {
-                if (chainActive)
-                {
-                    // Mode 2 continuation. ZC unconditionally — once
-                    // the anchor is opened we must keep ZCing through
-                    // the chain end (mid-chain copy would freeze readIdx
-                    // forever).
-                    tryZc = true;
-                }
-                else if (copyMode)
-                {
-                    // Continuation of a copy-mode multi-frame message.
-                    tryZc = false;
-                }
-                else if (isMore)
-                {
-                    // First frame of a multi-frame message. Decide chain
-                    // ZC vs copy mode based on declared LPM total length.
-                    if (payloadLength >= 5
-                        && ring.IsSpeculativeZcEligible(payloadLength, contiguous: true))
-                    {
-                        var firstSpan = payloadReservation.First.Span;
-                        var lpmBodyLen = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(
-                            firstSpan.Slice(1, 4));
-                        var totalMsg = 5L + lpmBodyLen;
-
-                        if (totalMsg <= ring.ChainZcBudget)
-                        {
-                            tryZc = true;
-                            startChain = true;
-                        }
-                        else
-                        {
-                            ring.ChainCopyMode = true;
-                        }
-                    }
-                    else
-                    {
-                        ring.ChainCopyMode = true;
-                    }
-                }
-                else
-                {
-                    // Final frame of an in-progress non-chain message,
-                    // or single-frame final that the hot path rejected
-                    // (e.g. sub-threshold). Re-evaluate eligibility.
-                    if (ring.IsSpeculativeZcEligible(payloadLength, contiguous: true))
-                    {
-                        tryZc = true;
-                    }
-                }
-            }
-            else if (isMore && !chainActive && !copyMode)
-            {
-                // First frame of multi-frame message but ZC disabled or
-                // wrapped. Mark copy mode for the rest of the message.
-                ring.ChainCopyMode = true;
-            }
-
-            if (tryZc)
-            {
-                if (startChain)
-                {
-                    // Open the anchor (cross-process visible) and the
-                    // codec-side chain marker (gates EndZc on Release).
-                    ring.BeginZcReservation(baseCommitReadIdx);
-                    ring.OpenZcChain();
-                }
-                else if (!chainActive)
-                {
-                    // Single-frame ZC (mode 1) or chain continuation
-                    // when the anchor was already opened by an earlier
-                    // call — only call BeginZc if no anchor exists yet.
-                    // (IsZcChainActive distinguishes "anchor exists"
-                    // from IsChainOpen which means "codec still adding
-                    // chain frames".)
-                    if (!ring.IsZcChainActive)
-                    {
-                        ring.BeginZcReservation(baseCommitReadIdx);
-                    }
-                }
-                Interlocked.Add(ref ring.SpeculativeReservedBytes, totalBytes);
-                ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
-                if (!isMore && ring.IsChainOpen)
-                {
-                    // Final frame of an active chain — codec-side close.
-                    ring.CloseZcChain();
-                }
-                return (header, FramePayload.FromRingMemorySpeculative(
-                    payloadReservation.First.Slice(0, payloadLength), ring, totalBytes));
-            }
-
-            // Copy path. CommitReadRaw advances readIdx normally (no
-            // anchor open in copy mode); when an anchor IS open it routes
-            // through the deferred-bump path (additive). Either way, the
-            // copied bytes are accounted for in <c>_deferredReadIdxTarget</c>.
-            var payload = ArrayPool<byte>.Shared.Rent(payloadLength);
+            // Copy fallback: sub-ZC-threshold, ring < 1 MiB, wrap, ZC
+            // disabled, or FIFO back-pressure. CommitReadAnchored advances
+            // header.ReadIdx directly when the FIFO is empty, or stashes
+            // the target via _pendingNonZcMax to be folded in at the next
+            // FIFO drain.
+            var pooled = ArrayPool<byte>.Shared.Rent(payloadLength);
             if (contiguous)
             {
-                payloadReservation.First.Span.Slice(0, payloadLength).CopyTo(payload);
+                payloadReservation.First.Span.Slice(0, payloadLength).CopyTo(pooled);
             }
             else
             {
-                CopyFromReservation(payloadReservation, payload.AsSpan(0, payloadLength));
+                CopyFromReservation(payloadReservation, pooled.AsSpan(0, payloadLength));
             }
-            ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
-
-            // Reset chain bookkeeping on the message's final frame so the
-            // next logical message gets a fresh decision.
-            if (!isMore)
-            {
-                if (copyMode)
-                {
-                    ring.ChainCopyMode = false;
-                }
-                else if (chainActive)
-                {
-                    // Chain ZC was opened earlier (first frame ZC-eligible)
-                    // but this final frame fell to the copy path because
-                    // its payload reservation wraps the ring boundary
-                    // (contiguous == false). Without closing the chain
-                    // here, <see cref="ShmRing.IsChainOpen"/> stays true
-                    // forever; <see cref="FramePayload.Release"/> on the
-                    // earlier ZC frames gates <see cref="ShmRing.EndZcReservation"/>
-                    // on <c>!IsChainOpen</c>, so the deferred-publish
-                    // never fires and the writer eventually deadlocks
-                    // waiting for <c>header.ReadIdx</c> to advance.
-                    ring.CloseZcChain();
-                }
-            }
-            return (header, FramePayload.FromPooled(payload, payloadLength));
+            ring.CommitReadAnchored(baseCommitReadIdx, totalBytes);
+            return (header, FramePayload.FromPooled(pooled, payloadLength));
         }
     }
 

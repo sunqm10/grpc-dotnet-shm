@@ -957,6 +957,30 @@ public sealed class ShmRing : IDisposable
         return true;
     }
 
+    /// <summary>
+    /// Phase Y eligibility check: ring + payload size threshold ONLY.
+    /// Drops the at-most-one-ZC gate (FIFO supports concurrent anchors)
+    /// and the back-pressure used-bytes gate (FIFO has its own 75% gate
+    /// inside <see cref="TryBeginPerFrameZc"/>).
+    /// </summary>
+    /// <remarks>
+    /// Mirrors <see cref="IsSpeculativeZcEligible"/>'s adaptive-min and
+    /// minimum-ring-size policy so the two paths share the same
+    /// "this payload is large enough that ZC is worthwhile" decision.
+    /// Callers must additionally check <c>contiguous</c> separately and
+    /// pass it in.
+    /// </remarks>
+    internal bool IsZcEligibleForAnchor(int payloadLength, bool contiguous)
+    {
+        if (!contiguous) return false;
+        const ulong MinRingForZeroCopy = 1024UL * 1024UL;
+        if (_capacity < MinRingForZeroCopy) return false;
+        var adaptiveMin = (int)Math.Min(64UL * 1024UL, _capacity / 16);
+        if (adaptiveMin < 4 * 1024) adaptiveMin = 4 * 1024;
+        if (payloadLength < adaptiveMin) return false;
+        return true;
+    }
+
 
     /// <summary>
     /// Checks whether a contiguous write of <paramref name="size"/> bytes is

@@ -596,7 +596,10 @@ public class Http2CodecTests
         {
             Assert.That(fp.IsSpeculativeZeroCopy, Is.True,
                 "Test sanity: payload must take the ZC path so the anchor is held.");
-            Assert.That(ring.SpeculativeReservedBytes, Is.GreaterThan(0L),
+            // Phase Y: anchor lives in the per-frame FIFO; track via
+            // InFlightAnchorCount instead of the legacy SpeculativeReservedBytes
+            // counter (which the new protocol does not use).
+            Assert.That(ring.InFlightAnchorCount, Is.GreaterThan(0),
                 "Test sanity: ZC anchor must be held while the FramePayload is in scope.");
 
             using var cts = new CancellationTokenSource();
