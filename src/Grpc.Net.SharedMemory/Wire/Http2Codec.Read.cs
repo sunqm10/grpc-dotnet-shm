@@ -104,39 +104,60 @@ internal static partial class Http2Codec
 
     /// <summary>
     /// Tracks an in-progress gRPC LPM message across multiple H2 DATA
-    /// frames. PR2 phase 2.5: the accumulator no longer holds the full
-    /// LPM body in a single ArrayPool buffer; instead each DATA frame's
-    /// body bytes are emitted as a separate MESSAGE chunk (with the
-    /// <see cref="MessageFlags.More"/> flag set on all but the LPM's
-    /// final chunk). Upstream readers (ReadSingleMessageAsync and
-    /// ShmAsyncStreamReader, both lazy-chain enabled in 5dfb2db2 and
-    /// c01f5b8e) consume the chain frame-by-frame, releasing each
-    /// pool-backed chunk as the protobuf parser advances. Net pool
-    /// footprint per H2 stream drops from O(LPM body size) to
-    /// O(per-DATA-frame ~16 MiB ceiling).
+    /// frames.
+    /// <para>
+    /// Phase X: when conditions allow (single-stream-mode dominant,
+    /// contiguous, no other ZC anchor in flight, totalLpm ≤
+    /// <see cref="ShmRing.ChainZcBudget"/>), the accumulator runs in
+    /// <see cref="ChainMode"/>: each DATA frame's body bytes are
+    /// surfaced as a single ring-backed (zero-copy) MESSAGE chunk, all
+    /// piggy-backing on a single chain anchor opened by the LPM's first
+    /// DATA frame. The chain mirrors Custom16's chain-ZC mechanism in
+    /// <see cref="FrameProtocol.ReadFramePayloadCustom16"/> — same
+    /// anchor lifecycle, same <c>SpeculativeReservedBytes</c> +
+    /// <c>IsChainOpen</c> handshake.
+    /// </para>
+    /// <para>
+    /// Phase 2.5 fallback path (used when chain-ZC is rejected, e.g.
+    /// peer coalesces multiple LPMs in one DATA, peer fragments the
+    /// 5-byte LPM header across DATA frames, ZC disabled, ring too
+    /// small, anchor already held by another stream): each DATA frame's
+    /// body is copied into a per-chunk ArrayPool buffer and emitted as
+    /// a pool-backed MESSAGE chunk, optionally producing multiple
+    /// chunks per DATA via <see cref="EnqueuePendingFrame"/>.
+    /// </para>
     /// </summary>
     private sealed class LpmAccumulator
     {
-        // 5-byte LPM header parsing state. Bytes copied here from the
-        // wire as DATA frames stream in; once HeaderBytesSeen == 5 the
-        // body length is known and chunk emission begins.
+        // 5-byte LPM header parsing state. Used ONLY by the slow
+        // (non-chain-mode) path: when the peer fragments the 5-byte
+        // LPM length-prefix across DATA frames, partial bytes are
+        // staged here until ExpectedBodyLen can be parsed.
         public readonly byte[] HeaderBuf = new byte[5];
         public int HeaderBytesSeen;     // 0..5
 
         // Body emission state. ExpectedBodyLen is the LPM body length
-        // (NOT including the 5-byte header) parsed from HeaderBuf[1..5].
-        // BodyEmitted is the cumulative count of body bytes that have
-        // been included in MESSAGE chunks emitted so far. The LPM is
-        // complete when BodyEmitted == ExpectedBodyLen.
+        // (NOT including the 5-byte header). BodyEmitted is the
+        // cumulative count of body bytes that have been included in
+        // MESSAGE chunks emitted so far. The LPM is complete when
+        // BodyEmitted == ExpectedBodyLen.
         public int ExpectedBodyLen;
         public int BodyEmitted;
 
-        // True once the first chunk for this LPM has been emitted; that
-        // chunk has the 5-byte HeaderBuf prepended so the upstream
-        // reader's compFlag sniff (Memory.Span[0]) and LPM body length
-        // sniff (Memory.Span.Slice(1,4) BE32) work unchanged.
-        // Subsequent chunks contain raw body bytes only.
+        // Slow-path only: true once the first chunk for the current LPM
+        // has been emitted with the 5-byte LPM header prepended. Unused
+        // in chain-ZC mode (ChainMode == true), where the first chunk's
+        // 5 header bytes ride along with the first DATA's ring slice.
         public bool HeaderEmittedAsChunk;
+
+        // Phase X: chain-ZC mode active for the current LPM. Set by the
+        // LPM's first DATA frame when chain-ZC eligibility succeeds;
+        // cleared by <see cref="Reset"/> on LPM completion or RST. While
+        // ChainMode is true, every DATA frame for this stream-LPM is
+        // surfaced as a ring-backed FramePayload; on LPM completion the
+        // codec MUST call <see cref="ShmRing.CloseZcChain"/> to release
+        // the anchor.
+        public bool ChainMode;
 
         public void Reset()
         {
@@ -144,6 +165,7 @@ internal static partial class Http2Codec
             ExpectedBodyLen = 0;
             BodyEmitted = 0;
             HeaderEmittedAsChunk = false;
+            ChainMode = false;
         }
     }
 
@@ -206,6 +228,35 @@ internal static partial class Http2Codec
             state.LastAcc = null;
         }
         return state.LpmAccumulators.Remove(streamId, out acc);
+    }
+
+    /// <summary>
+    /// Phase X: tears down all per-stream decoder state and, if a
+    /// chain-ZC anchor was open for this stream, closes it so the
+    /// ring's <c>readIdx</c> is not orphaned. Called from RST_STREAM,
+    /// END_STREAM mid-LPM (peer error), and any other path that
+    /// abandons an in-progress LPM.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="ShmRing.CloseZcChain"/> is idempotent and gated on
+    /// <c>chainOpen</c>, so calling it when the stream's accumulator is
+    /// not in <see cref="LpmAccumulator.ChainMode"/> is a safe no-op.
+    /// We only fire it when <c>ChainMode == true</c> to avoid spurious
+    /// races against another stream's anchor (the ring serialises
+    /// anchors via the at-most-one-ZC gate, but cross-process ordering
+    /// is still cheaper to skip when not needed).
+    /// </remarks>
+    private static void DiscardStreamState(ShmRing ring, Http2DecoderState state, uint streamId)
+    {
+        state.StreamsWithInitialHeaders.Remove(streamId);
+        if (RemoveAcc(state, streamId, out var stale))
+        {
+            if (stale!.ChainMode)
+            {
+                ring.CloseZcChain();
+            }
+            stale.Reset();
+        }
     }
 
     private static (FrameHeader Header, FramePayload Payload) ReadFramePayloadInternal(
@@ -343,11 +394,10 @@ internal static partial class Http2Codec
             // No body to feed to the LPM accumulator.
             if (endStream)
             {
-                state.StreamsWithInitialHeaders.Remove(streamId);
-                if (RemoveAcc(state, streamId, out var stale))
-                {
-                    stale!.Reset(); // free pooled buffer if any
-                }
+                // Phase X: if a chain anchor was open when END_STREAM
+                // arrived (peer-side LPM truncation), DiscardStreamState
+                // closes it so the ring's readIdx is not orphaned.
+                DiscardStreamState(ring, state, streamId);
                 return (new FrameHeader(FrameType.HalfClose, streamId, 0, 0), FramePayload.Empty);
             }
             // No-op DATA frame, signal outer loop to read next.
@@ -424,6 +474,110 @@ internal static partial class Http2Codec
                 return (hdr, FramePayload.FromPooled(pooled, bodyLength));
             }
             // Falls through to slow path: more bytes needed, or multiple LPMs in this frame.
+        }
+
+        // === Phase X: chain-ZC for multi-frame LPM. ===
+        //
+        // Mirrors Custom16's chain-ZC mechanism: open ONE anchor on the
+        // LPM's first DATA frame, every continuation DATA piggy-backs
+        // the same anchor (no per-frame BeginZcReservation), close on
+        // the last DATA. Eligibility is decided ONCE on the first DATA;
+        // <see cref="LpmAccumulator.ChainMode"/> carries the decision
+        // through the rest of the LPM.
+        //
+        // Multi-stream concurrency: ShmRing supports a single in-flight
+        // ZC anchor per ring (the "at-most-one-ZC" check inside
+        // <see cref="ShmRing.IsSpeculativeZcEligible"/> rejects on
+        // SpeculativeReservedBytes > 0). When stream A holds a chain
+        // anchor and stream B's first multi-frame DATA arrives, B's
+        // <c>IsSpeculativeZcEligible</c> returns false, B falls back to
+        // the pool-copy slow path. No deadlock; just a graceful
+        // performance degradation for the second concurrent stream.
+        //
+        // Continuation handling (<c>existingAcc.ChainMode == true</c>)
+        // is mandatory once the anchor is open: switching mid-LPM to
+        // pool copy would still work for byte delivery (CommitReadRaw
+        // routes additively into the anchor's deferred target while
+        // IsZcChainActive), but switching to the FeedAccumulator
+        // chunk-emit slow path would NOT — it manages its own state
+        // disjoint from the chain anchor's. So mid-LPM in chain mode
+        // we stay on the chain path even if a particular DATA wraps
+        // (degraded copy below).
+        if (existingAcc != null && existingAcc.ChainMode)
+        {
+            return ReadChainContinuation(
+                ring, baseCommitReadIdx, payloadReservation, existingAcc,
+                streamId, padded, bodyOffset, bodyLength,
+                totalBytes, endStream, state);
+        }
+
+        // First DATA of a multi-frame LPM: try to open a chain anchor.
+        //
+        // Eligibility (all must hold):
+        //   - ZC enabled for this read
+        //   - !padded (PADDED DATA's body is non-contiguous within the
+        //     reservation; cleanly unsupported in chain mode)
+        //   - !hasAccumulator (no prior in-progress LPM state)
+        //   - bodyLength >= 5 (full LPM length-prefix in this DATA;
+        //     peer-fragmented header is a slow-path case)
+        //   - First-slice contiguous (Second.IsEmpty)
+        //   - bodyLength < totalLpm: the LPM does NOT fit in one DATA,
+        //     so chain mode is needed (single-DATA LPMs go via the
+        //     fast path above)
+        //   - totalLpm <= ChainZcBudget: prevents starving the writer
+        //   - IsSpeculativeZcEligible(payloadLen): adaptive thresholds,
+        //     back-pressure auto-degrade, and the at-most-one-ZC gate
+        if (zeroCopy && !padded && !hasAccumulator
+            && bodyLength >= 5
+            && payloadReservation.Second.IsEmpty)
+        {
+            var firstSpan = payloadReservation.First.Span;
+            var declaredLpmBody = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(firstSpan.Slice(1, 4));
+            if (declaredLpmBody <= (uint)int.MaxValue - 5)
+            {
+                var totalLpm = (long)declaredLpmBody + 5L;
+                if (totalLpm > bodyLength
+                    && totalLpm <= ring.ChainZcBudget
+                    && ring.IsSpeculativeZcEligible(payloadLength: payloadLen, contiguous: true))
+                {
+                    // END_STREAM on the LPM's first DATA frame, but the LPM
+                    // declares more body than this DATA delivers, is a peer
+                    // protocol error. Reject before allocating a chain anchor.
+                    if (endStream)
+                    {
+                        ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
+                        throw new InvalidDataException(
+                            $"H2 stream {streamId}: END_STREAM set on first DATA but LPM declares " +
+                            $"{declaredLpmBody} body bytes, only {bodyLength - 5} delivered.");
+                    }
+
+                    var acc = GetOrAddAcc(state, streamId);
+                    acc.ExpectedBodyLen = (int)declaredLpmBody;
+                    acc.BodyEmitted = bodyLength - 5;
+                    // Mark the accumulator as in-progress so any future
+                    // re-entry into TryReadDataFrame for this stream takes
+                    // the ChainMode continuation branch above. The slow-path
+                    // fields (HeaderBytesSeen, HeaderEmittedAsChunk) are
+                    // also set so that a later ChainMode reset (e.g. after
+                    // a wrap-degraded close) leaves the slow-path
+                    // bookkeeping in a consistent state.
+                    acc.HeaderBytesSeen = 5;
+                    acc.HeaderEmittedAsChunk = true;
+                    acc.ChainMode = true;
+
+                    ring.BeginZcReservation(baseCommitReadIdx);
+                    ring.OpenZcChain();
+                    Interlocked.Add(ref ring.SpeculativeReservedBytes, totalBytes);
+                    ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
+
+                    var chainHdr = new FrameHeader(FrameType.Message, streamId,
+                        (uint)bodyLength, MessageFlags.More);
+                    return (chainHdr, FramePayload.FromRingMemorySpeculative(
+                        payloadReservation.First.Slice(0, bodyLength), ring, totalBytes));
+                }
+            }
+            // Falls through to slow path: budget exceeded, ring saturated,
+            // anchor already held by another stream, or coalesced multi-LPM.
         }
 
         // === Slow path: copy body into the per-stream LPM accumulator. ===
@@ -808,6 +962,152 @@ internal static partial class Http2Codec
         return (FramePayload.FromPooled(chunk, chunkPayloadLen), consumed, lpmComplete);
     }
 
+    /// <summary>
+    /// Phase X: handles a continuation DATA frame for an LPM that opened
+    /// a chain-ZC anchor on its first DATA frame. The anchor is shared
+    /// across all DATA frames of the LPM; every continuation either
+    /// surfaces a ring-backed (zero-copy) MESSAGE chunk piggy-backing
+    /// the open anchor (contiguous, !padded — the dominant case) or
+    /// falls back to a deferred-bump pool copy that still routes
+    /// CommitReadRaw additively into the anchor's target (wrap or
+    /// PADDED — rare). Either way the anchor closes when the final
+    /// DATA's bytes complete the LPM.
+    /// </summary>
+    /// <remarks>
+    /// Throws <see cref="InvalidDataException"/> if the continuation
+    /// would carry bytes beyond the LPM's declared body length (peer
+    /// coalescing across the LPM boundary while we're in chain mode is
+    /// unsupported because a single ring reservation cannot be split
+    /// across multiple Message frames), or if the peer sets END_STREAM
+    /// before the LPM body completes. In both error paths the chain
+    /// anchor is closed and the per-stream state is wiped before
+    /// throwing, so a subsequent stream on the same ring can take
+    /// chain-ZC again without an orphaned anchor.
+    /// </remarks>
+    private static (FrameHeader Header, FramePayload Payload) ReadChainContinuation(
+        ShmRing ring, ulong baseCommitReadIdx, ReadReservation payloadReservation,
+        LpmAccumulator acc, uint streamId, bool padded,
+        int bodyOffset, int bodyLength, int totalBytes, bool endStream,
+        Http2DecoderState state)
+    {
+        var totalLpm = 5L + acc.ExpectedBodyLen;
+        var newEmitted = acc.BodyEmitted + bodyLength;
+        if (5L + newEmitted > totalLpm)
+        {
+            // Peer wrote bytes beyond the declared LPM body. Splitting a
+            // single ring reservation across multiple Message frames is
+            // not supported in chain mode (ZC ring slices are
+            // single-release), so this is a hard error. Close the
+            // anchor before throwing so the ring's readIdx can resume
+            // advancing.
+            ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
+            // Order matters: close the chain anchor BEFORE wiping the
+            // accumulator, so DiscardStreamState's CloseZcChain check
+            // does not fire a second time. ChainMode flips to false
+            // inside acc.Reset() (called by DiscardStreamState).
+            ring.CloseZcChain();
+            acc.ChainMode = false; // prevent double-close in DiscardStreamState
+            DiscardStreamState(ring, state, streamId);
+            throw new InvalidDataException(
+                $"H2 stream {streamId}: chain DATA frame extends beyond LPM body " +
+                $"({5L + newEmitted} > {totalLpm} expected).");
+        }
+
+        var isLast = (5L + newEmitted) == totalLpm;
+        var contiguous = payloadReservation.Second.IsEmpty;
+
+        // === Contiguous (ZC) continuation — common case ===
+        if (contiguous && !padded)
+        {
+            Interlocked.Add(ref ring.SpeculativeReservedBytes, totalBytes);
+            ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
+
+            if (isLast)
+            {
+                ring.CloseZcChain();
+                acc.Reset();
+                if (endStream)
+                {
+                    state.StreamsWithInitialHeaders.Remove(streamId);
+                }
+            }
+            else if (endStream)
+            {
+                ring.CloseZcChain();
+                acc.Reset();
+                state.StreamsWithInitialHeaders.Remove(streamId);
+                throw new InvalidDataException(
+                    $"H2 stream {streamId} ended mid-LPM (chain ZC continuation, " +
+                    $"body {newEmitted}/{acc.ExpectedBodyLen}).");
+            }
+            else
+            {
+                acc.BodyEmitted = newEmitted;
+            }
+
+            byte msgFlags = (byte)(isLast ? 0 : MessageFlags.More);
+            if (isLast && endStream) msgFlags |= MessageFlags.EndStream;
+            var hdr = new FrameHeader(FrameType.Message, streamId,
+                (uint)bodyLength, msgFlags);
+            return (hdr, FramePayload.FromRingMemorySpeculative(
+                payloadReservation.First.Slice(0, bodyLength), ring, totalBytes));
+        }
+
+        // === Degraded (pool copy) continuation — wrap or PADDED ===
+        // Anchor stays open; CommitReadRaw under IsZcChainActive routes
+        // additively into _deferredReadIdxTarget so the anchor's
+        // post-chain target accumulates correctly. CloseZcChain on the
+        // last DATA still triggers EndZcReservation when the upstream
+        // consumer's last Release brings SpeculativeReservedBytes to 0.
+        var pooled = ArrayPool<byte>.Shared.Rent(bodyLength == 0 ? 1 : bodyLength);
+        try
+        {
+            if (payloadReservation.Second.IsEmpty)
+            {
+                payloadReservation.First.Span.Slice(bodyOffset, bodyLength).CopyTo(pooled);
+            }
+            else
+            {
+                CopyFromReservationSlice(payloadReservation, bodyOffset, pooled.AsSpan(0, bodyLength));
+            }
+            ring.CommitReadRaw(baseCommitReadIdx, totalBytes);
+
+            if (isLast)
+            {
+                ring.CloseZcChain();
+                acc.Reset();
+                if (endStream)
+                {
+                    state.StreamsWithInitialHeaders.Remove(streamId);
+                }
+            }
+            else if (endStream)
+            {
+                ring.CloseZcChain();
+                acc.Reset();
+                state.StreamsWithInitialHeaders.Remove(streamId);
+                throw new InvalidDataException(
+                    $"H2 stream {streamId} ended mid-LPM (chain copy continuation, " +
+                    $"body {newEmitted}/{acc.ExpectedBodyLen}).");
+            }
+            else
+            {
+                acc.BodyEmitted = newEmitted;
+            }
+
+            byte fallbackFlags = (byte)(isLast ? 0 : MessageFlags.More);
+            if (isLast && endStream) fallbackFlags |= MessageFlags.EndStream;
+            var fallbackHdr = new FrameHeader(FrameType.Message, streamId,
+                (uint)bodyLength, fallbackFlags);
+            return (fallbackHdr, FramePayload.FromPooled(pooled, bodyLength));
+        }
+        catch
+        {
+            ArrayPool<byte>.Shared.Return(pooled);
+            throw;
+        }
+    }
+
     private static (FrameHeader Header, FramePayload Payload) ReadHeadersFrame(
         ShmRing ring, ulong baseCommitReadIdx, uint streamId, byte h2Flags, int payloadLen,
         Http2DecoderState state, CancellationToken ct)
@@ -1091,13 +1391,11 @@ internal static partial class Http2Codec
 
         // Clean up all per-stream state. A pending LPM accumulator may still
         // hold a pooled buffer; calling Reset() returns it to ArrayPool to
-        // prevent a buffer leak when the peer cancels mid-message.
+        // prevent a buffer leak when the peer cancels mid-message. Phase X:
+        // also closes any open chain-ZC anchor for this stream so the ring's
+        // readIdx is not orphaned by RST.
         var state = GetState(ring);
-        state.StreamsWithInitialHeaders.Remove(streamId);
-        if (RemoveAcc(state, streamId, out var pendingAcc))
-        {
-            pendingAcc!.Reset();
-        }
+        DiscardStreamState(ring, state, streamId);
 
         var hdr = new FrameHeader(FrameType.Cancel, streamId, 0, 0);
         return (hdr, FramePayload.Empty);
