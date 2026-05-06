@@ -649,6 +649,227 @@ public sealed class ShmRing : IDisposable
         return Volatile.Read(ref header.WriteIdx);
     }
 
+    // ===== Phase Y: Per-frame ZC anchor FIFO (replaces single-anchor protocol) =====
+    //
+    // Goal: support multiple in-flight ZC anchors on the same ring, so that a
+    // large LPM that exceeds the legacy ChainZcBudget can still take ZC for
+    // every frame — and so that two concurrent streams don't reject each
+    // other on the at-most-one-ZC gate.
+    //
+    // Design summary:
+    //   - Pre-allocated PerFrameZcSlot[] sized at construction (powers of 2,
+    //     bounded by ring_capacity / minZcFrameSize, capped at 4096).
+    //   - Reader thread is single producer of the FIFO: it allocates slots
+    //     in order and writes their EndIdx + Released=false.
+    //   - Consumers (any thread, FramePayload.Release) flip Released=true
+    //     and call DrainReleasedAnchors which CAS-advances the head, owning
+    //     the publish for that slot.
+    //   - header.ReadIdx is advanced ONLY when the head slot is released;
+    //     this guarantees cross-process writers never wrap onto held bytes.
+    //   - Non-ZC frames committed during anchor hold are stashed in
+    //     _pendingNonZcMax and folded into readIdx when the FIFO drains
+    //     to empty.
+    //
+    // Y.1 keeps this side-by-side with the legacy single-anchor protocol;
+    // it is callable but not yet wired into any reader. Subsequent commits
+    // (Y.2 = FramePayload routing, Y.3 = Custom16 reader switch, Y.4 = H2
+    // reader switch, Y.5 = legacy delete) migrate the codecs and finally
+    // remove the old _zcActive / _deferredReadIdxTarget / _chainOpen state.
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct PerFrameZcSlot
+    {
+        public ulong EndIdx;     // baseIdx + size: the position readIdx should advance to upon release
+        public bool Released;    // consumer release flag
+        // 7 bytes implicit padding to 16-byte natural alignment
+    }
+
+    private PerFrameZcSlot[]? _zcSlots;     // null until InitZcAnchorFifo; once set, non-null forever
+    private int _slotMask;                   // _zcSlots.Length - 1
+    private int _slotCapacity;               // _zcSlots.Length
+
+    // Monotonic counters; never wrap in realistic deployments (ulong).
+    // Reader thread is the single producer of _zcSlotsTail.
+    // Consumers CAS-advance _zcSlotsHead.
+    private ulong _zcSlotsTail;
+    private ulong _zcSlotsHead;
+
+    // Side-channel: max byte position committed via copy path while anchors
+    // are in flight. Folded into readIdx publish when FIFO drains to empty.
+    private ulong _pendingNonZcMax;
+
+    /// <summary>
+    /// Lazily initialises the per-frame ZC anchor FIFO. Idempotent and
+    /// thread-safe via Interlocked.CompareExchange of <c>_zcSlots</c>.
+    /// </summary>
+    /// <remarks>
+    /// Slot count = max(16, ring_capacity / minZcFrameSize), rounded up to
+    /// the next power of two and capped at 4096. With 1 MiB ring + 64 KiB
+    /// adaptive min the FIFO holds 16 slots (256 B); with 256 MiB ring +
+    /// 64 KiB min it holds 4096 slots (~64 KiB). The cap bounds memory
+    /// even on misconfigured tiny rings.
+    /// </remarks>
+    internal void EnsureZcAnchorFifo()
+    {
+        if (_zcSlots != null) return;
+
+        // Mirror IsSpeculativeZcEligible's adaptive-min calculation so the
+        // slot capacity tracks the smallest frame that can claim a slot.
+        var adaptiveMin = (int)Math.Min(64UL * 1024UL, _capacity / 16);
+        if (adaptiveMin < 4 * 1024) adaptiveMin = 4 * 1024;
+        var slotsForRing = (int)Math.Max(16UL, _capacity / (ulong)adaptiveMin);
+        if (slotsForRing > 4096) slotsForRing = 4096;
+        var capacityPow2 = 1;
+        while (capacityPow2 < slotsForRing) capacityPow2 <<= 1;
+
+        var fresh = new PerFrameZcSlot[capacityPow2];
+        if (Interlocked.CompareExchange(ref _zcSlots, fresh, null) == null)
+        {
+            // We won the race; publish the metadata. Other paths reading
+            // _slotCapacity must use Volatile.Read to pair with this Volatile.Write.
+            Volatile.Write(ref _slotMask, capacityPow2 - 1);
+            Volatile.Write(ref _slotCapacity, capacityPow2);
+        }
+    }
+
+    /// <summary>
+    /// Allocates a per-frame ZC anchor for a frame at <paramref name="baseIdx"/>
+    /// of <paramref name="size"/> bytes. Returns the slot index, or -1 if
+    /// the FIFO is back-pressure self-disabled (>=75% full) and the caller
+    /// must fall back to the copy path.
+    /// </summary>
+    /// <remarks>
+    /// Reader thread is the SINGLE PRODUCER of the FIFO; this method assumes
+    /// no concurrent BeginPerFrameZc on the same ring. Consumer release is
+    /// concurrent (different threads).
+    /// <para>
+    /// Ordering: writes to the slot fields happen BEFORE the Volatile.Write
+    /// of <c>_zcSlotsTail</c>. Consumers reading tail with Volatile.Read get
+    /// the acquire barrier paired with our release write — they see a fully
+    /// initialised slot.
+    /// </para>
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal int TryBeginPerFrameZc(ulong baseIdx, int size)
+    {
+        var slots = _zcSlots;
+        if (slots == null) return -1; // not initialised
+
+        var tail = _zcSlotsTail;     // single producer: plain read
+        var head = Volatile.Read(ref _zcSlotsHead);
+        var inUse = (int)(tail - head);
+
+        // Back-pressure self-disable: if FIFO is >=75% full, refuse ZC.
+        // This bounds the worst-case "consumer holds head, producer can't
+        // advance readIdx" scenario to 75% of ring capacity; beyond that we
+        // force copy-path so readIdx keeps advancing.
+        if (inUse * 4 >= _slotCapacity * 3) return -1;
+
+        var slot = (int)(tail & (uint)_slotMask);
+        slots[slot].EndIdx = baseIdx + (ulong)size;
+        Volatile.Write(ref slots[slot].Released, false);
+        Volatile.Write(ref _zcSlotsTail, tail + 1);
+        return slot;
+    }
+
+    /// <summary>
+    /// Commits a non-ZC frame's bytes. If anchors are in flight, the target
+    /// is stashed via CAS-max; the head anchor's drain folds it in when the
+    /// FIFO becomes empty. If no anchors, header.ReadIdx is advanced
+    /// directly.
+    /// </summary>
+    /// <remarks>
+    /// Reader thread is the single producer of CommitRead too (called from
+    /// the same thread that does ReserveRead). We can therefore use the
+    /// non-CAS plain-read tail. But _pendingNonZcMax may be also written by
+    /// concurrent calls if the caller ever spawns multi-threaded reads;
+    /// CAS-max keeps it correct in either case.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void CommitReadAnchored(ulong baseIdx, int size)
+    {
+        var head = Volatile.Read(ref _zcSlotsHead);
+        var tail = Volatile.Read(ref _zcSlotsTail);
+        if (head == tail)
+        {
+            ref var hdr = ref GetHeader();
+            PublishTarget(ref hdr, baseIdx + (ulong)size);
+            SignalSpaceAvailability(ref hdr);
+            return;
+        }
+        var target = baseIdx + (ulong)size;
+        while (true)
+        {
+            var cur = Volatile.Read(ref _pendingNonZcMax);
+            if (target <= cur) return;
+            if (Interlocked.CompareExchange(ref _pendingNonZcMax, target, cur) == cur)
+                return;
+        }
+    }
+
+    /// <summary>
+    /// Marks a per-frame ZC slot as released and triggers FIFO drain. May
+    /// be called from any thread (typically a consumer parser thread via
+    /// <see cref="FramePayload.Release"/>).
+    /// </summary>
+    internal void ReleasePerFrameZc(int slotIdx)
+    {
+        var slots = _zcSlots;
+        if (slots == null)
+        {
+            // Defensive: should never hit. Slot allocated => slots non-null.
+            return;
+        }
+        Volatile.Write(ref slots[slotIdx].Released, true);
+        DrainReleasedAnchors();
+    }
+
+    private void DrainReleasedAnchors()
+    {
+        var slots = _zcSlots;
+        if (slots == null) return;
+        ref var hdr = ref GetHeader();
+
+        while (true)
+        {
+            var head = Volatile.Read(ref _zcSlotsHead);
+            var tail = Volatile.Read(ref _zcSlotsTail);
+            if (head == tail) return; // FIFO empty
+
+            var headSlotIdx = (int)(head & (uint)_slotMask);
+            if (!Volatile.Read(ref slots[headSlotIdx].Released))
+                return; // earliest still held
+
+            // Capture the slot's EndIdx into a local BEFORE attempting the
+            // CAS. After CAS succeeds, the reader producer may immediately
+            // wrap and overwrite this slot index; we must hold our own copy.
+            var endIdx = slots[headSlotIdx].EndIdx;
+
+            if (Interlocked.CompareExchange(
+                    ref _zcSlotsHead, head + 1, head) != head)
+                continue; // raced with another consumer; retry
+
+            // Re-read tail to detect "FIFO is now empty after this drain".
+            // If so, fold any pending non-ZC commits that arrived during
+            // the anchor hold into the publish target.
+            var latestTail = Volatile.Read(ref _zcSlotsTail);
+            if (head + 1 == latestTail)
+            {
+                var pending = Interlocked.Exchange(ref _pendingNonZcMax, 0UL);
+                if (pending > endIdx) endIdx = pending;
+            }
+
+            PublishTarget(ref hdr, endIdx);
+            SignalSpaceAvailability(ref hdr);
+        }
+    }
+
+    /// <summary>Diagnostic: number of in-flight ZC anchors.</summary>
+    internal int InFlightAnchorCount =>
+        (int)(Volatile.Read(ref _zcSlotsTail) - Volatile.Read(ref _zcSlotsHead));
+
+    /// <summary>Diagnostic: total slot capacity (post-EnsureZcAnchorFifo).</summary>
+    internal int AnchorFifoCapacity => Volatile.Read(ref _slotCapacity);
+
     /// <summary>
     /// Returns the current pending read index (bytes reserved but not yet committed).
     /// Used by speculative CommitRead to commit all bytes up to the current position,
