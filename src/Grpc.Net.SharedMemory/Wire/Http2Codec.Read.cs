@@ -1027,12 +1027,15 @@ internal static partial class Http2Codec
             }
             else if (endStream)
             {
+                // Capture diagnostic state BEFORE Reset clears the fields
+                // referenced in the error message (PR2 bug A).
+                var diagExpected = acc.ExpectedBodyLen;
                 ring.CloseZcChain();
                 acc.Reset();
                 state.StreamsWithInitialHeaders.Remove(streamId);
                 throw new InvalidDataException(
                     $"H2 stream {streamId} ended mid-LPM (chain ZC continuation, " +
-                    $"body {newEmitted}/{acc.ExpectedBodyLen}).");
+                    $"body {newEmitted}/{diagExpected}).");
             }
             else
             {
@@ -1077,12 +1080,15 @@ internal static partial class Http2Codec
             }
             else if (endStream)
             {
+                // Capture diagnostic state BEFORE Reset clears the fields
+                // referenced in the error message (PR2 bug A).
+                var diagExpected = acc.ExpectedBodyLen;
                 ring.CloseZcChain();
                 acc.Reset();
                 state.StreamsWithInitialHeaders.Remove(streamId);
                 throw new InvalidDataException(
                     $"H2 stream {streamId} ended mid-LPM (chain copy continuation, " +
-                    $"body {newEmitted}/{acc.ExpectedBodyLen}).");
+                    $"body {newEmitted}/{diagExpected}).");
             }
             else
             {

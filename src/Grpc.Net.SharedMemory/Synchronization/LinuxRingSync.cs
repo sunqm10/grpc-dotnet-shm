@@ -174,6 +174,20 @@ internal sealed partial class LinuxRingSync : IRingSync
             }, addrPtr)
             : default;
 
+        // Re-check cancellation AFTER registering. If cancellation was
+        // requested between the entry guard above and UnsafeRegister,
+        // the callback fires inline on this thread BEFORE we have a
+        // waiter parked. The FUTEX_WAKE would then wake zero waiters
+        // (lost wake) and the subsequent FUTEX_WAIT below would block
+        // until the producer next bumps the seq — possibly indefinitely
+        // for an idle stream. The re-check defeats this race; we trade
+        // one extra atomic load on the cancel-during-register window
+        // for guaranteed prompt cancellation.
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+
         if (timeout.HasValue)
         {
             var ts = new Timespec

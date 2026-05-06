@@ -108,6 +108,18 @@ internal sealed class LazyChainRos : IDisposable
     private InboundFrame _currentFrame;
 
     /// <summary>
+    /// Frame pulled by the most recent trampoline run but not yet rotated
+    /// into <see cref="_currentFrame"/>. Lives between the
+    /// <see cref="FulfillPlaceholder"/> in <c>seg[i].GetSpan</c> and the
+    /// rotation that fires when the parser enters <c>seg[i+1].GetSpan</c>.
+    /// Tracked here so that an exception thrown by the parser (or an early
+    /// <see cref="Dispose"/>) does not strand the pre-pulled next frame
+    /// in <see cref="LazyHookedSegment.AssignedFrame"/> with no other
+    /// owner to return it to the pool.
+    /// </summary>
+    private InboundFrame _pendingFrame;
+
+    /// <summary>
     /// Cumulative length of body bytes covered by linked-and-fulfilled
     /// segments. Used to decide when the chain has reached
     /// <see cref="_totalBodyLen"/> and must stop pulling.
@@ -222,6 +234,11 @@ internal sealed class LazyChainRos : IDisposable
             }
             _prevFrame = _currentFrame;
             _currentFrame = seg.AssignedFrame;
+            // _currentFrame now owns the frame previously tracked by
+            // _pendingFrame (the trampoline pulled it during the prior
+            // segment's GetSpan). Clear pending so Dispose doesn't
+            // double-release.
+            _pendingFrame = default;
         }
         // else: seg[0]. _currentFrame was assigned at construction (= firstFrame).
         // _prevFrame is default (no prior frame). No rotation.
@@ -270,6 +287,10 @@ internal sealed class LazyChainRos : IDisposable
         var slice = frame.Memory.Slice(0, effective);
         placeholder.Fulfill(frame, slice);
         _linkedLength += effective;
+        // Track the just-pulled frame so Dispose can return it to the
+        // pool if the parser throws before reaching the rotation that
+        // would have promoted it to _currentFrame.
+        _pendingFrame = frame;
 
         if (_linkedLength < _totalBodyLen)
         {
@@ -301,6 +322,15 @@ internal sealed class LazyChainRos : IDisposable
         {
             _currentFrame.ReturnToPool();
             _currentFrame = default;
+        }
+        // Release any frame the trampoline pre-pulled for the next
+        // segment but the parser never advanced into. Without this,
+        // exception-during-parse paths would leak that frame's pool
+        // buffer (and its ZC ring reservation, if any).
+        if (_pendingFrame.Length > 0)
+        {
+            _pendingFrame.ReturnToPool();
+            _pendingFrame = default;
         }
     }
 }

@@ -155,8 +155,6 @@ internal sealed class ShmFrameWriter : IDisposable
 
     /// <summary>
     /// Writes an arbitrary frame inline on the caller's thread.
-    /// Caller MUST have called PauseWriterLoop first.
-    /// Does NOT drain the queue — caller is responsible for ordering.
     /// </summary>
     internal void WriteInlineFrame(FrameType type, uint streamId, byte flags, ReadOnlySpan<byte> payload, CancellationToken ct)
     {
