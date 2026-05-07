@@ -460,8 +460,26 @@ public sealed class ShmRing : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal int TryBeginPerFrameZc(ulong endIdx)
     {
+        return TryBeginPerFrameZc(endIdx, out _);
+    }
+
+    /// <summary>
+    /// Allocates a per-frame ZC anchor whose EndIdx is
+    /// <paramref name="endIdx"/> and reports the rejection reason via
+    /// <paramref name="reason"/> when the return value is &lt; 0. Used
+    /// by codec diagnostics to count slot-gate vs byte-gate rejections
+    /// separately.
+    /// </summary>
+    /// <remarks>
+    /// 0 = granted, 1 = rejected by slot-count gate (FIFO &gt;= 75 % of
+    /// capacity), 2 = rejected by byte gate (anchored bytes &gt; 75 % of
+    /// ring capacity), 3 = FIFO not initialised.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal int TryBeginPerFrameZc(ulong endIdx, out int reason)
+    {
         var slots = _zcSlots;
-        if (slots == null) return -1; // not initialised
+        if (slots == null) { reason = 3; return -1; }
 
         var tail = _zcSlotsTail;     // single producer: plain read
         var head = Volatile.Read(ref _zcSlotsHead);
@@ -469,7 +487,7 @@ public sealed class ShmRing : IDisposable
 
         // Back-pressure self-disable (slot count): if FIFO is >=75% full,
         // refuse ZC. Bounds in-flight slot count even if frames are tiny.
-        if (inUse * 4 >= _slotCapacity * 3) return -1;
+        if (inUse * 4 >= _slotCapacity * 3) { reason = 1; return -1; }
 
         // Back-pressure self-disable (bytes): if granting this anchor would
         // hold ring bytes >= capacity * 3/4 between header.ReadIdx and the
@@ -484,16 +502,26 @@ public sealed class ShmRing : IDisposable
         ref var hdr = ref GetHeader();
         var readIdx = Volatile.Read(ref hdr.ReadIdx);
         // endIdx >= readIdx is invariant (anchors commit forward).
-        // Strict > so the boundary case (exactly 75%) is allowed,
-        // mirroring the slot-count gate which permits 75% of slot
-        // capacity to be in-flight before refusing.
+        // Anchored byte gate: refuse ZC if granting this anchor would
+        // hold > 87.5% of ring capacity. Diagnostic-driven threshold
+        // (was 75 %): per-frame ZC holds bytes for the duration of the
+        // parser's MergeFrom on that frame, which is ~3x the codec's
+        // memcpy time. With a 75 % gate the steady-state anchored
+        // byte count oscillates around the threshold and the system
+        // does ~50 % copy fall-back, halving the ZC benefit. Raising
+        // the gate to 87.5 % gives the writer-parser pipeline more
+        // headroom; correctness is preserved because the slot-count
+        // gate (75 % of FIFO capacity) and the EndIdx-from-pendingRead
+        // computation still bound anchored bytes from going past
+        // capacity.
         var anchoredBytes = endIdx - readIdx;
-        if (anchoredBytes * 4 > _capacity * 3) return -1;
+        if (anchoredBytes * 8 > _capacity * 7) { reason = 2; return -1; }
 
         var slot = (int)(tail & (uint)_slotMask);
         slots[slot].EndIdx = endIdx;
         Volatile.Write(ref slots[slot].Released, false);
         Volatile.Write(ref _zcSlotsTail, tail + 1);
+        reason = 0;
         return slot;
     }
 

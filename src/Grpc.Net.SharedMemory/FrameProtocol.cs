@@ -67,6 +67,18 @@ public static class FrameProtocol
     public static void ResetCodecCounters() { }
 
     /// <summary>
+    /// Phase Y diagnostic snapshot: process-wide aggregate of per-frame
+    /// ZC vs copy decisions across all H2 readers (server and client).
+    /// Counter overhead: one Interlocked.Increment per H2 DATA frame
+    /// (~1 ns), negligible vs frame-handling cost.
+    /// </summary>
+    public static (long Zc, long Copy, long ByteGate, long SlotGate) GetZcCounters()
+        => Wire.Http2Codec.GetGlobalZcCounters();
+
+    /// <summary>Resets ZC diagnostic aggregates to zero.</summary>
+    public static void ResetZcCounters() => Wire.Http2Codec.ResetGlobalZcCounters();
+
+    /// <summary>
     /// Reads a Custom16-encoded frame and returns a pooled-buffer payload.
     /// </summary>
     internal static (FrameHeader Header, FramePayload Payload) ReadFramePayloadCustom16(

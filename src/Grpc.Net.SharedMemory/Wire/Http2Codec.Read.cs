@@ -34,6 +34,81 @@ internal static partial class Http2Codec
     private static readonly ConditionalWeakTable<ShmRing, Http2DecoderState> s_decoderState
         = new();
 
+    // Global Phase Y diagnostics aggregator. Per-ring counters in
+    // <see cref="Http2DecoderState"/> are summed here on every increment
+    // so benchmark / interop tooling can read process-wide totals
+    // without enumerating all live rings (which the
+    // ConditionalWeakTable doesn't easily expose). Single-process bench
+    // tools therefore see all server- and client-side reader paths
+    // aggregated. Negligible cost: one Interlocked.Increment per frame
+    // already on the slow path.
+    private static long s_globalZc;
+    private static long s_globalCopy;
+    private static long s_globalByteGate;
+    private static long s_globalSlotGate;
+
+    /// <summary>
+    /// Diagnostic snapshot of per-frame ZC vs copy decisions for a ring.
+    /// Returns (zcFrames, copyFrames, byteGateRejects, slotGateRejects).
+    /// Used by benchmark tooling (set <c>SHM_ZC_DIAG=1</c>) to observe
+    /// how often the FIFO byte-gate forces fall-back to copy under a
+    /// given ring/payload configuration.
+    /// </summary>
+    public static (long Zc, long Copy, long ByteGate, long SlotGate) GetZcCounters(ShmRing ring)
+    {
+        var state = GetState(ring);
+        return (state.ZcFrames, state.CopyFrames, state.ByteGateRejects, state.SlotGateRejects);
+    }
+
+    /// <summary>
+    /// Process-wide aggregate of per-frame ZC vs copy decisions across
+    /// all rings. <see cref="ResetGlobalZcCounters"/> zeroes them.
+    /// </summary>
+    public static (long Zc, long Copy, long ByteGate, long SlotGate) GetGlobalZcCounters()
+        => (
+            Volatile.Read(ref s_globalZc),
+            Volatile.Read(ref s_globalCopy),
+            Volatile.Read(ref s_globalByteGate),
+            Volatile.Read(ref s_globalSlotGate));
+
+    /// <summary>Resets global aggregates to zero. Useful between bench cells.</summary>
+    public static void ResetGlobalZcCounters()
+    {
+        Volatile.Write(ref s_globalZc, 0);
+        Volatile.Write(ref s_globalCopy, 0);
+        Volatile.Write(ref s_globalByteGate, 0);
+        Volatile.Write(ref s_globalSlotGate, 0);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void OnZc(Http2DecoderState state)
+    {
+        state.ZcFrames++;
+        Interlocked.Increment(ref s_globalZc);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void OnCopy(Http2DecoderState state)
+    {
+        state.CopyFrames++;
+        Interlocked.Increment(ref s_globalCopy);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void OnZcReject(Http2DecoderState state, int reason)
+    {
+        if (reason == 1)
+        {
+            state.SlotGateRejects++;
+            Interlocked.Increment(ref s_globalSlotGate);
+        }
+        else if (reason == 2)
+        {
+            state.ByteGateRejects++;
+            Interlocked.Increment(ref s_globalByteGate);
+        }
+    }
+
     /// <summary>Per-ring decoder state used to distinguish HEADERS vs trailers.</summary>
     /// <remarks>
     /// All access goes through the per-ring frame-reader thread (see
@@ -61,6 +136,19 @@ internal static partial class Http2Codec
         // dict but pay only per-stream-switch overhead.
         public uint LastStreamId;
         public LpmAccumulator? LastAcc;
+
+        // ===== Phase Y diagnostics (opt-in via SHM_ZC_DIAG=1) =====
+        // Counters track per-frame ZC vs copy decisions across the H2
+        // DATA path. Enabled lazily via env var read; in the disabled
+        // case the counters are still updated (Interlocked overhead
+        // ~1 ns / frame, negligible) but never printed. Allows
+        // benchmark tooling to observe oscillation between ZC and copy
+        // and tune the byte-gate / chain entry heuristics with real
+        // data instead of inference.
+        public long ZcFrames;       // frames surfaced as FromRingZcAnchor
+        public long CopyFrames;     // frames materialised to ArrayPool
+        public long ByteGateRejects;// TryBeginPerFrameZc returned -1 due to byte gate
+        public long SlotGateRejects;// TryBeginPerFrameZc returned -1 due to slot count gate
 
         // Synthetic-frame queue: a single H2 wire frame can produce more
         // than one logical internal frame. Two scenarios both depend on
@@ -474,18 +562,21 @@ internal static partial class Http2Codec
                     // protocol guarantees header.ReadIdx never advances
                     // past held bytes (see ShmRing.DrainReleasedAnchors).
                     ring.EnsureZcAnchorFifo();
-                    var slot = ring.TryBeginPerFrameZc(ring.PeekPendingReadIdx());
+                    var slot = ring.TryBeginPerFrameZc(ring.PeekPendingReadIdx(), out var rsn);
                     if (slot >= 0)
                     {
+                        OnZc(state);
                         return (hdr, FramePayload.FromRingZcAnchor(
                             payloadReservation.First.Slice(0, bodyLength), ring, slot));
                     }
+                    OnZcReject(state, rsn);
                     // FIFO at >=75% capacity: fall through to copy.
                 }
 
                 var pooled = ArrayPool<byte>.Shared.Rent(bodyLength);
                 bodySpan.CopyTo(pooled);
                 ring.CommitReadAnchored(ring.PeekPendingReadIdx());
+                OnCopy(state);
                 return (hdr, FramePayload.FromPooled(pooled, bodyLength));
             }
             // Falls through: the DATA carries a partial LPM (chain-ZC
@@ -542,7 +633,7 @@ internal static partial class Http2Codec
                     // through to the slow copy path so readIdx stays
                     // unblocked.
                     ring.EnsureZcAnchorFifo();
-                    var slot = ring.TryBeginPerFrameZc(ring.PeekPendingReadIdx());
+                    var slot = ring.TryBeginPerFrameZc(ring.PeekPendingReadIdx(), out var rsn);
                     if (slot >= 0)
                     {
                         var acc = GetOrAddAcc(state, streamId);
@@ -557,9 +648,11 @@ internal static partial class Http2Codec
 
                         var chainHdr = new FrameHeader(FrameType.Message, streamId,
                             (uint)bodyLength, MessageFlags.More);
+                        OnZc(state);
                         return (chainHdr, FramePayload.FromRingZcAnchor(
                             payloadReservation.First.Slice(0, bodyLength), ring, slot));
                     }
+                    OnZcReject(state, rsn);
                 }
             }
             // Falls through to slow path: bigger-than-frame budget OK,
@@ -1003,7 +1096,7 @@ internal static partial class Http2Codec
             && ring.IsZcEligibleForAnchor(bodyLength, contiguous: true))
         {
             ring.EnsureZcAnchorFifo();
-            var slot = ring.TryBeginPerFrameZc(ring.PeekPendingReadIdx());
+            var slot = ring.TryBeginPerFrameZc(ring.PeekPendingReadIdx(), out var rsn);
             if (slot >= 0)
             {
                 if (isLast)
@@ -1035,9 +1128,11 @@ internal static partial class Http2Codec
                 if (isLast && endStream) msgFlags |= MessageFlags.EndStream;
                 var hdr = new FrameHeader(FrameType.Message, streamId,
                     (uint)bodyLength, msgFlags);
+                OnZc(state);
                 return (hdr, FramePayload.FromRingZcAnchor(
                     payloadReservation.First.Slice(0, bodyLength), ring, slot));
             }
+            OnZcReject(state, rsn);
             // FIFO at >=75% capacity: fall through to copy.
         }
 
@@ -1054,6 +1149,7 @@ internal static partial class Http2Codec
                 CopyFromReservationSlice(payloadReservation, bodyOffset, pooled.AsSpan(0, bodyLength));
             }
             ring.CommitReadAnchored(ring.PeekPendingReadIdx());
+            OnCopy(state);
 
             if (isLast)
             {

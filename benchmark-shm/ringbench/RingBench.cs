@@ -178,6 +178,17 @@ foreach (var startEnv in new Func<Task<BenchEnv>>[] { StartTcpEnv, StartShmEnv, 
 
     var clientCounters = FrameProtocol.GetCodecCounters();
     Console.WriteLine($"  client codec-counters: c16-read={clientCounters.Custom16Read} h2-read={clientCounters.Http2Read} c16-write={clientCounters.Custom16Write} h2-write={clientCounters.Http2Write}");
+
+    // Phase Y diagnostics: per-frame ZC vs copy across all H2 readers
+    // (server + client). Always printed; the global counters'
+    // Interlocked overhead is ~1 ns/frame and benchmark output is
+    // informational. Reset between transports so each block reports
+    // counts attributable only to its own runs.
+    var zcStats = FrameProtocol.GetZcCounters();
+    var totalFrames = zcStats.Zc + zcStats.Copy;
+    var zcPct = totalFrames > 0 ? 100.0 * zcStats.Zc / totalFrames : 0;
+    Console.WriteLine($"  zc-counters: zc={zcStats.Zc} copy={zcStats.Copy} ({zcPct:F1}% ZC) byte-gate-rejects={zcStats.ByteGate} slot-gate-rejects={zcStats.SlotGate}");
+    FrameProtocol.ResetZcCounters();
     Console.WriteLine();
 }
 
