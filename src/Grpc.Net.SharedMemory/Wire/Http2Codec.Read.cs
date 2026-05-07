@@ -159,17 +159,6 @@ internal static partial class Http2Codec
         // the anchor.
         public bool ChainMode;
 
-        // Phase Y safety: when an LPM's declared total size exceeds
-        // 3/4 of the ring capacity, we force the entire LPM down the
-        // copy path. ZC anchors held across many DATA frames would
-        // otherwise pin readIdx and starve the ring writer
-        // (LazyChainRos releases anchors as the parser advances, but
-        // the codec produces frames into an unbounded channel ahead
-        // of the parser — 6+ in-flight 128 KiB chunks on a 1 MiB ring
-        // already exceed capacity). Set on the first DATA, checked
-        // by every DATA continuation; cleared by <see cref="Reset"/>.
-        public bool ForceCopy;
-
         public void Reset()
         {
             HeaderBytesSeen = 0;
@@ -177,7 +166,6 @@ internal static partial class Http2Codec
             BodyEmitted = 0;
             HeaderEmittedAsChunk = false;
             ChainMode = false;
-            ForceCopy = false;
         }
     }
 
@@ -525,16 +513,17 @@ internal static partial class Http2Codec
             if (declaredLpmBody <= (uint)int.MaxValue - 5)
             {
                 var totalLpm = (long)declaredLpmBody + 5L;
-                // Per-LPM ZC gate: if the entire LPM would not fit in
-                // 3/4 of the ring, ZC anchors held across its DATA frames
-                // would pin readIdx and starve the writer. Force the
-                // whole LPM through the copy path — LazyChainRos still
-                // gives sliding-window pool footprint, but readIdx
-                // advances every DATA so the ring stays drained.
-                var ringCap = (long)ring.Capacity;
-                var bigLpm = totalLpm > (ringCap >> 2) * 3;
+                // No per-LPM size gate: per-frame ZC anchors release as
+                // LazyChainRos's parser advances (typically holding only
+                // 2-3 frames at any instant), and the FIFO byte-gate
+                // (75 % of ring capacity) inside TryBeginPerFrameZc
+                // self-throttles to copy-path when the channel fills
+                // ahead of the parser. Even a 256 MB LPM on a 1 MiB ring
+                // is safe: each frame independently picks ZC vs copy,
+                // and the EndIdx-from-PeekPendingReadIdx fix ensures
+                // anchored bytes are computed correctly so the byte-gate
+                // throttles at the right moment.
                 if (totalLpm > bodyLength
-                    && !bigLpm
                     && ring.IsZcEligibleForAnchor(payloadLength: payloadLen, contiguous: true))
                 {
                     // END_STREAM on the LPM's first DATA frame, but the LPM
