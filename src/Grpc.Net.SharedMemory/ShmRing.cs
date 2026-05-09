@@ -502,20 +502,11 @@ public sealed class ShmRing : IDisposable
         ref var hdr = ref GetHeader();
         var readIdx = Volatile.Read(ref hdr.ReadIdx);
         // endIdx >= readIdx is invariant (anchors commit forward).
-        // Anchored byte gate: refuse ZC if granting this anchor would
-        // hold > 87.5% of ring capacity. Diagnostic-driven threshold
-        // (was 75 %): per-frame ZC holds bytes for the duration of the
-        // parser's MergeFrom on that frame, which is ~3x the codec's
-        // memcpy time. With a 75 % gate the steady-state anchored
-        // byte count oscillates around the threshold and the system
-        // does ~50 % copy fall-back, halving the ZC benefit. Raising
-        // the gate to 87.5 % gives the writer-parser pipeline more
-        // headroom; correctness is preserved because the slot-count
-        // gate (75 % of FIFO capacity) and the EndIdx-from-pendingRead
-        // computation still bound anchored bytes from going past
-        // capacity.
+        // Strict > so the boundary case (exactly 75%) is allowed,
+        // mirroring the slot-count gate which permits 75% of slot
+        // capacity to be in-flight before refusing.
         var anchoredBytes = endIdx - readIdx;
-        if (anchoredBytes * 8 > _capacity * 7) { reason = 2; return -1; }
+        if (anchoredBytes * 4 > _capacity * 3) { reason = 2; return -1; }
 
         var slot = (int)(tail & (uint)_slotMask);
         slots[slot].EndIdx = endIdx;
