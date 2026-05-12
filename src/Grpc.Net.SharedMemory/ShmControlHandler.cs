@@ -1112,6 +1112,22 @@ internal sealed class ShmControlResponseContent : HttpContent,
     private List<InboundFrame>? _chainFrames;
     private int _chainBodySize;          // accumulated body size (excludes LPM 5-byte header at chain start)
 
+    // Client-side lazy-chain ROS for streaming multi-chunk uncompressed
+    // messages. Built when the first chunk (More=1, compFlag=0) arrives;
+    // pulls subsequent chunks synchronously as the caller's MergeFrom
+    // advances and releases each pool buffer immediately after the parser
+    // consumes it. Pool peak ~2 chunks regardless of LPM size (vs
+    // O(message) under the legacy BufferSegment-collect-then-MergeFrom
+    // path).
+    //
+    // _lazyChainSawEndStream tracks whether the puller observed EndStream
+    // on the final chunk; surfaced to the caller via the (Empty, EOS=true)
+    // sentinel return on the NEXT ReadNextMessage* call (EOS is not known
+    // when we return the ROS - it is discovered inside MergeFrom when
+    // the parser pulls the last chunk).
+    private LazyChainRos? _lazyChain;
+    private bool _lazyChainSawEndStream;
+
     // Multi-frame accumulation (compressed path only). Allocated lazily
     // via ArrayPool when the compressed code path needs a contiguous
     // buffer; returned to ArrayPool on Dispose. ArrayPool's LOH bucket
@@ -1281,6 +1297,22 @@ internal sealed class ShmControlResponseContent : HttpContent,
         ReleaseChain();
         _assembledPos = 0;
 
+        // Dispose any lazy-chain from the PREVIOUS message; if its puller
+        // observed EndStream, surface (Empty, true) immediately without
+        // touching the channel further.
+        if (_lazyChain != null)
+        {
+            _lazyChain.Dispose();
+            _lazyChain = null;
+            if (_lazyChainSawEndStream)
+            {
+                _lazyChainSawEndStream = false;
+                _stream.MarkHalfCloseReceived();
+                ApplyTrailers();
+                return new ValueTask<(ReadOnlySequence<byte>, bool)>((ReadOnlySequence<byte>.Empty, true));
+            }
+        }
+
         // Fast path: try sync read.
         while (_stream.TryReceiveFrame(out var frame))
         {
@@ -1317,15 +1349,65 @@ internal sealed class ShmControlResponseContent : HttpContent,
                 //     _assembled until END.
                 if ((frame.Flags & MessageFlags.More) != 0)
                 {
-                    bool firstChunk = _chainHead == null && _assembledPos == 0;
+                    bool firstChunk = _chainHead == null && _assembledPos == 0 && _lazyChain == null;
+
+                    // Multi-frame UNCOMPRESSED messages take the
+                    // LazyChainRos path. Synchronously pulls subsequent
+                    // chunks as the caller's MergeFrom advances; pool
+                    // buffer footprint drops from O(message-size) to ~2
+                    // chunks. EndStream is captured by the puller closure
+                    // and surfaced on the NEXT ReadNextMessage* call.
+                    if (firstChunk && frame.Length >= 5 && frame.Memory.Span[0] == 0)
+                    {
+                        var lpmBodyLen = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(
+                            frame.Memory.Span.Slice(1, 4));
+
+                        InboundFrame? Pull(CancellationToken pullCt)
+                        {
+                            var pulled = _stream.ReceiveFrameSync(pullCt);
+                            if (pulled is null) return null;
+                            if (pulled.Value.Type != FrameType.Message)
+                            {
+                                // Non-Message frame mid-LPM-body: release
+                                // and treat as truncation; the original
+                                // frame will be re-processed on the next
+                                // ReadNextMessage call.
+                                pulled.Value.ReturnToPool();
+                                return null;
+                            }
+                            if ((pulled.Value.Flags & MessageFlags.EndStream) != 0)
+                            {
+                                _lazyChainSawEndStream = true;
+                            }
+                            return pulled.Value;
+                        }
+
+                        // EndStream may also be set on the FIRST chunk
+                        // itself (More=1 + EndStream is unusual but
+                        // theoretically valid).
+                        if ((frame.Flags & MessageFlags.EndStream) != 0)
+                        {
+                            _lazyChainSawEndStream = true;
+                        }
+
+                        _lazyChain = new LazyChainRos(
+                            frame, firstFrameBodyOffset: 5,
+                            totalBodyLen: lpmBodyLen,
+                            pullNext: Pull,
+                            ct: _stream.DisposeCancellationToken);
+                        // Return ROS to the caller. EndStream is NOT yet
+                        // known - it surfaces on the NEXT ReadNextMessage
+                        // call once the puller sees the final chunk.
+                        return (_lazyChain.Sequence, false);
+                    }
+
                     bool useChain;
                     if (firstChunk)
                     {
-                        // Sniff compFlag from the first byte. Frames are
-                        // guaranteed at least 5 bytes here because the writer
-                        // always emits the LPM header in the first frame.
-                        var compFlagFirst = frame.Memory.Span[0];
-                        useChain = compFlagFirst == 0;
+                        // Only reached when compFlag != 0 (compressed
+                        // multi-frame first chunk). Falls through to the
+                        // contiguous _assembled buffer.
+                        useChain = false;
                     }
                     else
                     {
@@ -1682,6 +1764,12 @@ internal sealed class ShmControlResponseContent : HttpContent,
             _currentFrame.ReturnToPool();
             _currentFrame = default;
             ReleaseChain();
+
+            if (_lazyChain != null)
+            {
+                _lazyChain.Dispose();
+                _lazyChain = null;
+            }
 
             if (_assembled != null)
             {
