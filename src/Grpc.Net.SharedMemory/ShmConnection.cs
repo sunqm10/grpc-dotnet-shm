@@ -763,9 +763,36 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         // Check if stream already exists
         if (_streams.TryGetValue(streamId, out var existingStream))
         {
-            // Route to existing stream (e.g., response headers for client)
+            // Route to existing stream (e.g., response headers for client).
+            //
+            // Round-7 perf: under high concurrency (N>>1 active streams),
+            // dispatching response HEADERS inline on the reader Thread
+            // can head-of-line block other streams' frames when the user
+            // awaiter for the HEADERS task runs synchronously on the
+            // reader (AllowSynchronousContinuations=true is on by
+            // default when the striper is enabled). Route HEADERS
+            // through the striper in that regime so any user inline
+            // work runs on the per-stream stripe Thread instead.
+            //
+            // FIFO is preserved per stream because DATA / Trailers
+            // already go through the same striper using the same
+            // StreamId hash \u2014 HEADERS, DATA, Trailers for stream N
+            // all land on stripe StripeIndex(N).
+            //
+            // Keep direct path at ActiveStreamCount <= 1 to avoid
+            // adding a stripe-queue hop on the unary-microbench hot
+            // path. A false-negative (N grew between check and write)
+            // is just one frame taking the slower path: not a
+            // correctness issue.
             var frame = new InboundFrame(header.Type, payload, header.Flags);
-            existingStream.OnFrameReceived(frame);
+            if (_receiveStriper != null && ActiveStreamCount > 1)
+            {
+                _receiveStriper.Enqueue(streamId, frame);
+            }
+            else
+            {
+                existingStream.OnFrameReceived(frame);
+            }
             return;
         }
 

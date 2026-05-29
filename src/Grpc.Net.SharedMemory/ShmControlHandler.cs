@@ -628,7 +628,12 @@ public sealed class ShmControlHandler : HttpMessageHandler
 
     private static Metadata? ExtractMetadata(HttpRequestHeaders headers)
     {
-        var metadata = new Metadata();
+        // Round-7 perf: lazy-allocate. The dominant case (gRPC unary call
+        // with no user metadata) walks the headers, hits no surviving
+        // entry, and the old code still allocated a fresh Metadata
+        // instance just to return null. Allocate only when we find the
+        // first non-skipped entry — saves one alloc per RPC.
+        Metadata? metadata = null;
 
         foreach (var header in headers)
         {
@@ -650,18 +655,18 @@ public sealed class ShmControlHandler : HttpMessageHandler
                     // Binary metadata — skip malformed base64 instead of crashing.
                     try
                     {
-                        metadata.Add(new Metadata.Entry(header.Key, Convert.FromBase64String(value)));
+                        (metadata ??= new Metadata()).Add(new Metadata.Entry(header.Key, Convert.FromBase64String(value)));
                     }
                     catch (FormatException) { /* malformed base64 — skip */ }
                 }
                 else
                 {
-                    metadata.Add(new Metadata.Entry(header.Key, value));
+                    (metadata ??= new Metadata()).Add(new Metadata.Entry(header.Key, value));
                 }
             }
         }
 
-        return metadata.Count > 0 ? metadata : null;
+        return metadata;
     }
 
     private static DateTime? ExtractDeadline(HttpRequestHeaders headers)
