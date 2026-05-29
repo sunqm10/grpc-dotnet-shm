@@ -1197,7 +1197,14 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// Receives the next frame from the stream.
     /// </summary>
     /// <returns>The frame, or null if the stream is closed.</returns>
-    public Task<InboundFrame?> ReceiveFrameAsync(CancellationToken cancellationToken = default)
+    /// <remarks>
+    /// Round-8 PR-C2: returns <see cref="ValueTask{TResult}"/> so the
+    /// synchronously-completed fast path (frame already buffered in the
+    /// per-stream channel — the dominant case under load) does not
+    /// allocate a <see cref="Task{TResult}"/>. <c>await</c> works
+    /// identically for ValueTask and Task callers.
+    /// </remarks>
+    public ValueTask<InboundFrame?> ReceiveFrameAsync(CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
 
@@ -1218,7 +1225,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                     }
                 }
             }
-            return Task.FromResult<InboundFrame?>(frame);
+            return new ValueTask<InboundFrame?>(frame);
         }
 
         // Slow path: need to wait for a frame.
@@ -1336,7 +1343,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         return null;
     }
 
-    private async Task<InboundFrame?> ReceiveFrameSlowAsync(CancellationToken cancellationToken)
+    private async ValueTask<InboundFrame?> ReceiveFrameSlowAsync(CancellationToken cancellationToken)
     {
         // Only create LinkedCTS when the caller provided a cancellable token.
         // In streaming steady state, grpc-dotnet typically passes default.
@@ -1433,21 +1440,33 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             throw new InvalidOperationException("Only client receives response headers");
 
         var frameTask = ReceiveFrameAsync(cancellationToken);
-        if (frameTask.IsCompletedSuccessfully)
+        if (!frameTask.IsCompletedSuccessfully)
         {
-            var frame = frameTask.Result;
-            if (frame != null && frame.Value.Type == FrameType.Headers)
-            {
-                _responseHeaders = frame.Value.AsHeaders();
-                frame.Value.ReturnToPool();
-                return Task.FromResult(_responseHeaders);
-            }
+            // Slow path: hand the unresolved ValueTask to the async slow
+            // helper which awaits it exactly once (ValueTask single-
+            // consume invariant).
+            return ReceiveResponseHeadersSlowAsync(frameTask, cancellationToken);
         }
-        return ReceiveResponseHeadersSlowAsync(frameTask, cancellationToken);
+
+        // Fast path completed synchronously: consume the ValueTask result
+        // here (exactly once) and dispatch on the resolved frame.
+        var firstFrame = frameTask.Result;
+        if (firstFrame != null && firstFrame.Value.Type == FrameType.Headers)
+        {
+            _responseHeaders = firstFrame.Value.AsHeaders();
+            firstFrame.Value.ReturnToPool();
+            return Task.FromResult(_responseHeaders);
+        }
+        // Fast path completed but the first frame wasn't HEADERS (e.g.,
+        // server returned trailers-only refusal). Re-wrap the already-
+        // resolved frame as a completed ValueTask so the slow path can
+        // await it without re-consuming the original.
+        return ReceiveResponseHeadersSlowAsync(
+            new ValueTask<InboundFrame?>(firstFrame), cancellationToken);
     }
 
     private async Task<HeadersV1> ReceiveResponseHeadersSlowAsync(
-        Task<InboundFrame?> firstFrameTask, CancellationToken cancellationToken)
+        ValueTask<InboundFrame?> firstFrameTask, CancellationToken cancellationToken)
     {
         var firstFrame = await firstFrameTask.ConfigureAwait(false);
         if (firstFrame == null)
