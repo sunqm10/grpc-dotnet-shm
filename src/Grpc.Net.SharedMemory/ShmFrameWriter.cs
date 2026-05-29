@@ -1667,6 +1667,27 @@ internal sealed class ShmFrameWriter : IDisposable
     }
 
     /// <summary>
+    /// Round-7 PR-B object-passthrough inline write: emits a HEADERS frame
+    /// directly from a <see cref="HeadersV1"/> object. Caller MUST hold
+    /// <see cref="TryPauseWriterLoop"/>. Avoids the
+    /// <c>HeadersV1.Encode → bytes → DecodeHeadersV1</c> round-trip the
+    /// byte path goes through (~2.18 µs + 104 B saved per HEADERS frame,
+    /// per HeaderPathProfileTests).
+    /// </summary>
+    internal void WriteInlineHeadersFrame(uint streamId, HeadersV1 headers, CancellationToken ct)
+    {
+        FrameProtocol.WriteHeadersFrame(_ring, streamId, headers, ct);
+    }
+
+    /// <summary>
+    /// Round-7 PR-B companion to <see cref="WriteInlineHeadersFrame"/> for TRAILERS.
+    /// </summary>
+    internal void WriteInlineTrailersFrame(uint streamId, TrailersV1 trailers, CancellationToken ct)
+    {
+        FrameProtocol.WriteTrailersFrame(_ring, streamId, trailers, ct);
+    }
+
+    /// <summary>
     /// Inline-write fallback for wire formats where the hand-crafted SHM
     /// header path doesn't apply (e.g. HTTP/2 — its codec needs to own
     /// the on-wire header layout). Serialises the protobuf message into

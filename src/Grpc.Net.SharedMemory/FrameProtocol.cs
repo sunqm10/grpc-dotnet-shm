@@ -84,6 +84,24 @@ public static class FrameProtocol
         => Wire.Http2Codec.WriteFrame(ring, header, payload1, payload2, cancellationToken);
 
     /// <summary>
+    /// Round-7 PR-B: writes a HEADERS frame directly from a <see cref="HeadersV1"/>
+    /// object, skipping the <c>HeadersV1.Encode → bytes → HeadersV1.Decode</c>
+    /// round-trip the byte path requires. Saves ~4.36 µs + 312 B per Unary RPC
+    /// (measured by HeaderPathProfileTests). Use this whenever you have the
+    /// already-built object in hand.
+    /// </summary>
+    public static void WriteHeadersFrame(
+        ShmRing ring, uint streamId, HeadersV1 headers, CancellationToken cancellationToken = default)
+        => Wire.Http2Codec.WriteH2HeadersFromObject(ring, streamId, headers, cancellationToken);
+
+    /// <summary>
+    /// Round-7 PR-B companion to <see cref="WriteHeadersFrame"/> for TRAILERS.
+    /// </summary>
+    public static void WriteTrailersFrame(
+        ShmRing ring, uint streamId, TrailersV1 trailers, CancellationToken cancellationToken = default)
+        => Wire.Http2Codec.WriteH2TrailersFromObject(ring, streamId, trailers, cancellationToken);
+
+    /// <summary>
     /// Writes a PING frame.
     /// </summary>
     public static void WritePing(ShmRing ring, byte flags, ReadOnlySpan<byte> data, CancellationToken cancellationToken = default)

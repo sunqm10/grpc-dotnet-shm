@@ -135,8 +135,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     // batch -> 1 SignalData wake for the whole request. If the body is
     // too big or non-protobuf, FlushStagedHeadersAsync sends the staged
     // Headers via the existing queued path (today's behavior preserved).
-    private byte[]? _stagedHeadersPayload;
-    private int _stagedHeadersPayloadLength;
+    //
+    // Round-7 PR-B: stores the HeadersV1 OBJECT directly (no upfront
+    // Encode to bytes). WriteStagedHeadersInline HPACK-encodes from the
+    // object via the new object-passthrough API; FlushStagedHeadersAsync
+    // encodes on demand only for the (cold) queued fallback path.
+    private HeadersV1? _stagedHeaders;
     private int _stagedHeadersConsumed; // 0=available, 1=already sent or aborted
 
     // Diagnostic counters for the wake-coalescing path. Static across
@@ -549,8 +553,6 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             Metadata = ConvertMetadata(metadata)
         };
 
-        var (payload, payloadLength) = _requestHeaders.Encode();
-
         // Single-stream-mode inline-write fast path. When the connection
         // negotiated single-stream mode and only one stream is active,
         // bypass the WriterLoop queue and write Headers directly to the
@@ -566,6 +568,11 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         // Routing Headers through the same TryPause path serialises the
         // sends through `_inlineWriterActive` CAS; both writes go to the
         // ring in caller-thread order, no race.
+        //
+        // Round-7 PR-B: inline path now uses WriteInlineHeadersFrame which
+        // takes a HeadersV1 OBJECT and HPACK-encodes it directly,
+        // skipping the HeadersV1.Encode → bytes → DecodeHeadersV1
+        // round-trip the byte path requires.
         //
         // Falls back to the queued path when:
         //   * not in single-stream mode (multi-stream pipelining wants
@@ -593,8 +600,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                         var batchOpened = true;
                         try
                         {
-                            writer.WriteInlineFrame(FrameType.Headers, StreamId,
-                                HeadersFlags.Initial, payload.AsSpan(0, payloadLength), default);
+                            writer.WriteInlineHeadersFrame(StreamId, _requestHeaders, default);
                             Volatile.Write(ref _pendingInlineBatch, 1);
                             batchOpened = false; // ownership transferred to HalfClose / Dispose
                         }
@@ -605,20 +611,19 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                     }
                     else
                     {
-                        writer.WriteInlineFrame(FrameType.Headers, StreamId,
-                            HeadersFlags.Initial, payload.AsSpan(0, payloadLength), default);
+                        writer.WriteInlineHeadersFrame(StreamId, _requestHeaders, default);
                     }
                     return Task.CompletedTask;
                 }
                 finally
                 {
-                    ArrayPool<byte>.Shared.Return(payload);
                     writer.ResumeWriterLoop();
                 }
             }
         }
 
-        if (payloadLength <= 512)
+        // Fall-back queued path: encode to bytes for the queue.
+        var (payload, payloadLength) = _requestHeaders.Encode();        if (payloadLength <= 512)
         {
             Task task;
             try
@@ -693,9 +698,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             Metadata = ConvertMetadata(metadata)
         };
 
-        var (payload, payloadLength) = _requestHeaders.Encode();
-        _stagedHeadersPayload = payload;
-        _stagedHeadersPayloadLength = payloadLength;
+        // Round-7 PR-B: store the HeadersV1 object directly — the inline
+        // flush path (WriteStagedHeadersInline) HPACK-encodes from the
+        // object without a HeadersV1.Encode round-trip. Encoding to bytes
+        // happens lazily only if FlushStagedHeadersAsync (cold queued
+        // fallback) is invoked instead.
+        _stagedHeaders = _requestHeaders;
         Volatile.Write(ref _stagedHeadersConsumed, 0);
     }
 
@@ -705,15 +713,15 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// </summary>
     internal bool HasStagedHeaders =>
         Volatile.Read(ref _stagedHeadersConsumed) == 0
-        && _stagedHeadersPayload != null;
+        && _stagedHeaders != null;
 
     /// <summary>
     /// Writes the staged Headers frame inline via <paramref name="writer"/>'s
     /// direct ring-write path. Caller MUST already hold
-    /// <c>writer.TryPauseWriterLoop</c>. The pooled payload buffer is
-    /// returned to <see cref="System.Buffers.ArrayPool{T}"/> after the
-    /// write. No-op if Headers were already consumed (idempotent under
-    /// CAS race with <see cref="FlushStagedHeadersAsync"/>).
+    /// <c>writer.TryPauseWriterLoop</c>. No-op if Headers were already
+    /// consumed (idempotent under CAS race with
+    /// <see cref="FlushStagedHeadersAsync"/>). Round-7 PR-B: uses the
+    /// object-passthrough API — no buffer to manage.
     /// </summary>
     internal void WriteStagedHeadersInline(ShmFrameWriter writer)
     {
@@ -721,19 +729,10 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         {
             return; // already consumed
         }
-        var payload = _stagedHeadersPayload;
-        var len = _stagedHeadersPayloadLength;
-        _stagedHeadersPayload = null;
-        if (payload == null) return;
-        try
-        {
-            writer.WriteInlineFrame(FrameType.Headers, StreamId,
-                HeadersFlags.Initial, payload.AsSpan(0, len), default);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(payload);
-        }
+        var headers = _stagedHeaders;
+        _stagedHeaders = null;
+        if (headers == null) return;
+        writer.WriteInlineHeadersFrame(StreamId, headers, default);
     }
 
     /// <summary>
@@ -749,10 +748,15 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         {
             return Task.CompletedTask; // already consumed
         }
-        var payload = _stagedHeadersPayload;
-        var len = _stagedHeadersPayloadLength;
-        _stagedHeadersPayload = null;
-        if (payload == null) return Task.CompletedTask;
+        var headers = _stagedHeaders;
+        _stagedHeaders = null;
+        if (headers == null) return Task.CompletedTask;
+
+        // Round-7 PR-B: cold fall-back path — the queued send still goes
+        // through byte serialization. Encode lazily here only when we
+        // actually reach this path (the inline fast-path in
+        // WriteStagedHeadersInline avoided the encode entirely).
+        var (payload, len) = headers.Encode();
 
         if (len <= 512)
         {
@@ -854,13 +858,9 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         if (_responseHeaders != null) return;
         metadata = InjectResponseEncoding(metadata);
         _responseHeaders = new HeadersV1 { Version = 1, HeaderType = 1, Metadata = ConvertMetadata(metadata) };
-        var (payload, payloadLength) = _responseHeaders.Encode();
-        try
-        {
-            writer.WriteInlineFrame(FrameType.Headers, StreamId, HeadersFlags.Initial,
-                payload.AsSpan(0, payloadLength), default);
-        }
-        finally { ArrayPool<byte>.Shared.Return(payload); }
+        // Round-7 PR-B: object-passthrough inline write (no upfront
+        // HeadersV1.Encode → bytes → DecodeHeadersV1 round-trip).
+        writer.WriteInlineHeadersFrame(StreamId, _responseHeaders, default);
     }
 
     private bool HasSentInitialHeaders()
@@ -1074,16 +1074,8 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             Metadata = ConvertMetadata(metadata)
         };
 
-        var (payload, payloadLength) = _trailers.Encode();
-        try
-        {
-            writer.WriteInlineFrame(FrameType.Trailers, StreamId, TrailersFlags.EndStream,
-                payload.AsSpan(0, payloadLength), default);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(payload);
-        }
+        // Round-7 PR-B: object-passthrough inline write.
+        writer.WriteInlineTrailersFrame(StreamId, _trailers, default);
         Volatile.Write(ref _halfCloseSent, 1);
     }
 
@@ -2139,17 +2131,13 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         // Safety: if StageRequestHeaders was called but neither
         // WriteStagedHeadersInline nor FlushStagedHeadersAsync ran
-        // (e.g., request cancelled before body write), return the
-        // rented headers buffer to the pool to prevent a leak.
+        // (e.g., request cancelled before body write), clear the staged
+        // HeadersV1 reference so the object can be GC'd. Round-7 PR-B:
+        // no pooled buffer to return — staged storage is now just the
+        // managed object reference.
         if (Interlocked.Exchange(ref _stagedHeadersConsumed, 1) == 0)
         {
-            var staged = _stagedHeadersPayload;
-            _stagedHeadersPayload = null;
-            if (staged != null)
-            {
-                try { ArrayPool<byte>.Shared.Return(staged); }
-                catch { /* best effort */ }
-            }
+            _stagedHeaders = null;
         }
 
         _disposeCts.Cancel();
