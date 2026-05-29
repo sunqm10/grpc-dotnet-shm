@@ -827,11 +827,16 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 return;
             }
 
-            // Decode headers
+            // Decode headers — round-7 PR-B: prefer the pre-decoded
+            // object attached by the H2 codec read path (avoids the
+            // HeadersV1 → bytes → HeadersV1 round-trip the byte
+            // fallback path requires). Falls back to byte decode if the
+            // codec didn't attach an object (defensive).
             HeadersV1 headersV1;
             try
             {
-                headersV1 = HeadersV1.Decode(payload.Memory.Span);
+                headersV1 = payload.DecodedHeader as HeadersV1
+                    ?? HeadersV1.Decode(payload.Memory.Span);
             }
             catch (Exception ex)
             {

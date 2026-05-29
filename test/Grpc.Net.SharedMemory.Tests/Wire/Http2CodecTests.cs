@@ -84,7 +84,11 @@ public class Http2CodecTests
         {
             Assert.That(rh.Type, Is.EqualTo(FrameType.Headers));
             Assert.That(rh.StreamId, Is.EqualTo(1u));
-            var rt = HeadersV1.Decode(rp.Memory.Span);
+            // Round-7 PR-B: codec attaches the decoded HeadersV1 object
+            // directly to FramePayload.DecodedHeader, eliminating the
+            // bytes → HeadersV1 round-trip. Fall back to byte decode if
+            // the object isn't attached (defensive).
+            var rt = rp.DecodedHeader as HeadersV1 ?? HeadersV1.Decode(rp.Memory.Span);
             Assert.That(rt.HeaderType, Is.EqualTo((byte)0));
             Assert.That(rt.Method, Is.EqualTo(v1.Method));
             Assert.That(rt.Authority, Is.EqualTo(v1.Authority));
@@ -131,7 +135,8 @@ public class Http2CodecTests
         {
             Assert.That(hdr2.Type, Is.EqualTo(FrameType.Trailers));
             Assert.That(hdr2.StreamId, Is.EqualTo(streamId));
-            var rt = TrailersV1.Decode(pld2.Memory.Span);
+            // Round-7 PR-B: prefer codec-attached object over byte decode.
+            var rt = pld2.DecodedHeader as TrailersV1 ?? TrailersV1.Decode(pld2.Memory.Span);
             Assert.That(rt.GrpcStatusCode, Is.EqualTo(global::Grpc.Core.StatusCode.OK));
             Assert.That(rt.GrpcStatusMessage, Is.EqualTo("ok"));
             Assert.That(rt.Metadata.Count, Is.EqualTo(1));
@@ -264,7 +269,8 @@ public class Http2CodecTests
             // check at the internal-frame level.
             Assert.That(h1.Flags, Is.EqualTo((byte)HeadersFlags.Initial));
 
-            var hv1 = HeadersV1.Decode(p1.Memory.Span);
+            // Round-7 PR-B: prefer codec-attached object over byte decode.
+            var hv1 = p1.DecodedHeader as HeadersV1 ?? HeadersV1.Decode(p1.Memory.Span);
             Assert.That(hv1.HeaderType, Is.EqualTo((byte)1),
                 "Trailers-only's Headers half maps to server-initial style.");
         }
@@ -283,7 +289,8 @@ public class Http2CodecTests
             Assert.That(h2.Flags & TrailersFlags.EndStream, Is.EqualTo(TrailersFlags.EndStream),
                 "Trailers half must carry EndStream (signals call completion).");
 
-            var tv1 = TrailersV1.Decode(p2.Memory.Span);
+            // Round-7 PR-B: prefer codec-attached object over byte decode.
+            var tv1 = p2.DecodedHeader as TrailersV1 ?? TrailersV1.Decode(p2.Memory.Span);
             Assert.That(tv1.GrpcStatusCode, Is.EqualTo(global::Grpc.Core.StatusCode.NotFound),
                 "Trailers half must carry the parsed grpc-status (gRFC G3).");
             Assert.That(tv1.GrpcStatusMessage, Is.EqualTo("not found"),
@@ -830,7 +837,8 @@ public class Http2CodecTests
                 Assert.That(h.Type, Is.EqualTo(FrameType.Headers));
                 Assert.That(h.StreamId, Is.EqualTo(streamId));
 
-                var hv1 = HeadersV1.Decode(p.Memory.Span);
+                // Round-7 PR-B: prefer codec-attached object over byte decode.
+                var hv1 = p.DecodedHeader as HeadersV1 ?? HeadersV1.Decode(p.Memory.Span);
                 Assert.That(hv1.HeaderType, Is.EqualTo((byte)0),
                     "Reassembled HEADERS must be parsed as client-initial.");
                 Assert.That(hv1.Method, Is.EqualTo("/svc/M"));

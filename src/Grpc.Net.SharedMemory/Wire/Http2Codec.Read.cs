@@ -997,8 +997,6 @@ internal static partial class Http2Codec
 
         FrameType internalType;
         byte internalFlags;
-        byte[] payloadBytes;
-        int payloadLen;
 
         if (!hasInitial)
         {
@@ -1025,44 +1023,46 @@ internal static partial class Http2Codec
             // <see cref="Http2DecoderState.PendingFrameHeader"/>. The next
             // call to <see cref="ReadFramePayloadInternal"/> returns the
             // stash before touching the ring, preserving FIFO order.
+            //
+            // Round-7 PR-B: pass the decoded HeadersV1 / TrailersV1 OBJECT
+            // straight through via <see cref="FramePayload.FromDecodedHeader"/>
+            // instead of re-serializing it to bytes for the upper layer to
+            // re-parse. Eliminates ~50% of the read-side header path cost
+            // (see HeaderPathProfileTests measurements).
             if (endStream)
             {
                 var (headersV1, trailersV1) = HpackHeadersAdapter.DecodeTrailersOnly(headerBlock);
 
-                var (hPayload, hLen) = headersV1.Encode();
-                var (tPayload, tLen) = trailersV1.Encode();
-
                 EnqueuePendingFrame(state,
-                    new FrameHeader(FrameType.Trailers, streamId, (uint)tLen, TrailersFlags.EndStream),
-                    FramePayload.FromPooled(tPayload, tLen));
+                    new FrameHeader(FrameType.Trailers, streamId, 0, TrailersFlags.EndStream),
+                    FramePayload.FromDecodedHeader(trailersV1));
 
                 // No persistent stream state to retain: trailers-only means
                 // the stream ended in this single HEADERS frame; any further
                 // wire frames on this stream id (none expected from a well-
                 // behaved peer) get treated as a fresh stream.
                 var hHdr = new FrameHeader(
-                    FrameType.Headers, streamId, (uint)hLen, HeadersFlags.Initial);
-                return (hHdr, FramePayload.FromPooled(hPayload, hLen));
+                    FrameType.Headers, streamId, 0, HeadersFlags.Initial);
+                return (hHdr, FramePayload.FromDecodedHeader(headersV1));
             }
 
             var v1 = HpackHeadersAdapter.DecodeHeaders(headerBlock);
-            (payloadBytes, payloadLen) = v1.Encode();
             internalType = FrameType.Headers;
             internalFlags = (byte)HeadersFlags.Initial;
             state.StreamsWithInitialHeaders[streamId] = 1;
+            var hdrFirst = new FrameHeader(internalType, streamId, 0, internalFlags);
+            return (hdrFirst, FramePayload.FromDecodedHeader(v1));
         }
         else
         {
             // Subsequent HEADERS → trailers.
             var v1 = HpackHeadersAdapter.DecodeTrailers(headerBlock);
-            (payloadBytes, payloadLen) = v1.Encode();
             internalType = FrameType.Trailers;
             internalFlags = endStream ? TrailersFlags.EndStream : (byte)0;
             state.StreamsWithInitialHeaders.Remove(streamId);
+            var hdrSub = new FrameHeader(internalType, streamId, 0, internalFlags);
+            return (hdrSub, FramePayload.FromDecodedHeader(v1));
         }
-
-        var hdr = new FrameHeader(internalType, streamId, (uint)payloadLen, internalFlags);
-        return (hdr, FramePayload.FromPooled(payloadBytes, payloadLen));
     }
 
     private static (FrameHeader Header, FramePayload Payload) ReadRstStreamFrame(

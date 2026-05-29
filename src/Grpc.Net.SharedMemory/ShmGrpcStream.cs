@@ -50,6 +50,36 @@ public readonly struct InboundFrame
     /// <summary>True if this frame's payload is a ring-backed ZC view.</summary>
     public bool IsSpeculativeZeroCopy => _payload.IsSpeculativeZeroCopy;
 
+    /// <summary>
+    /// Round-7 PR-B object passthrough: when set, contains the already-
+    /// decoded <see cref="HeadersV1"/> or <see cref="TrailersV1"/> for a
+    /// HEADERS / TRAILERS frame. Consumers MUST prefer this over decoding
+    /// <see cref="Memory"/> bytes whenever it is non-null for HEADERS or
+    /// TRAILERS frame types, to avoid the redundant
+    /// <c>HeadersV1.Encode</c> &#x2192; bytes &#x2192; <c>HeadersV1.Decode</c>
+    /// round-trip. <see langword="null"/> for all other frame types and for
+    /// HEADERS frames that took the byte-fallback path.
+    /// </summary>
+    public object? DecodedHeader => _payload.DecodedHeader;
+
+    /// <summary>
+    /// Round-7 PR-B: returns the <see cref="HeadersV1"/> for a HEADERS
+    /// frame, preferring the pre-decoded object attached by the codec
+    /// (zero-cost fast-path); falls back to decoding <see cref="Memory"/>
+    /// bytes if no object is attached (byte fallback path).
+    /// </summary>
+    public HeadersV1 AsHeaders()
+        => DecodedHeader as HeadersV1 ?? HeadersV1.Decode(Memory.Span);
+
+    /// <summary>
+    /// Round-7 PR-B: returns the <see cref="TrailersV1"/> for a TRAILERS
+    /// frame, preferring the pre-decoded object attached by the codec
+    /// (zero-cost fast-path); falls back to decoding <see cref="Memory"/>
+    /// bytes if no object is attached (byte fallback path).
+    /// </summary>
+    public TrailersV1 AsTrailers()
+        => DecodedHeader as TrailersV1 ?? TrailersV1.Decode(Memory.Span);
+
     /// <summary>Returns the buffer to the pool or commits the ring read.</summary>
     public void ReturnToPool()
     {
@@ -1389,7 +1419,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
             if (frame.Value.Type == FrameType.Headers)
             {
-                _requestHeaders = HeadersV1.Decode(frame.Value.Memory.Span);
+                _requestHeaders = frame.Value.AsHeaders();
                 frame.Value.ReturnToPool();
                 return _requestHeaders;
             }
@@ -1416,7 +1446,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             var frame = frameTask.Result;
             if (frame != null && frame.Value.Type == FrameType.Headers)
             {
-                _responseHeaders = HeadersV1.Decode(frame.Value.Memory.Span);
+                _responseHeaders = frame.Value.AsHeaders();
                 frame.Value.ReturnToPool();
                 return Task.FromResult(_responseHeaders);
             }
@@ -1438,14 +1468,14 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         if (firstFrame.Value.Type == FrameType.Headers)
         {
-            _responseHeaders = HeadersV1.Decode(firstFrame.Value.Memory.Span);
+            _responseHeaders = firstFrame.Value.AsHeaders();
             firstFrame.Value.ReturnToPool();
             return _responseHeaders;
         }
 
         if (firstFrame.Value.Type == FrameType.Trailers)
         {
-            var trailers = TrailersV1.Decode(firstFrame.Value.Memory.Span);
+            var trailers = firstFrame.Value.AsTrailers();
             firstFrame.Value.ReturnToPool();
             _trailers = trailers;
             _halfCloseReceived = true;
@@ -1467,7 +1497,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
             if (frame.Value.Type == FrameType.Headers)
             {
-                _responseHeaders = HeadersV1.Decode(frame.Value.Memory.Span);
+                _responseHeaders = frame.Value.AsHeaders();
                 frame.Value.ReturnToPool();
                 return _responseHeaders;
             }
@@ -1476,7 +1506,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             // This happens when the server's max concurrent streams is exceeded.
             if (frame.Value.Type == FrameType.Trailers)
             {
-                var trailers = TrailersV1.Decode(frame.Value.Memory.Span);
+                var trailers = frame.Value.AsTrailers();
                 frame.Value.ReturnToPool();
                 _trailers = trailers;
                 _halfCloseReceived = true;
@@ -1549,7 +1579,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                     yield break;
 
                 case FrameType.Trailers:
-                    _trailers = TrailersV1.Decode(f.Memory.Span);
+                    _trailers = f.AsTrailers();
                     f.ReturnToPool();
                     _halfCloseReceived = true;
                     yield break;
@@ -1659,7 +1689,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                     return (default, default, true);
 
                 case FrameType.Trailers:
-                    _trailers = TrailersV1.Decode(f.Memory.Span);
+                    _trailers = f.AsTrailers();
                     f.ReturnToPool();
                     _halfCloseReceived = true;
                     return (default, default, true);
@@ -1753,7 +1783,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                         yield break;
 
                     case FrameType.Trailers:
-                        _trailers = TrailersV1.Decode(f.Memory.Span);
+                        _trailers = f.AsTrailers();
                         f.ReturnToPool();
                         _halfCloseReceived = true;
                         yield break;
@@ -1896,7 +1926,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// <summary>Sets trailers from a Trailers frame.</summary>
     internal void SetTrailers(InboundFrame frame)
     {
-        _trailers = TrailersV1.Decode(frame.Memory.Span);
+        _trailers = frame.AsTrailers();
     }
 
     internal static void OnWindowUpdate(uint increment)

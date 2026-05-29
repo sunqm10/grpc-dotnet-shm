@@ -37,6 +37,18 @@ public static class FrameProtocol
     /// <summary>
     /// Reads a frame from the ring and returns a pooled-buffer payload.
     /// Always uses the HTTP/2 wire format (the only supported format).
+    /// <para>
+    /// <b>Round-7 PR-B contract change for HEADERS / TRAILERS frame types:</b>
+    /// the returned <see cref="FramePayload"/> carries the already-decoded
+    /// <see cref="HeadersV1"/> / <see cref="TrailersV1"/> via
+    /// <see cref="FramePayload.DecodedHeader"/> instead of serialized bytes
+    /// in <see cref="FramePayload.Memory"/> (Memory is empty for these
+    /// frame types). Consumers MUST check <c>DecodedHeader</c> first when
+    /// the frame type is <see cref="FrameType.Headers"/> or
+    /// <see cref="FrameType.Trailers"/>. The <see cref="InboundFrame.AsHeaders"/>
+    /// / <see cref="InboundFrame.AsTrailers"/> helpers implement this fall-back
+    /// pattern automatically. DATA and other frame types are unaffected.
+    /// </para>
     /// </summary>
     public static (FrameHeader Header, FramePayload Payload) ReadFramePayload(
         ShmRing ring,
