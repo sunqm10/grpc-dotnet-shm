@@ -55,6 +55,20 @@ internal sealed class ShmFrameWriter : IDisposable
         /// <c>deferredMessage{entry, offset}</c> resume state.
         /// </summary>
         public int BytesWritten;
+
+        /// <summary>
+        /// Round-8 PR-D object passthrough for the QUEUED HEADERS/TRAILERS
+        /// path. When non-null and <see cref="Type"/> is
+        /// <see cref="FrameType.Headers"/> or <see cref="FrameType.Trailers"/>,
+        /// the WriterLoop dispatches via
+        /// <see cref="FrameProtocol.WriteHeadersFrame"/> /
+        /// <see cref="FrameProtocol.WriteTrailersFrame"/> directly from the
+        /// object, skipping the HeadersV1.Encode → bytes →
+        /// DecodeHeadersV1 round-trip the byte path does. Companion to the
+        /// PR-B inline-path optimization (covers async/queued fallback that
+        /// PR-B's inline-only fix didn't reach).
+        /// </summary>
+        public object? DecodedHeader;
     }
 
     /// <summary>
@@ -317,6 +331,90 @@ internal sealed class ShmFrameWriter : IDisposable
     /// _readySignal.Set() check.
     /// </summary>
     internal void EnableSingleStreamMode() => _singleStreamMode = true;
+
+    /// <summary>
+    /// Round-8 PR-D: enqueues a HEADERS frame carrying a
+    /// <see cref="HeadersV1"/> object directly (no upfront byte encode).
+    /// WriterLoop dispatches via <see cref="FrameProtocol.WriteHeadersFrame"/>,
+    /// which HPACK-encodes from the object without the
+    /// <c>HeadersV1.Encode → bytes → DecodeHeadersV1</c> round-trip
+    /// the byte path requires. Companion to the PR-B inline-path
+    /// optimization (this is the async/queued fallback that PR-B's
+    /// inline-only fix didn't reach).
+    /// </summary>
+    /// <exception cref="InvalidOperationException">Writer disposed.</exception>
+    public void EnqueueHeaders(uint streamId, byte flags, HeadersV1 headers)
+    {
+        if (_completed)
+        {
+            throw new InvalidOperationException("Frame writer has been disposed.");
+        }
+
+        _queue.Enqueue(new FrameEntry
+        {
+            Type = FrameType.Headers, StreamId = streamId, Flags = flags,
+            Length = 0, Payload = ReadOnlyMemory<byte>.Empty,
+            ReturnToPool = null,
+            DecodedHeader = headers,
+        });
+
+        if (Volatile.Read(ref _waiting) != 0 && _disposed == 0)
+        {
+            try { _readySignal.Set(); _kernelReadySignal.Set(); } catch (ObjectDisposedException) { }
+        }
+    }
+
+    /// <summary>
+    /// Round-8 PR-D companion to <see cref="EnqueueHeaders"/> for TRAILERS.
+    /// </summary>
+    public void EnqueueTrailers(uint streamId, byte flags, TrailersV1 trailers)
+    {
+        if (_completed)
+        {
+            throw new InvalidOperationException("Frame writer has been disposed.");
+        }
+
+        _queue.Enqueue(new FrameEntry
+        {
+            Type = FrameType.Trailers, StreamId = streamId, Flags = flags,
+            Length = 0, Payload = ReadOnlyMemory<byte>.Empty,
+            ReturnToPool = null,
+            DecodedHeader = trailers,
+        });
+
+        if (Volatile.Read(ref _waiting) != 0 && _disposed == 0)
+        {
+            try { _readySignal.Set(); _kernelReadySignal.Set(); } catch (ObjectDisposedException) { }
+        }
+    }
+
+    /// <summary>
+    /// Round-8 PR-D centralised dispatch helper: when the entry carries a
+    /// decoded <see cref="HeadersV1"/> / <see cref="TrailersV1"/> via
+    /// <see cref="FrameEntry.DecodedHeader"/>, write via the object
+    /// passthrough API (skips byte round-trip); otherwise fall back to the
+    /// generic byte-payload <see cref="FrameProtocol.WriteFrame"/>.
+    /// </summary>
+    private void WriteFrameEntryToRing(in FrameEntry entry)
+    {
+        if (entry.DecodedHeader is not null)
+        {
+            if (entry.Type == FrameType.Headers && entry.DecodedHeader is HeadersV1 hv)
+            {
+                FrameProtocol.WriteHeadersFrame(_ring, entry.StreamId, hv, _ct);
+                return;
+            }
+            if (entry.Type == FrameType.Trailers && entry.DecodedHeader is TrailersV1 tv)
+            {
+                FrameProtocol.WriteTrailersFrame(_ring, entry.StreamId, tv, _ct);
+                return;
+            }
+            // Unexpected combination (mis-tagged object): fall through to
+            // byte path defensively.
+        }
+        var header = new FrameHeader(entry.Type, entry.StreamId, (uint)entry.Length, entry.Flags);
+        FrameProtocol.WriteFrame(_ring, header, entry.Payload.Span, _ct);
+    }
 
     /// <summary>
     /// Enqueues a frame by defensively copying the payload into a pooled buffer.
@@ -966,8 +1064,10 @@ internal sealed class ShmFrameWriter : IDisposable
                             batch[i] = default;
                             continue;
                         }
-                        var header = new FrameHeader(entry.Type, entry.StreamId, (uint)entry.Length, entry.Flags);
-                        FrameProtocol.WriteFrame(_ring, header, payload, _ct);
+                        // PR-D: HEADERS/TRAILERS with DecodedHeader go via
+                        // the object path; everything else takes the byte
+                        // WriteFrame route.
+                        WriteFrameEntryToRing(in entry);
                     }
                 }
 
@@ -1309,8 +1409,7 @@ internal sealed class ShmFrameWriter : IDisposable
                         // HalfClose / Trailers / etc parked behind the
                         // Message. Write them out so the peer sees
                         // proper stream termination.
-                        var hdr = new FrameHeader(ent.Type, ent.StreamId, (uint)ent.Length, ent.Flags);
-                        FrameProtocol.WriteFrame(_ring, hdr, ent.Payload.Span, _ct);
+                        WriteFrameEntryToRing(in ent);
                     }
                     if (ent.ReturnToPool != null)
                         ArrayPool<byte>.Shared.Return(ent.ReturnToPool);
@@ -1351,8 +1450,7 @@ internal sealed class ShmFrameWriter : IDisposable
                     // immediately.
                     queue.RemoveFirst();
                     _deferredCount--;
-                    var header = new FrameHeader(ent.Type, ent.StreamId, (uint)ent.Length, ent.Flags);
-                    FrameProtocol.WriteFrame(_ring, header, ent.Payload.Span, _ct);
+                    WriteFrameEntryToRing(in ent);
                     if (ent.ReturnToPool != null)
                         ArrayPool<byte>.Shared.Return(ent.ReturnToPool);
                     ent.CompletionSignal?.Set();
@@ -2170,8 +2268,7 @@ internal sealed class ShmFrameWriter : IDisposable
     {
         while (_controlQueue.TryDequeue(out var entry))
         {
-            var header = new FrameHeader(entry.Type, entry.StreamId, (uint)entry.Length, entry.Flags);
-            FrameProtocol.WriteFrame(_ring, header, entry.Payload.Span, _ct);
+            WriteFrameEntryToRing(in entry);
             if (entry.ReturnToPool != null)
                 ArrayPool<byte>.Shared.Return(entry.ReturnToPool);
             entry.CompletionSignal?.Set();
@@ -2216,8 +2313,7 @@ internal sealed class ShmFrameWriter : IDisposable
             }
             else
             {
-                var header = new FrameHeader(entry.Type, entry.StreamId, (uint)entry.Length, entry.Flags);
-                FrameProtocol.WriteFrame(_ring, header, entry.Payload.Span, _ct);
+                WriteFrameEntryToRing(in entry);
             }
 
             if (entry.ReturnToPool != null)

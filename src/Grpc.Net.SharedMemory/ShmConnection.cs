@@ -566,6 +566,27 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Round-8 PR-D: enqueues a HEADERS frame via the object passthrough
+    /// path (no byte encode round-trip). Used by
+    /// <see cref="ShmGrpcStream.SendResponseHeadersAsync"/> queued
+    /// fallback. See <see cref="ShmFrameWriter.EnqueueHeaders"/>.
+    /// </summary>
+    internal void SendHeadersFrame(uint streamId, byte flags, HeadersV1 headers)
+    {
+        ThrowIfDisposed();
+        _frameWriter!.EnqueueHeaders(streamId, flags, headers);
+    }
+
+    /// <summary>
+    /// Round-8 PR-D companion to <see cref="SendHeadersFrame"/> for TRAILERS.
+    /// </summary>
+    internal void SendTrailersFrame(uint streamId, byte flags, TrailersV1 trailers)
+    {
+        ThrowIfDisposed();
+        _frameWriter!.EnqueueTrailers(streamId, flags, trailers);
+    }
+
+    /// <summary>
     /// Enqueues a frame without copying the payload. <paramref name="pooledBuffer"/>
     /// is returned to <see cref="ArrayPool{T}"/> after the ring write completes.
     /// </summary>

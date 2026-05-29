@@ -829,24 +829,11 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             Metadata = ConvertMetadata(metadata)
         };
 
-        var (payload, payloadLength) = _responseHeaders.Encode();
-        if (payloadLength <= 512)
-        {
-            try
-            {
-                await SendFrameAsync(FrameType.Headers, HeadersFlags.Initial,
-                    payload.AsMemory(0, payloadLength));
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(payload);
-            }
-        }
-        else
-        {
-            await SendFrameZeroCopyAsync(FrameType.Headers, HeadersFlags.Initial,
-                payload.AsMemory(0, payloadLength), payload);
-        }
+        // Round-8 PR-D: queued/async fallback uses the object passthrough
+        // path (was Encode → bytes → SendFrameAsync → DecodeHeadersV1
+        // round-trip). Companion to PR-B's inline single-stream fix —
+        // multi-stream / N>1 RPCs now also benefit.
+        await SendHeadersFrameAsync(HeadersFlags.Initial, _responseHeaders).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1097,24 +1084,10 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             Metadata = ConvertMetadata(metadata)
         };
 
-        var (payload, payloadLength) = _trailers.Encode();
-        if (payloadLength <= 512)
-        {
-            try
-            {
-                await SendFrameAsync(FrameType.Trailers, TrailersFlags.EndStream,
-                    payload.AsMemory(0, payloadLength));
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(payload);
-            }
-        }
-        else
-        {
-            await SendFrameZeroCopyAsync(FrameType.Trailers, TrailersFlags.EndStream,
-                payload.AsMemory(0, payloadLength), payload);
-        }
+        // Round-8 PR-D: queued/async fallback uses the object passthrough
+        // path. Inline single-stream fast path (SendTrailersInline) was
+        // already PR-B; this covers the multi-stream / N>1 fallback.
+        await SendTrailersFrameAsync(TrailersFlags.EndStream, _trailers).ConfigureAwait(false);
         Volatile.Write(ref _halfCloseSent, 1);
     }
 
@@ -1970,6 +1943,89 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         // Contended: fall back to async wait.
         return SendFrameAsyncContended(type, flags, payload, cancellationToken);
+    }
+
+    /// <summary>
+    /// Round-8 PR-D: enqueues a HEADERS frame from a
+    /// <see cref="HeadersV1"/> object (no upfront byte encode). Used by
+    /// <see cref="SendResponseHeadersAsync"/>'s queued/async fallback when
+    /// the inline single-stream fast path is unavailable.
+    /// </summary>
+    private Task SendHeadersFrameAsync(byte flags, HeadersV1 headers, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+#pragma warning disable CA2016
+        if (_sendLock.Wait(0))
+#pragma warning restore CA2016
+        {
+            try
+            {
+                _connection.SendHeadersFrame(StreamId, flags, headers);
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+            return Task.CompletedTask;
+        }
+        return SendHeadersFrameAsyncContended(flags, headers, cancellationToken);
+    }
+
+    private async Task SendHeadersFrameAsyncContended(byte flags, HeadersV1 headers, CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            _connection.SendHeadersFrame(StreamId, flags, headers);
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Round-8 PR-D companion to <see cref="SendHeadersFrameAsync"/> for TRAILERS.
+    /// </summary>
+    private Task SendTrailersFrameAsync(byte flags, TrailersV1 trailers, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+#pragma warning disable CA2016
+        if (_sendLock.Wait(0))
+#pragma warning restore CA2016
+        {
+            try
+            {
+                _connection.SendTrailersFrame(StreamId, flags, trailers);
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+            return Task.CompletedTask;
+        }
+        return SendTrailersFrameAsyncContended(flags, trailers, cancellationToken);
+    }
+
+    private async Task SendTrailersFrameAsyncContended(byte flags, TrailersV1 trailers, CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            _connection.SendTrailersFrame(StreamId, flags, trailers);
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
     }
 
     private async Task SendFrameAsyncContended(FrameType type, byte flags, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
