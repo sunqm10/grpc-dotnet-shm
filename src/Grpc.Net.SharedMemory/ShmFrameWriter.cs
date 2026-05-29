@@ -1471,6 +1471,32 @@ internal sealed class ShmFrameWriter : IDisposable
             {
                 var ent = queue.First.Value;
 
+                // BUG-FIX (round-10 Opus #8): respect CancelFlag for fresh
+                // (BytesWritten == 0) Message entries. A fresh entry that
+                // was parked on insufficient quota can be safely dropped
+                // if the caller cancelled — the peer has not yet seen any
+                // LPM header for this message, so nothing on the wire
+                // depends on it. A PARTIAL entry (BytesWritten > 0) MUST
+                // be completed regardless of CancelFlag because the peer's
+                // accumulator is mid-LPM and dropping the tail bytes would
+                // leave the peer's reader waiting for them indefinitely.
+                // The immediate FlushBatch path (~line 867) already has
+                // this skip for fresh entries; the deferred-drain path
+                // was the inconsistent peer.
+                if (ent.Type == FrameType.Message
+                    && ent.CancelFlag != null
+                    && ent.BytesWritten == 0
+                    && Volatile.Read(ref ent.CancelFlag.Value))
+                {
+                    queue.RemoveFirst();
+                    _deferredCount--;
+                    if (ent.ReturnToPool != null)
+                        ArrayPool<byte>.Shared.Return(ent.ReturnToPool);
+                    ent.CompletionSignal?.Set();
+                    anyProgress = true;
+                    continue;
+                }
+
                 if (ent.Type != FrameType.Message)
                 {
                     // HalfClose / Trailers / etc parked behind a Message
