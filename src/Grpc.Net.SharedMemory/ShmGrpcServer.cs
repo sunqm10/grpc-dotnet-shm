@@ -392,7 +392,44 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 $"Sending message exceeds the maximum configured message size ({size} vs {maxSendMessageSize})"));
         }
 
-        // Serialize protobuf first
+        // Round-9 PR-E: decide compression up front so the uncompressed
+        // fast path (which is the dominant case at N>1 server fallback)
+        // can serialize protobuf DIRECTLY into the final framed buffer.
+        // Pre-PR-E this path rented two pooled buffers (protoBuffer +
+        // framedBuf) and did a full-payload memcpy between them; the
+        // direct serialize eliminates one rent/return AND one memcpy
+        // per response on the hottest server multi-stream path. Round-9
+        // dual-agent (GPT-5.5 + Opus 4.8) #1 finding.
+        var compressor = compression?.GetSendCompressor();
+        var willCompress = compressor != null
+            && !compressor.IsIdentity
+            && compression!.ShouldCompress(size);
+
+        if (!willCompress)
+        {
+            // Uncompressed fast path: rent the framed buffer ONCE and
+            // serialize protobuf straight into the body slot. The
+            // framed buffer's LPM header is written first so the
+            // single pooled buffer is fully formed when handed off to
+            // SendMessageZeroCopyAsync (which owns it from here).
+            var buffer = ArrayPool<byte>.Shared.Rent(5 + size);
+            try
+            {
+                buffer[0] = 0; // no compression
+                System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+                    buffer.AsSpan(1, 4), (uint)size);
+                message.WriteTo(buffer.AsSpan(5, size));
+            }
+            catch
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+                throw;
+            }
+            return stream.SendMessageZeroCopyAsync(buffer.AsMemory(0, 5 + size), buffer, ct);
+        }
+
+        // Compression path: needs the raw protobuf bytes as input to
+        // the compressor, so the two-buffer + copy shape is mandatory.
         var protoBuffer = ArrayPool<byte>.Shared.Rent(size);
         try
         {
@@ -404,31 +441,16 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             throw;
         }
 
-        // Optionally compress if compression is configured and payload is large enough
-        var compressor = compression?.GetSendCompressor();
-        if (compressor != null && !compressor.IsIdentity && compression!.ShouldCompress(size))
-        {
-            var compressed = compressor.Compress(protoBuffer.AsSpan(0, size));
-            ArrayPool<byte>.Shared.Return(protoBuffer);
-
-            var framedBuf = ArrayPool<byte>.Shared.Rent(5 + compressed.Length);
-            framedBuf[0] = 1; // compressed
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
-                framedBuf.AsSpan(1, 4), (uint)compressed.Length);
-            compressed.AsSpan().CopyTo(framedBuf.AsSpan(5));
-            return stream.SendMessageZeroCopyAsync(
-                framedBuf.AsMemory(0, 5 + compressed.Length), framedBuf, ct);
-        }
-
-        // No compression — write LPM header + protobuf
-        var buffer = ArrayPool<byte>.Shared.Rent(5 + size);
-        buffer[0] = 0; // no compression
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
-            buffer.AsSpan(1, 4), (uint)size);
-        protoBuffer.AsSpan(0, size).CopyTo(buffer.AsSpan(5));
+        var compressed = compressor!.Compress(protoBuffer.AsSpan(0, size));
         ArrayPool<byte>.Shared.Return(protoBuffer);
 
-        return stream.SendMessageZeroCopyAsync(buffer.AsMemory(0, 5 + size), buffer, ct);
+        var framedBuf = ArrayPool<byte>.Shared.Rent(5 + compressed.Length);
+        framedBuf[0] = 1; // compressed
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+            framedBuf.AsSpan(1, 4), (uint)compressed.Length);
+        compressed.AsSpan().CopyTo(framedBuf.AsSpan(5));
+        return stream.SendMessageZeroCopyAsync(
+            framedBuf.AsMemory(0, 5 + compressed.Length), framedBuf, ct);
     }
 
     /// <inheritdoc/>
