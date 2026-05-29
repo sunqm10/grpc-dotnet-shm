@@ -1218,6 +1218,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         if (_cancelled) return;
         _cancelled = true;
         CancelCancellationToken();
+        // BUG-FIX (round-10 GPT-5.5 #1): wake any sender parked on
+        // send-quota so it observes _cancelled and aborts. Mirrors
+        // the inbound-Cancel handler (FIX-1) and AbortForFlowControl.
+        // Without this, a writer parked in ReserveSendQuotaOrBlock
+        // stays parked even after the local user cancels its own RPC.
+        _sendQuotaWake.Set();
 
         try
         {
@@ -1226,6 +1232,24 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         catch { }
 
         _inboundFrames.Writer.TryComplete();
+
+        // BUG-FIX (round-10 GPT-5.5 #1): release the stream slot in
+        // the connection's stream-map. Previously CancelAsync did not
+        // do this -- only Dispose() did. ShmControlHandler.SendAsync
+        // catches OperationCanceledException, calls CancelAsync, then
+        // rethrows without disposing the stream. The stream stayed in
+        // the connection's stream-map until the connection itself was
+        // torn down, holding a permanent slot per cancelled RPC.
+        // Repeated cancellations on a long-lived connection would
+        // eventually exhaust the per-connection MAX_CONCURRENT_STREAMS
+        // budget and produce false "no available stream slot" errors
+        // for new RPCs.
+        //
+        // RemoveStream is idempotent so the subsequent Dispose() (when
+        // the stream object is garbage-collected or explicitly disposed)
+        // re-removing is a no-op. Mirrors what the inbound-Cancel
+        // handler at ~line 1812 already does on remote cancel.
+        _connection.RemoveStream(StreamId);
     }
 
     /// <summary>
