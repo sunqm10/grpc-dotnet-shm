@@ -119,8 +119,19 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     private TrailersV1? _trailers;
     private string? _responseEncoding;
     private int _halfCloseSent; // 0=not sent, 1=sent; use Interlocked for thread safety
-    private bool _halfCloseReceived;
-    private bool _cancelled;
+    // Round-10 BUG-FIX (Opus #7): _halfCloseReceived + _cancelled are
+    // written on the stripe/reader thread (OnFrameReceived) and read
+    // on user-call threads (via IsRemoteHalfClosed / IsCancelled
+    // getters AND ReserveSendQuotaOrBlock's loop guard added by
+    // round-10 FIX-1). Plain bool reads have no cross-thread barrier
+    // and could observe a stale value for an unbounded time,
+    // contradicting the wake-and-abort contract the Cancel path now
+    // depends on. Use `volatile bool` so every read/write is a
+    // releasing/acquiring access consistent with the other state
+    // flags in this type (_disposed, _halfCloseSent both use
+    // Volatile/Interlocked).
+    private volatile bool _halfCloseReceived;
+    private volatile bool _cancelled;
     private int _disposed;
     private volatile Exception? _sendFailure; // set by SendBodyAsync on failure
 
