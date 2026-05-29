@@ -622,44 +622,13 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             }
         }
 
-        // Fall-back queued path: encode to bytes for the queue.
-        var (payload, payloadLength) = _requestHeaders.Encode();        if (payloadLength <= 512)
-        {
-            Task task;
-            try
-            {
-                task = SendFrameAsync(FrameType.Headers, HeadersFlags.Initial,
-                    payload.AsMemory(0, payloadLength));
-            }
-            catch
-            {
-                ArrayPool<byte>.Shared.Return(payload);
-                throw;
-            }
-            if (task.IsCompletedSuccessfully)
-            {
-                ArrayPool<byte>.Shared.Return(payload);
-                return Task.CompletedTask;
-            }
-            return SendRequestHeadersReturnPoolAsync(task, payload);
-        }
-        else
-        {
-            return SendFrameZeroCopyAsync(FrameType.Headers, HeadersFlags.Initial,
-                payload.AsMemory(0, payloadLength), payload);
-        }
-    }
-
-    private static async Task SendRequestHeadersReturnPoolAsync(Task sendTask, byte[] payload)
-    {
-        try
-        {
-            await sendTask.ConfigureAwait(false);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(payload);
-        }
+        // Round-9 PR-F: queued fallback uses the object passthrough path
+        // (was Encode → bytes → SendFrameAsync → DecodeHeadersV1 round-
+        // trip). PR-B closed this on the inline single-stream branch;
+        // PR-D closed it for SendResponseHeadersAsync / SendTrailersAsync;
+        // PR-F now covers the client request HEADERS queued fallback so
+        // every Headers send path uses the new API.
+        return SendHeadersFrameAsync(HeadersFlags.Initial, _requestHeaders);
     }
 
     /// <summary>
@@ -752,34 +721,11 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         _stagedHeaders = null;
         if (headers == null) return Task.CompletedTask;
 
-        // Round-7 PR-B: cold fall-back path — the queued send still goes
-        // through byte serialization. Encode lazily here only when we
-        // actually reach this path (the inline fast-path in
-        // WriteStagedHeadersInline avoided the encode entirely).
-        var (payload, len) = headers.Encode();
-
-        if (len <= 512)
-        {
-            Task task;
-            try
-            {
-                task = SendFrameAsync(FrameType.Headers, HeadersFlags.Initial,
-                    payload.AsMemory(0, len), cancellationToken);
-            }
-            catch
-            {
-                ArrayPool<byte>.Shared.Return(payload);
-                throw;
-            }
-            if (task.IsCompletedSuccessfully)
-            {
-                ArrayPool<byte>.Shared.Return(payload);
-                return Task.CompletedTask;
-            }
-            return SendRequestHeadersReturnPoolAsync(task, payload);
-        }
-        return SendFrameZeroCopyAsync(FrameType.Headers, HeadersFlags.Initial,
-            payload.AsMemory(0, len), payload, cancellationToken);
+        // Round-9 PR-F: cold queued fall-back now uses the object
+        // passthrough path too — no Encode/Decode round-trip even on
+        // this rare path. PR-B closed the WriteStagedHeadersInline
+        // fast path; PR-F closes the symmetric async fallback.
+        return SendHeadersFrameAsync(HeadersFlags.Initial, headers, cancellationToken);
     }
 
     /// <summary>
@@ -2031,7 +1977,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     private async Task SendFrameAsyncContended(FrameType type, byte flags, ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
-        await _sendLock.WaitAsync(cancellationToken);
+        await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
@@ -2096,7 +2042,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         }
         try
         {
-            await _sendLock.WaitAsync(cancellationToken);
+            await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch
         {
