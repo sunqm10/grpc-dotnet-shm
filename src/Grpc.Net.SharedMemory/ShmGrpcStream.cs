@@ -103,7 +103,15 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     private readonly ShmConnection _connection;
     private readonly Channel<InboundFrame> _inboundFrames;
     private readonly CancellationTokenSource _disposeCts;
-    private readonly CancellationTokenSource _cancellationCts;
+    // Round-9 PR-I: lazy-allocate the call-cancellation CTS. The CLIENT-
+    // side stream never reads CancellationToken (only the server-side
+    // ShmServerCallContext ctor reads it once), so client RPCs paid for
+    // an unused CTS per call. Lazy via interlocked CAS so concurrent
+    // first-read + Cancel race deterministically: a Cancel that arrives
+    // before the CTS is created sets _cancelRequested, and the lazy
+    // creator returns a CTS that is *already* cancelled.
+    private CancellationTokenSource? _cancellationCts;
+    private int _cancelRequested; // 1 = Cancel happened (possibly pre-CTS)
     private readonly SemaphoreSlim _sendLock;
 
     private HeadersV1? _requestHeaders;
@@ -253,7 +261,43 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     /// </summary>
     public bool IsServerStream { get; }
 
-    internal CancellationToken CancellationToken => _cancellationCts.Token;
+    internal CancellationToken CancellationToken
+    {
+        get
+        {
+            // Round-9 PR-I lazy init. Common client-side case: never
+            // read, never allocated. Server-side reads once at
+            // ShmServerCallContext ctor.
+            var existing = _cancellationCts;
+            if (existing != null) return existing.Token;
+
+            var fresh = new CancellationTokenSource();
+            // Pre-cancel if a Cancel raced ahead while we were
+            // allocating but before we publish below.
+            if (Volatile.Read(ref _cancelRequested) != 0)
+            {
+                fresh.Cancel();
+            }
+            var prev = Interlocked.CompareExchange(ref _cancellationCts, fresh, null);
+            if (prev != null)
+            {
+                // Lost the publish race — another reader beat us. Throw
+                // away our local CTS and use the winner. Cancel-flag
+                // propagation already handled by the winning thread.
+                fresh.Dispose();
+                return prev.Token;
+            }
+            // Won. If Cancel raced between our flag pre-check and our
+            // CAS publish, it would have observed _cancellationCts as
+            // null and done nothing; close the gap by re-checking the
+            // flag after publish.
+            if (Volatile.Read(ref _cancelRequested) != 0 && !fresh.IsCancellationRequested)
+            {
+                try { fresh.Cancel(); } catch (ObjectDisposedException) { }
+            }
+            return fresh.Token;
+        }
+    }
 
     internal ShmGrpcStream(uint streamId, ShmConnection connection, bool isServerStream = false)
     {
@@ -297,7 +341,9 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             AllowSynchronousContinuations = inlineContinuations
         });
         _disposeCts = new CancellationTokenSource();
-        _cancellationCts = new CancellationTokenSource();
+        // _cancellationCts stays null until first CancellationToken read
+        // (lazy init via interlocked CAS — see CancellationToken getter
+        // for the race-free flag-then-publish protocol).
         _sendLock = new SemaphoreSlim(1, 1);
         // HTTP/2 per-stream send quota: bytes the peer has granted us via
         // SETTINGS_INITIAL_WINDOW_SIZE + accumulated WINDOW_UPDATE. Decremented
@@ -2094,12 +2140,20 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
     private void CancelCancellationToken()
     {
-        try
+        // Round-9 PR-I: lazy _cancellationCts. Set flag first so a
+        // first-read happening concurrently produces an already-
+        // cancelled CTS even if it loses our null-check race.
+        Volatile.Write(ref _cancelRequested, 1);
+        var cts = _cancellationCts;
+        if (cts != null)
         {
-            _cancellationCts.Cancel();
-        }
-        catch (ObjectDisposedException)
-        {
+            try
+            {
+                cts.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
         }
     }
 
@@ -2173,7 +2227,9 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         _connection.RemoveStream(StreamId);
         _sendLock.Dispose();
-        _cancellationCts.Dispose();
+        // Round-9 PR-I: lazy CTS may have never been allocated (client
+        // path that never reads CancellationToken).
+        _cancellationCts?.Dispose();
         _disposeCts.Dispose();
     }
 
