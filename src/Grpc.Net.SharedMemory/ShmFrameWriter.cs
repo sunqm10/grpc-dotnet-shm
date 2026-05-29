@@ -821,6 +821,35 @@ internal sealed class ShmFrameWriter : IDisposable
             }
             DrainControlFrames();
 
+            // BUG-FIX (round-10 Opus #6): drain _deferred too on writer
+            // exit. Any FC-parked entries left in the dictionary hold
+            // pooled ReturnToPool buffers (leak) AND CompletionSignal
+            // MRESes that callers (EnqueueZeroCopyAndWait) are awaiting
+            // — without this drain those callers block forever on the
+            // post-cancel `token.Signal.Wait()` (which has no
+            // CancellationToken and no timeout). The existing Dispose-
+            // side drain only runs when writerDone == true; this
+            // ensures parked waiters are released even on the writerDone
+            // path that exits cleanly before Dispose's drain block.
+            // Safe to walk without locking: we are the sole writer of
+            // _deferred (this thread) and we are about to exit.
+            if (_deferredCount > 0)
+            {
+                foreach (var kvp in _deferred)
+                {
+                    var queue = kvp.Value;
+                    foreach (var parked in queue)
+                    {
+                        if (parked.ReturnToPool != null)
+                            ArrayPool<byte>.Shared.Return(parked.ReturnToPool);
+                        parked.CompletionSignal?.Set();
+                    }
+                    queue.Clear();
+                }
+                _deferred.Clear();
+                _deferredCount = 0;
+            }
+
             // SAW-WriterLoop shutdown safety: ensure any signals
             // deferred by the final FlushBatch are actually delivered
             // so peer readers see the last bytes before we exit.
@@ -2395,6 +2424,11 @@ internal sealed class ShmFrameWriter : IDisposable
                 // their session) AND blocks the waiter forever. Safe to
                 // walk without locking: writerDone implies the WriterLoop
                 // is the only writer of _deferred and has exited.
+                // Round-10 Opus #6: the WriterLoop now also drains
+                // _deferred on its own exit (see WriterLoop bottom), so
+                // this block is mostly redundant safety. Kept for the
+                // case writer exited via fault before reaching its own
+                // drain.
                 if (_deferredCount > 0)
                 {
                     foreach (var kvp in _deferred)
@@ -2410,6 +2444,53 @@ internal sealed class ShmFrameWriter : IDisposable
                     }
                     _deferred.Clear();
                     _deferredCount = 0;
+                }
+            }
+            else
+            {
+                // BUG-FIX (round-10 Opus #6): writer task did NOT exit
+                // within budget (typically: hung in a kernel ring-write
+                // syscall because peer reader stopped). We cannot safely
+                // free pooled buffers (writer may still own them), but we
+                // CAN at minimum signal the CompletionSignal MRESes of
+                // parked _deferred entries so any caller stuck in
+                // EnqueueZeroCopyAndWait's post-cancel `token.Signal.Wait()`
+                // (no timeout, no CT) wakes up instead of blocking
+                // indefinitely. MRES.Set is idempotent + thread-safe; a
+                // racing writer that completes the entry naturally just
+                // re-Sets harmlessly. Iteration may throw
+                // InvalidOperationException if the writer concurrently
+                // mutates the Dictionary — swallow and accept (best
+                // effort; the waiters that we did wake are still better
+                // off than zero waiters). Same for _queue and
+                // _controlQueue: TryDequeue is concurrent-safe so we can
+                // wake their CompletionSignals too.
+                try
+                {
+                    while (_queue.TryDequeue(out var entry))
+                    {
+                        entry.CompletionSignal?.Set();
+                    }
+                    while (_controlQueue.TryDequeue(out var ctlEntry))
+                    {
+                        ctlEntry.CompletionSignal?.Set();
+                    }
+                    if (_deferredCount > 0)
+                    {
+                        foreach (var kvp in _deferred)
+                        {
+                            foreach (var parked in kvp.Value)
+                            {
+                                parked.CompletionSignal?.Set();
+                            }
+                        }
+                    }
+                }
+                catch (InvalidOperationException)
+                {
+                    // Writer concurrently mutated the Dictionary during
+                    // our iteration. Best-effort — the waiters we did
+                    // reach were signalled.
                 }
             }
 
