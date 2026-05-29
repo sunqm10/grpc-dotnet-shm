@@ -314,12 +314,12 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             catch (RpcException ex)
             {
                 await SendErrorTrailersAsync(stream, ex.StatusCode, ex.Status.Detail,
-                    ex.Trailers?.Count > 0 ? ex.Trailers : context.ResponseTrailers);
+                    ex.Trailers?.Count > 0 ? ex.Trailers : context.ResponseTrailersOrNull);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
                 await SendErrorTrailersAsync(stream, StatusCode.Cancelled, "Server shutting down",
-                    context.ResponseTrailers);
+                    context.ResponseTrailersOrNull);
             }
             catch (OperationCanceledException)
             {
@@ -329,12 +329,12 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                     : StatusCode.Cancelled;
                 await SendErrorTrailersAsync(stream, code,
                     code == StatusCode.DeadlineExceeded ? "Deadline exceeded" : "Cancelled",
-                    context.ResponseTrailers);
+                    context.ResponseTrailersOrNull);
             }
             catch (Exception ex)
             {
                 await SendErrorTrailersAsync(stream, StatusCode.Internal, ex.Message,
-                    context.ResponseTrailers);
+                    context.ResponseTrailersOrNull);
             }
         }
         catch
@@ -563,7 +563,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         else
                             writer.WriteInline(stream.StreamId, stackalloc byte[5], 0, default, stream);
                         stream.SendTrailersInline(writer, context.Status.StatusCode,
-                            context.Status.Detail, context.ResponseTrailers);
+                            context.Status.Detail, context.ResponseTrailersOrNull);
                     }
                     finally
                     {
@@ -604,7 +604,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         else
                             writer.WriteInline(stream.StreamId, stackalloc byte[5], 0, default, stream);
                         stream.SendTrailersInline(writer, context.Status.StatusCode,
-                            context.Status.Detail, context.ResponseTrailers);
+                            context.Status.Detail, context.ResponseTrailersOrNull);
                     }
                     finally
                     {
@@ -617,7 +617,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             // Fallback path: ensure headers sent, then use WriterLoop queue.
             await context.EnsureResponseHeadersSentAsync();
             await SendProtobufMessageAsync(stream, response, cfg.Compression, cfg.MaxSendMessageSize, ct);
-            await stream.SendTrailersAsync(context.Status.StatusCode, context.Status.Detail, context.ResponseTrailers);
+            await stream.SendTrailersAsync(context.Status.StatusCode, context.Status.Detail, context.ResponseTrailersOrNull);
         }
     }
 
@@ -659,7 +659,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                     try
                     {
                         stream.SendTrailersInline(fw, context.Status.StatusCode,
-                            context.Status.Detail, context.ResponseTrailers);
+                            context.Status.Detail, context.ResponseTrailersOrNull);
                     }
                     finally
                     {
@@ -673,7 +673,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             await stream.SendTrailersAsync(
                 context.Status.StatusCode,
                 context.Status.Detail,
-                context.ResponseTrailers);
+                context.ResponseTrailersOrNull);
         }
     }
 
@@ -726,7 +726,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         else
                             writer.WriteInline(stream.StreamId, stackalloc byte[5], 0, default, stream);
                         stream.SendTrailersInline(writer, context.Status.StatusCode,
-                            context.Status.Detail, context.ResponseTrailers);
+                            context.Status.Detail, context.ResponseTrailersOrNull);
                     }
                     finally
                     {
@@ -771,7 +771,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                             }
                             writer.WriteInline(stream.StreamId, serializedBuffer.AsSpan(0, serializedSize), 0, default, stream);
                             stream.SendTrailersInline(writer, context.Status.StatusCode,
-                                context.Status.Detail, context.ResponseTrailers);
+                                context.Status.Detail, context.ResponseTrailersOrNull);
                         }
                         finally
                         {
@@ -790,7 +790,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             await stream.SendTrailersAsync(
                 context.Status.StatusCode,
                 context.Status.Detail,
-                context.ResponseTrailers);
+                context.ResponseTrailersOrNull);
         }
     }
 
@@ -831,7 +831,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                     try
                     {
                         stream.SendTrailersInline(fw, context.Status.StatusCode,
-                            context.Status.Detail, context.ResponseTrailers);
+                            context.Status.Detail, context.ResponseTrailersOrNull);
                     }
                     finally
                     {
@@ -844,7 +844,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             await stream.SendTrailersAsync(
                 context.Status.StatusCode,
                 context.Status.Detail,
-                context.ResponseTrailers);
+                context.ResponseTrailersOrNull);
         }
     }
 
