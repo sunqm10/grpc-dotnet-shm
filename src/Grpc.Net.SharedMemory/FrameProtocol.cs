@@ -204,6 +204,8 @@ public static class FrameProtocol
             // Refund quota if WriteFrame throws: we have debited but the
             // bytes never reached the peer, so no future WU will arrive
             // to refund and the stream would stall on the next send.
+            // Round-10 DEFER-1: refund BOTH stream + conn (the
+            // ReserveSendQuotaOrBlock above now debits both).
             try
             {
                 var header = new FrameHeader(FrameType.Message, streamId, (uint)data.Length, flags);
@@ -211,7 +213,7 @@ public static class FrameProtocol
             }
             catch
             {
-                fairStream?.RefundSendQuota(data.Length);
+                fairStream?.RefundSendQuotaWithConn(data.Length);
                 throw;
             }
             return;
@@ -244,6 +246,8 @@ public static class FrameProtocol
             // chunkSize bytes but the peer never received them, so no WU
             // will ever refund this credit. Prior chunks in this loop are
             // already on the wire and will be acked by peer WU as normal.
+            // Round-10 DEFER-1: refund BOTH stream + conn (the
+            // ReserveSendQuotaOrBlock above now debits both).
             try
             {
                 var header = new FrameHeader(FrameType.Message, streamId, (uint)chunkSize, chunkFlags);
@@ -251,7 +255,7 @@ public static class FrameProtocol
             }
             catch
             {
-                fairStream?.RefundSendQuota(chunkSize);
+                fairStream?.RefundSendQuotaWithConn(chunkSize);
                 throw;
             }
         }

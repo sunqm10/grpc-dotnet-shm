@@ -982,8 +982,23 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// because every outbound DATA flows through the writer task after
     /// Phase B refactor.
     /// </para>
+    /// <para>
+    /// Round-10 DEFER-1: initialised to <see cref="ShmConstants.MaxWindowSize"/>
+    /// (= <c>int.MaxValue</c>, ~2 GiB) matching grpc-go-shmem's SHM-mode
+    /// choice (see shm_client_transport.go#L864-L871). Rationale: in pure
+    /// SHM-SHM operation both peers advertise high windows; initialising
+    /// the local credit to a conservative 65535 / 32 MiB would cause
+    /// permanent under-utilisation and trip deadlocks for streaming
+    /// workloads (e.g. ping-pong tests where both sides exhaust the
+    /// 32 MiB conn window before the threshold-driven WU drip kicks in).
+    /// The debit path now ensures the field's value tracks actual
+    /// per-frame send accounting; interop with a strict-H2 peer that
+    /// genuinely advertises 65535 would require a peer-driven init via
+    /// SETTINGS_INITIAL_WINDOW_SIZE handshake hook, which is out of
+    /// scope for the SHM-only path today.
+    /// </para>
     /// </summary>
-    private long _connSendQuota = ShmConstants.InitialWindowSize;
+    private long _connSendQuota = ShmConstants.MaxWindowSize;
 
     /// <summary>
     /// Wake signal for senders blocked on insufficient conn-level quota.
@@ -1021,6 +1036,72 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     internal long ConnSendQuota => Volatile.Read(ref _connSendQuota);
 
     /// <summary>
+    /// Round-10 DEFER-1 fix: attempts to reserve <paramref name="n"/> bytes
+    /// of conn-level H2 send quota. Returns <see langword="true"/> with the
+    /// CAS-debit committed if quota is sufficient; <see langword="false"/>
+    /// (quota unchanged) otherwise. Mirrors the conn leg of grpc-go-shmem's
+    /// <c>tryReserveSendQuota</c> two-resource CAS pattern
+    /// (shm_client_transport.go ~L343). Per RFC 7540/9113 §6.9.1, every
+    /// outbound DATA frame MUST debit BOTH the per-stream window and the
+    /// connection window; this is the conn half of that contract.
+    /// </summary>
+    internal bool TryReserveConnSendQuota(int n)
+    {
+        if (n <= 0) return n == 0;
+        while (true)
+        {
+            var current = Volatile.Read(ref _connSendQuota);
+            if (current < n) return false;
+            if (Interlocked.CompareExchange(ref _connSendQuota, current - n, current) == current)
+                return true;
+        }
+    }
+
+    /// <summary>
+    /// Round-10 DEFER-1 fix: refunds <paramref name="n"/> bytes of
+    /// conn-level send quota (called when an outbound DATA write fails
+    /// after the conn debit committed but before the bytes reach the ring,
+    /// e.g. ring-write throw / CancelledException). Wakes
+    /// <see cref="_connSendQuotaWake"/> AND every active stream's per-stream
+    /// wake so any sender parked on insufficient credit re-probes.
+    /// </summary>
+    internal void RefundConnSendQuota(int n)
+    {
+        if (n <= 0) return;
+        while (true)
+        {
+            var current = Volatile.Read(ref _connSendQuota);
+            var desired = current + n;
+            if (desired > int.MaxValue) desired = int.MaxValue;
+            if (Interlocked.CompareExchange(ref _connSendQuota, desired, current) == current)
+            {
+                _connSendQuotaWake.Set();
+                WakeAllStreamsForConnQuotaChange();
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Round-10 DEFER-1 fix: wakes every active stream's per-stream
+    /// send-quota MRES so writers parked inside
+    /// <see cref="ShmGrpcStream.ReserveSendQuotaOrBlock"/> on insufficient
+    /// CONN credit re-evaluate after fresh conn credit arrives. Without this
+    /// hop, blocked writers only ever observe their own per-stream wake
+    /// and would stay parked through conn-level WU bursts. Iteration over
+    /// <see cref="_streams"/> (ConcurrentDictionary) is concurrent-safe;
+    /// each MRES.Set is idempotent and O(1).
+    /// </summary>
+    private void WakeAllStreamsForConnQuotaChange()
+    {
+        foreach (var stream in _streams.Values)
+        {
+            try { stream.SendQuotaWake.Set(); }
+            catch { /* defensive: stream may be mid-Dispose */ }
+        }
+    }
+
+    /// <summary>
     /// Routes an inbound <c>WINDOW_UPDATE</c> frame from the H2 codec
     /// to the appropriate quota.
     /// </summary>
@@ -1055,6 +1136,14 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 if (Interlocked.CompareExchange(ref _connSendQuota, desired, current) == current)
                 {
                     _connSendQuotaWake.Set();
+                    // Round-10 DEFER-1: also wake every stream's per-
+                    // stream MRES so writers parked in
+                    // ReserveSendQuotaOrBlock (now ALSO gated on conn
+                    // quota by DEFER-1 fix) re-probe after the conn-
+                    // level credit arrives. Without this, blocked
+                    // writers only observe per-stream WUs and would
+                    // stay parked through conn-level WU bursts.
+                    WakeAllStreamsForConnQuotaChange();
                     return;
                 }
             }

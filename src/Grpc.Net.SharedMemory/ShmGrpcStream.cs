@@ -530,6 +530,48 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Round-10 DEFER-1 fix: attempts to reserve <paramref name="n"/> bytes
+    /// from BOTH the per-stream window AND the connection-level window
+    /// atomically. Returns <see langword="true"/> with both debits
+    /// committed; <see langword="false"/> (both quotas unchanged) on
+    /// insufficient credit in either window. Mirrors grpc-go-shmem's
+    /// two-resource CAS pattern (shm_client_transport.go ~L343):
+    /// reserves stream first, then conn; rolls back the stream debit if
+    /// the conn CAS loses to ensure callers see all-or-nothing semantics.
+    /// Per RFC 7540/9113 §6.9.1 every outbound DATA frame MUST observe
+    /// both windows.
+    /// </summary>
+    internal bool TryReserveSendQuotaWithConn(int n)
+    {
+        if (n <= 0) return n == 0;
+        // Probe both first to fail fast without inducing CAS churn.
+        if (Volatile.Read(ref _sendQuota) < n) return false;
+        if (_connection.ConnSendQuota < n) return false;
+        // Reserve stream first.
+        if (!TryReserveSendQuota(n)) return false;
+        // Reserve conn; roll back stream on race loss.
+        if (!_connection.TryReserveConnSendQuota(n))
+        {
+            RefundSendQuota(n);
+            return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Round-10 DEFER-1 fix: refunds <paramref name="n"/> bytes to BOTH
+    /// the per-stream window and the connection window. Used by every
+    /// DATA write site's catch/rollback path, mirroring the
+    /// <see cref="TryReserveSendQuotaWithConn"/> two-resource reservation.
+    /// </summary>
+    internal void RefundSendQuotaWithConn(int n)
+    {
+        if (n <= 0) return;
+        RefundSendQuota(n);
+        _connection.RefundConnSendQuota(n);
+    }
+
+    /// <summary>
     /// Adds <paramref name="delta"/> bytes to the send window in response
     /// to an incoming <c>WINDOW_UPDATE</c> frame from the peer. Caps at
     /// <see cref="Synchronization.InFlow.MaxWindowSize"/> (HTTP/2 31-bit
@@ -592,8 +634,9 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     internal void ReserveSendQuotaOrBlock(int n, Action? drainBeforeWait, CancellationToken cancellationToken)
     {
         if (n <= 0) return;
-        // Fast path: quota readily available.
-        if (TryReserveSendQuota(n)) return;
+        // Fast path: both quotas readily available (round-10 DEFER-1
+        // upgraded this to reserve both stream + conn atomically).
+        if (TryReserveSendQuotaWithConn(n)) return;
 
         while (true)
         {
@@ -609,9 +652,12 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             }
             // Reset BEFORE recheck to ensure we observe any quota added
             // before our Wait starts; sticky semantics of MRESlim mean
-            // a Set between Reset and Wait still wakes us.
+            // a Set between Reset and Wait still wakes us. _sendQuotaWake
+            // wakes on per-stream WU AND on conn-level WU (DEFER-1:
+            // AddSendQuota(streamId=0) explicitly wakes every active
+            // stream's MRES so writers parked here re-probe both windows).
             _sendQuotaWake.Reset();
-            if (TryReserveSendQuota(n)) return;
+            if (TryReserveSendQuotaWithConn(n)) return;
             // Re-check disposal AFTER Reset to close the missed-wake
             // race where Dispose() ran between our earlier
             // ThrowIfDisposed() and our Reset() — Dispose's wake-Set
