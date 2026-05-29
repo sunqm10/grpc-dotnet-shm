@@ -546,6 +546,14 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         {
             cancellationToken.ThrowIfCancellationRequested();
             ThrowIfDisposed();
+            // BUG-FIX (round-10 GPT-5.5 #2): check _cancelled so a
+            // remote Cancel/RST during our quota wait aborts the
+            // send instead of waiting indefinitely for the caller's
+            // own token to fire.
+            if (_cancelled)
+            {
+                throw new OperationCanceledException("Stream cancelled by peer (CANCEL frame received).");
+            }
             // Reset BEFORE recheck to ensure we observe any quota added
             // before our Wait starts; sticky semantics of MRESlim mean
             // a Set between Reset and Wait still wakes us.
@@ -560,6 +568,15 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             // Cancellation is re-checked symmetrically.
             ThrowIfDisposed();
             cancellationToken.ThrowIfCancellationRequested();
+            // Same re-check for remote-peer cancel as above; covers
+            // the race where Cancel arrived between our top-of-loop
+            // _cancelled read and our Reset() (Reset would have
+            // cleared the Cancel-path's wake-Set, dooming us to a
+            // Wait that never wakes).
+            if (_cancelled)
+            {
+                throw new OperationCanceledException("Stream cancelled by peer (CANCEL frame received).");
+            }
             // Flush pending control frames (Ping/Pong keepalive) so
             // they are not stranded behind a blocked DATA write while
             // we wait for the peer to grant more quota.
@@ -1805,6 +1822,14 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 case FrameType.Cancel:
                     _cancelled = true;
                     CancelCancellationToken();
+                    // BUG-FIX (round-10 GPT-5.5 #2): wake any sender
+                    // parked in ReserveSendQuotaOrBlock so it observes
+                    // _cancelled at the top of its loop and aborts
+                    // promptly instead of waiting for the caller's
+                    // (unrelated) cancellation token or the eventual
+                    // RPC deadline. Mirrors the AbortForFlowControl
+                    // pattern at line ~2175 which already does this.
+                    _sendQuotaWake.Set();
                     frame.ReturnToPool();
                     ownsFrame = false;
                     _inboundFrames.Writer.TryComplete();
