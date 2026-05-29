@@ -573,59 +573,44 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                     return;
                 }
 
-                // TryPause failed: ExecuteInline with intermediate buffer.
-                byte[] serializedBuffer;
-                int serializedSize;
-                bool returnBuffer = false;
-                if (size > 0)
+                // TryPause failed: ExecuteInline runs the lambda on the
+                // writer-loop thread under the same ring-exclusivity the
+                // TryPause-success branch enjoys. Round-9 PR-G: use
+                // WriteInlineDirectMultiFrame to serialize protobuf
+                // STRAIGHT into the ring (matches TryPause-success
+                // branch above) instead of pre-serializing into an
+                // intermediate pooled buffer and re-copying via
+                // WriteInline. Eliminates 1 ArrayPool rent/return + 1
+                // full-payload memcpy per response on the contended-
+                // inline-write path. (Opus 4.8 round-9 #2 finding.)
+                writer.ExecuteInline(() =>
                 {
-                    serializedBuffer = ArrayPool<byte>.Shared.Rent(5 + size);
-                    returnBuffer = true;
-                    serializedBuffer[0] = 0;
-                    System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
-                        serializedBuffer.AsSpan(1, 4), (uint)size);
-                    msg.WriteTo(serializedBuffer.AsSpan(5, size));
-                    serializedSize = 5 + size;
-                }
-                else
-                {
-                    serializedBuffer = EmptyGrpcLpm;
-                    serializedSize = 5;
-                }
-
-                try
-                {
-                    writer.ExecuteInline(() =>
+                    // Same coalescing as TryPause path \u2014 single wake for
+                    // HEADERS+MESSAGE+TRAILERS instead of three. Safe
+                    // iff the message body fits in ONE H2 DATA frame
+                    // (see TryPause path / CanCoalesceInlineMessage
+                    // for the chunking/deadlock rationale).
+                    bool coalesce = writer.CanCoalesceInlineMessage(5 + size);
+                    if (coalesce) writer.BeginInlineBatch();
+                    try
                     {
-                        // Same coalescing as TryPause path — single wake for
-                        // HEADERS+MESSAGE+TRAILERS instead of three. Safe
-                        // iff the message body fits in ONE H2 DATA frame
-                        // (see TryPause path / CanCoalesceInlineMessage
-                        // for the chunking/deadlock rationale).
-                        bool coalesce = writer.CanCoalesceInlineMessage(serializedSize);
-                        if (coalesce) writer.BeginInlineBatch();
-                        try
+                        if (!context.HeadersSent)
                         {
-                            if (!context.HeadersSent)
-                            {
-                                stream.SendResponseHeadersInline(writer);
-                                context.MarkHeadersSent();
-                            }
-                            writer.WriteInline(stream.StreamId,
-                                serializedBuffer.AsSpan(0, serializedSize), 0, default, stream);
-                            stream.SendTrailersInline(writer, context.Status.StatusCode,
-                                context.Status.Detail, context.ResponseTrailers);
+                            stream.SendResponseHeadersInline(writer);
+                            context.MarkHeadersSent();
                         }
-                        finally
-                        {
-                            if (coalesce) writer.EndInlineBatch();
-                        }
-                    });
-                }
-                finally
-                {
-                    if (returnBuffer) ArrayPool<byte>.Shared.Return(serializedBuffer);
-                }
+                        if (size > 0)
+                            writer.WriteInlineDirectMultiFrame(stream.StreamId, size, msg, 0, default, stream);
+                        else
+                            writer.WriteInline(stream.StreamId, stackalloc byte[5], 0, default, stream);
+                        stream.SendTrailersInline(writer, context.Status.StatusCode,
+                            context.Status.Detail, context.ResponseTrailers);
+                    }
+                    finally
+                    {
+                        if (coalesce) writer.EndInlineBatch();
+                    }
+                });
                 return;
             }
 
