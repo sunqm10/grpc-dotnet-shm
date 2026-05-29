@@ -1245,7 +1245,12 @@ internal sealed class ShmFrameWriter : IDisposable
         {
             var remainingLen = totalLen - offset;
             var chunkSize = Math.Min(maxFramePayload, remainingLen);
-            if (!fairStream.TryReserveSendQuota(chunkSize))
+            // Round-10 DEFER-1: reserve BOTH per-stream + conn-level
+            // quota atomically (RFC 7540/9113 §6.9.1 "either window"
+            // MUST). On failure (either window insufficient) we return
+            // the current offset so the writer task can park the entry
+            // in _deferred and resume after the next WU.
+            if (!fairStream.TryReserveSendQuotaWithConn(chunkSize))
             {
                 return offset;
             }
@@ -1262,13 +1267,14 @@ internal sealed class ShmFrameWriter : IDisposable
             // teardown, OperationCanceled): the bytes never reach the
             // peer, so no WINDOW_UPDATE will refund this credit (same
             // bug-class as round-5 FrameProtocol.WriteMessage fix).
+            // Round-10 DEFER-1: refund BOTH stream + conn.
             try
             {
                 FrameProtocol.WriteFrame(_ring, header, fullPayload.Slice(offset, chunkSize), _ct);
             }
             catch
             {
-                fairStream.RefundSendQuota(chunkSize);
+                fairStream.RefundSendQuotaWithConn(chunkSize);
                 throw;
             }
             offset += chunkSize;
@@ -1999,9 +2005,11 @@ internal sealed class ShmFrameWriter : IDisposable
                 // in-flight body), so no other thread races for the
                 // refunded credit between Refund and the RFS's first
                 // ReserveSendQuotaOrBlock.
+                // Round-10 DEFER-1: refund BOTH stream + conn (the
+                // ReserveSendQuotaOrBlock above debited both).
                 if (quotaAlreadyReserved)
                 {
-                    fairStream?.RefundSendQuota(framePayloadSize);
+                    fairStream?.RefundSendQuotaWithConn(framePayloadSize);
                     quotaAlreadyReserved = false;
                 }
             }
@@ -2009,7 +2017,7 @@ internal sealed class ShmFrameWriter : IDisposable
             {
                 if (quotaAlreadyReserved && !committedSingleFrame)
                 {
-                    fairStream?.RefundSendQuota(framePayloadSize);
+                    fairStream?.RefundSendQuotaWithConn(framePayloadSize);
                 }
                 throw;
             }
@@ -2083,6 +2091,7 @@ internal sealed class ShmFrameWriter : IDisposable
             // never put them on the wire, so peer will never emit WU to
             // refund. Without this, future sends on this stream block
             // forever waiting for credit that the peer doesn't owe.
+            // Round-10 DEFER-1: refund BOTH stream + conn.
             WriteReservation reservation;
             try
             {
@@ -2090,7 +2099,7 @@ internal sealed class ShmFrameWriter : IDisposable
             }
             catch
             {
-                _fairStream?.RefundSendQuota(chunkPayload);
+                _fairStream?.RefundSendQuotaWithConn(chunkPayload);
                 throw;
             }
             _currentReservation = reservation;
@@ -2287,10 +2296,12 @@ internal sealed class ShmFrameWriter : IDisposable
                 // bytes it received. Without this refund we permanently
                 // over-debit by (capacity - written) per partial frame,
                 // causing future sends on the stream to stall.
+                // Round-10 DEFER-1: refund BOTH stream + conn (both were
+                // debited by the per-chunk ReserveSendQuotaOrBlock).
                 var unused = _currentFrameCapacity - _currentFrameWritten;
                 if (unused > 0)
                 {
-                    _fairStream?.RefundSendQuota(unused);
+                    _fairStream?.RefundSendQuotaWithConn(unused);
                 }
             }
             base.Dispose(disposing);
