@@ -1091,10 +1091,26 @@ internal static partial class Http2Codec
         }
         else
         {
-            // Subsequent HEADERS → trailers.
+            // Subsequent HEADERS → trailers per gRPC over HTTP/2.
+            // BUG-FIX (round-10 GPT-5.5 #8): trailers MUST carry
+            // END_STREAM. Per RFC 7540 §8.1 + the gRPC over HTTP/2
+            // wire spec, the trailing metadata HEADERS block MUST set
+            // the END_STREAM flag (it is the final frame of the stream).
+            // Without this guard a malformed/malicious peer could send
+            // "trailers" without END_STREAM and the upper layer would
+            // unconditionally mark _halfCloseReceived = true, complete
+            // the inbound channel, and remove the stream — leaving any
+            // subsequent peer frames routed to nothing (silent data
+            // loss + a spurious "successful" RPC completion).
+            if (!endStream)
+            {
+                throw new InvalidDataException(
+                    $"H2 trailers HEADERS on stream {streamId} missing END_STREAM " +
+                    "(RFC 7540 §8.1 + gRPC over HTTP/2: trailing metadata must end the stream)");
+            }
             var v1 = HpackHeadersAdapter.DecodeTrailers(headerBlock);
             internalType = FrameType.Trailers;
-            internalFlags = endStream ? TrailersFlags.EndStream : (byte)0;
+            internalFlags = TrailersFlags.EndStream;
             state.StreamsWithInitialHeaders.Remove(streamId);
             var hdrSub = new FrameHeader(internalType, streamId, 0, internalFlags);
             return (hdrSub, FramePayload.FromDecodedHeader(v1));
