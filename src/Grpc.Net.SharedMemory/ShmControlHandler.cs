@@ -431,92 +431,125 @@ public sealed class ShmControlHandler : HttpMessageHandler
             // Send CONNECT request with preferred ring capacity from client options.
             // Server will negotiate: Min(clientPreferred, serverMax). Value 0 = use server default.
             // Wire format is always HTTP/2 (advertised in the extension).
+            //
+            // Nonce coordination (gRFC A — Stale Response Correlation):
+            // generate a fresh 8-byte CSPRNG nonce per CONNECT. The
+            // server echoes it in ACCEPT/REJECT so we can detect and
+            // skip stale responses left on the shared Ring B by a
+            // previously timed-out dialer (which would otherwise
+            // mis-bind us to the wrong peer's segment with the wrong
+            // singleStreamMode flag). Bounded skip loop matches
+            // grpc-go-shmem's maxStaleResponses=3.
             var preferredRing = _options.RingCapacity;
+            var ourNonce = ControlWire.NewConnectNonce();
             await WriteControlFrameAsync(ctlTx, FrameType.Connect,
-                ControlWire.EncodeConnectRequest(preferredRing, preferredRing, _options.SingleStreamMode), ct).ConfigureAwait(false);
+                ControlWire.EncodeConnectRequest(preferredRing, preferredRing, _options.SingleStreamMode, ourNonce), ct).ConfigureAwait(false);
 
-            // Read response
-            var (responseHeader, responsePayload) = await ReadControlFrameAsync(ctlRx, ct).ConfigureAwait(false);
-
-            switch (responseHeader.Type)
+            const int maxStaleResponses = 3;
+            for (int attempt = 0; attempt <= maxStaleResponses; attempt++)
             {
-                case FrameType.Accept:
-                    var dataSegmentName = ControlWire.DecodeConnectResponse(responsePayload.Span);
+                // Read response
+                var (responseHeader, responsePayload) = await ReadControlFrameAsync(ctlRx, ct).ConfigureAwait(false);
 
-                    // Open the data segment
-                    var dataSegment = Segment.Open(dataSegmentName);
-                    try
-                    {
-                        await dataSegment.WaitForServerAsync(ct).ConfigureAwait(false);
-
-                        // Signal that client has mapped the segment
-                        dataSegment.SetClientReady(true);
-
-                        // Optional security handshake on the data segment
-                        // BEFORE we hand it to ShmConnection — the connection
-                        // ctor starts the frame reader loop which would
-                        // otherwise race the handshake frame I/O. Mirrors
-                        // grpc-go-shmem's transport-layer
-                        // ShmSecurityHandshaker.ClientHandshake.
-                        ShmAuthInfo? authInfo = null;
-                        if (_options.Handshaker != null)
+                switch (responseHeader.Type)
+                {
+                    case FrameType.Accept:
+                        var (dataSegmentName, acceptNonce) = ControlWire.DecodeConnectResponse(responsePayload.Span);
+                        if (acceptNonce != ourNonce)
                         {
-                            // From the client's perspective: RingA is
-                            // client→server (we write), RingB is
-                            // server→client (we read).
-                            authInfo = await _options.Handshaker.ClientHandshakeAsync(
-                                writer: (type, payload, c) => WriteHandshakeFrameAsync(dataSegment.RingA, type, payload, c),
-                                reader: c => ReadHandshakeFrameAsync(dataSegment.RingB, c),
-                                ct).ConfigureAwait(false);
+                            // Stale ACCEPT from a previous dialer; skip
+                            // and keep reading for OUR response.
+                            continue;
                         }
 
-                        // Wire format is always HTTP/2 — the protocol layer rejected
-                        // anything else.
-                        // Create and return the connection
-                        var conn = ShmConnection.FromClientSegment(dataSegmentName, dataSegment);
-                        conn.AuthInfo = authInfo;
-                        if (_options.SingleStreamMode)
+                        // Open the data segment
+                        var dataSegment = Segment.Open(dataSegmentName);
+                        try
                         {
-                            conn.ZeroCopyRead = true;
-                            // SingleStreamMode propagates to TxRing/RxRing
-                            // (see ShmConnection.SingleStreamMode setter), so
-                            // the chain-ZC budget on the data rings reflects
-                            // the negotiated mode and the client-side inline-
-                            // write fast paths are unlocked.
-                            //
-                            // Correctness depends on `SendRequestHeadersAsync`
-                            // taking the TryPauseWriterLoop inline-write path
-                            // when this flag is set so Headers, Message, and
-                            // HalfClose all serialise through the same inline
-                            // writer (no concurrent WriterLoop dequeue racing
-                            // against an inline writer on the same ring).
-                            conn.SingleStreamMode = true;
-                            conn.FrameWriter?.EnableSingleStreamMode();
+                            await dataSegment.WaitForServerAsync(ct).ConfigureAwait(false);
+
+                            // Signal that client has mapped the segment
+                            dataSegment.SetClientReady(true);
+
+                            // Optional security handshake on the data segment
+                            // BEFORE we hand it to ShmConnection — the connection
+                            // ctor starts the frame reader loop which would
+                            // otherwise race the handshake frame I/O. Mirrors
+                            // grpc-go-shmem's transport-layer
+                            // ShmSecurityHandshaker.ClientHandshake.
+                            ShmAuthInfo? authInfo = null;
+                            if (_options.Handshaker != null)
+                            {
+                                // From the client's perspective: RingA is
+                                // client→server (we write), RingB is
+                                // server→client (we read).
+                                authInfo = await _options.Handshaker.ClientHandshakeAsync(
+                                    writer: (type, payload, c) => WriteHandshakeFrameAsync(dataSegment.RingA, type, payload, c),
+                                    reader: c => ReadHandshakeFrameAsync(dataSegment.RingB, c),
+                                    ct).ConfigureAwait(false);
+                            }
+
+                            // Wire format is always HTTP/2 — the protocol layer rejected
+                            // anything else.
+                            // Create and return the connection
+                            var conn = ShmConnection.FromClientSegment(dataSegmentName, dataSegment);
+                            conn.AuthInfo = authInfo;
+                            if (_options.SingleStreamMode)
+                            {
+                                conn.ZeroCopyRead = true;
+                                // SingleStreamMode propagates to TxRing/RxRing
+                                // (see ShmConnection.SingleStreamMode setter), so
+                                // the chain-ZC budget on the data rings reflects
+                                // the negotiated mode and the client-side inline-
+                                // write fast paths are unlocked.
+                                //
+                                // Correctness depends on `SendRequestHeadersAsync`
+                                // taking the TryPauseWriterLoop inline-write path
+                                // when this flag is set so Headers, Message, and
+                                // HalfClose all serialise through the same inline
+                                // writer (no concurrent WriterLoop dequeue racing
+                                // against an inline writer on the same ring).
+                                conn.SingleStreamMode = true;
+                                conn.FrameWriter?.EnableSingleStreamMode();
+                            }
+                            if (_options.InlineReceiveContinuations)
+                            {
+                                // Local receive-side opt-in: only affects this
+                                // client's Channel<InboundFrame> dispatch, not
+                                // the wire protocol. Each side picks its own
+                                // continuation model independently. See
+                                // ShmConnection.InlineReceiveContinuations.
+                                conn.InlineReceiveContinuations = true;
+                            }
+                            return conn;
                         }
-                        if (_options.InlineReceiveContinuations)
+                        catch
                         {
-                            // Local receive-side opt-in: only affects this
-                            // client's Channel<InboundFrame> dispatch, not
-                            // the wire protocol. Each side picks its own
-                            // continuation model independently. See
-                            // ShmConnection.InlineReceiveContinuations.
-                            conn.InlineReceiveContinuations = true;
+                            dataSegment.Dispose();
+                            throw;
                         }
-                        return conn;
-                    }
-                    catch
-                    {
-                        dataSegment.Dispose();
-                        throw;
-                    }
 
-                case FrameType.Reject:
-                    var message = ControlWire.DecodeConnectReject(responsePayload.Span);
-                    throw new InvalidOperationException($"Connection rejected by server: {message}");
+                    case FrameType.Reject:
+                        var (message, rejectNonce) = ControlWire.DecodeConnectReject(responsePayload.Span);
+                        if (rejectNonce != ourNonce)
+                        {
+                            // Stale REJECT (or 0-nonce decode-failure
+                            // REJECT for a previous dialer); skip.
+                            continue;
+                        }
+                        throw new InvalidOperationException($"Connection rejected by server: {message}");
 
-                default:
-                    throw new InvalidOperationException($"Unexpected response frame type: {responseHeader.Type}");
+                    default:
+                        throw new InvalidOperationException($"Unexpected response frame type: {responseHeader.Type}");
+                }
             }
+
+            // Exhausted the stale-skip budget without seeing our nonce.
+            // Treat as a soft handshake failure: the legitimate response
+            // is either delayed past our patience or got mis-consumed by
+            // an earlier dialer that beat us to Ring B reads.
+            throw new InvalidOperationException(
+                $"No matching connect response after {maxStaleResponses + 1} attempts (stale-skip budget exhausted).");
         }
         finally
         {
