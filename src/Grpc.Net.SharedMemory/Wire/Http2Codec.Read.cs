@@ -904,6 +904,20 @@ internal static partial class Http2Codec
             // CONTINUATION almost never necessary).
             if (endHeaders)
             {
+                // BUG-FIX (round-10 GPT-5.5 #9): enforce MaxHeaderListSize
+                // here too. The CONTINUATION path already checks the
+                // cumulative payload (see line ~984), but the single-
+                // HEADERS fast path skipped the check. A peer could send
+                // one oversized HEADERS frame up to the per-frame cap
+                // (MaxH2FramePayloadSize) and force us to HPACK-decode
+                // and materialise the entire block despite our declared
+                // MaxHeaderListSize budget. Reject early.
+                if (firstHeaderBlockLength > MaxHeaderListSize)
+                {
+                    throw new InvalidDataException(
+                        $"H2 HEADERS payload {firstHeaderBlockLength} bytes exceeds " +
+                        $"MaxHeaderListSize ({MaxHeaderListSize})");
+                }
                 var single = firstFragment.AsSpan(firstHeaderBlockOffset, firstHeaderBlockLength);
                 return EmitDecodedHeaders(single, streamId, state, endStream);
             }
