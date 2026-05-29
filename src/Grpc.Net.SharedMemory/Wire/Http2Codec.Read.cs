@@ -378,6 +378,26 @@ internal static partial class Http2Codec
         ShmRing ring, ulong baseCommitReadIdx, uint streamId, byte h2Flags, int payloadLen,
         bool zeroCopy, Http2DecoderState state, CancellationToken ct)
     {
+        // BUG-FIX (round-10 GPT-5.5 #7): RFC 7540 §6.1 — DATA frames
+        // MUST be associated with a stream. Receiving a DATA frame on
+        // stream 0 is a PROTOCOL_ERROR connection error. Previously
+        // this was silently accepted and would have driven flow-
+        // control state and the LPM accumulator on the connection
+        // pseudo-stream, leaving the codec in undefined state.
+        // Drain the malformed payload first so the ring read pointer
+        // stays in sync (matches the RST_STREAM malformed-payload
+        // pattern at ~line 1079).
+        if (streamId == 0)
+        {
+            if (payloadLen > 0)
+            {
+                var _ = ring.ReserveRead(payloadLen, ct);
+            }
+            ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+            throw new InvalidDataException(
+                $"H2 DATA frame on connection stream 0 (RFC 7540 §6.1 PROTOCOL_ERROR)");
+        }
+
         // Per RFC 7540 §6.9.1, the entire DATA frame payload (including
         // Pad Length byte and padding) is included in flow control. Fire
         // the per-DATA-frame hook here so the connection can drive
@@ -814,6 +834,22 @@ internal static partial class Http2Codec
         ShmRing ring, ulong baseCommitReadIdx, uint streamId, byte h2Flags, int payloadLen,
         Http2DecoderState state, CancellationToken ct)
     {
+        // BUG-FIX (round-10 GPT-5.5 #7): RFC 7540 §6.2 — HEADERS frames
+        // MUST be associated with a stream. Receiving HEADERS on stream
+        // 0 is a PROTOCOL_ERROR connection error. Previously this was
+        // silently routed to EmitDecodedHeaders which would have driven
+        // header state on a non-existent stream.
+        if (streamId == 0)
+        {
+            if (payloadLen > 0)
+            {
+                var _ = ring.ReserveRead(payloadLen, ct);
+            }
+            ring.CommitReadRaw(baseCommitReadIdx, Http2FrameHeader.Size + payloadLen);
+            throw new InvalidDataException(
+                $"H2 HEADERS frame on connection stream 0 (RFC 7540 §6.2 PROTOCOL_ERROR)");
+        }
+
         var endStream = (h2Flags & Http2Flags.EndStream) != 0;
         var endHeaders = (h2Flags & Http2Flags.EndHeaders) != 0;
         var padded = (h2Flags & Http2Flags.Padded) != 0;
