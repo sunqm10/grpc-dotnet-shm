@@ -2329,6 +2329,14 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         _connection.RemoveStream(StreamId);
         _sendLock.Dispose();
+        // BUG-FIX (round-10 GPT-5.5 #10): dispose the send-quota wake
+        // MRES so its lazily-allocated kernel wait handle is released.
+        // Wake the MRES first (already done at top of Dispose) so any
+        // pending Wait observes the signal before we dispose; final
+        // pending waiter will get ObjectDisposedException which is
+        // caught by the existing send-path try/catch wrappers.
+        try { _sendQuotaWake.Dispose(); }
+        catch { /* defensive: never throw from Dispose */ }
         // Round-9 PR-I + Round-10 Opus #5: atomically take ownership
         // of the lazy CTS via Exchange so a concurrent CancellationToken
         // getter (or one that races past our _disposed pre-check) can

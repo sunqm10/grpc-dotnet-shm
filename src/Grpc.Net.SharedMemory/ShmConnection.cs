@@ -1493,6 +1493,14 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         {
             _segment.Dispose();
         }
+        // BUG-FIX (round-10 GPT-5.5 #10): dispose the connection-level
+        // send-quota wake MRES (allocated alongside _connSendQuota in
+        // the field initialiser). Without this the kernel wait handle
+        // it lazily allocates for blocking waits would leak per
+        // connection. Same pattern as the per-stream _sendQuotaWake
+        // disposal added by the companion fix in ShmGrpcStream.Dispose.
+        try { _connSendQuotaWake.Dispose(); }
+        catch { /* defensive: never throw from Dispose */ }
         _disposeCts.Dispose();
     }
 
@@ -1568,6 +1576,9 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         {
             _segment.Dispose();
         }
+        // BUG-FIX (round-10 GPT-5.5 #10): see sync Dispose for rationale.
+        try { _connSendQuotaWake.Dispose(); }
+        catch { /* defensive: never throw from DisposeAsync */ }
         _disposeCts.Dispose();
     }
 }
