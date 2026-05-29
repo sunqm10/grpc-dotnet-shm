@@ -268,8 +268,32 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             // Round-9 PR-I lazy init. Common client-side case: never
             // read, never allocated. Server-side reads once at
             // ShmServerCallContext ctor.
+            //
+            // Round-10 BUG-FIX (Opus #5): guard against Dispose races.
+            // (a) Pre-check _disposed so we don't allocate a CTS that
+            //     Dispose has already missed (which would leak it).
+            // (b) Wrap existing.Token in ODE-catch so a getter that
+            //     races with the Dispose that disposed our published
+            //     CTS returns a clean cancelled token instead of
+            //     surfacing ObjectDisposedException to user code.
+            // (c) Post-CAS re-check of _disposed: if Dispose ran
+            //     between (a) and our CAS publish, atomically swap our
+            //     CTS back out of the field and dispose it ourselves
+            //     (Dispose may have already drained the field).
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                return new CancellationToken(canceled: true);
+            }
+
             var existing = _cancellationCts;
-            if (existing != null) return existing.Token;
+            if (existing != null)
+            {
+                try { return existing.Token; }
+                catch (ObjectDisposedException)
+                {
+                    return new CancellationToken(canceled: true);
+                }
+            }
 
             var fresh = new CancellationTokenSource();
             // Pre-cancel if a Cancel raced ahead while we were
@@ -285,9 +309,27 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
                 // away our local CTS and use the winner. Cancel-flag
                 // propagation already handled by the winning thread.
                 fresh.Dispose();
-                return prev.Token;
+                try { return prev.Token; }
+                catch (ObjectDisposedException)
+                {
+                    return new CancellationToken(canceled: true);
+                }
             }
-            // Won. If Cancel raced between our flag pre-check and our
+            // Won. Round-10 BUG-FIX (Opus #5): if Dispose ran between
+            // our pre-check and our CAS publish, the freshly-published
+            // CTS would leak. Detect by re-reading _disposed; if set,
+            // atomically swap our CTS back out. If we win the swap we
+            // own dispose; if Dispose already drained the field, it
+            // disposed the CTS already.
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                if (Interlocked.CompareExchange(ref _cancellationCts, null, fresh) == fresh)
+                {
+                    fresh.Dispose();
+                }
+                return new CancellationToken(canceled: true);
+            }
+            // If Cancel raced between our flag pre-check and our
             // CAS publish, it would have observed _cancellationCts as
             // null and done nothing; close the gap by re-checking the
             // flag after publish.
@@ -2252,9 +2294,13 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         _connection.RemoveStream(StreamId);
         _sendLock.Dispose();
-        // Round-9 PR-I: lazy CTS may have never been allocated (client
-        // path that never reads CancellationToken).
-        _cancellationCts?.Dispose();
+        // Round-9 PR-I + Round-10 Opus #5: atomically take ownership
+        // of the lazy CTS via Exchange so a concurrent CancellationToken
+        // getter (or one that races past our _disposed pre-check) can
+        // detect via its post-CAS disposed re-check that we no longer
+        // hold the field, and refrain from double-disposing.
+        var ctsToDispose = Interlocked.Exchange(ref _cancellationCts, null);
+        ctsToDispose?.Dispose();
         _disposeCts.Dispose();
     }
 
