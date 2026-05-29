@@ -2289,6 +2289,32 @@ internal sealed class ShmFrameWriter : IDisposable
                         ArrayPool<byte>.Shared.Return(ctlEntry.ReturnToPool);
                     ctlEntry.CompletionSignal?.Set();
                 }
+
+                // 4b. Drain per-stream FC-parked entries in _deferred.
+                // Round-8 PR-C1: every parked FrameEntry may hold a pooled
+                // ReturnToPool buffer AND a CompletionSignal MRES that the
+                // caller is awaiting (EnqueueZeroCopyAndWait). Without this
+                // drain, sustained-load + abrupt connection teardown leaks
+                // both the pooled buffer (matches the bug class Go found in
+                // their session) AND blocks the waiter forever. Safe to
+                // walk without locking: writerDone implies the WriterLoop
+                // is the only writer of _deferred and has exited.
+                if (_deferredCount > 0)
+                {
+                    foreach (var kvp in _deferred)
+                    {
+                        var queue = kvp.Value;
+                        foreach (var parked in queue)
+                        {
+                            if (parked.ReturnToPool != null)
+                                ArrayPool<byte>.Shared.Return(parked.ReturnToPool);
+                            parked.CompletionSignal?.Set();
+                        }
+                        queue.Clear();
+                    }
+                    _deferred.Clear();
+                    _deferredCount = 0;
+                }
             }
 
             _readySignal.Dispose();

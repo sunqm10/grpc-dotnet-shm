@@ -49,6 +49,11 @@ public sealed class ShmControlHandler : HttpMessageHandler
     private readonly ShmConnectionPool? _pool;
     private int _disposed;
 
+    // Round-8 PR-C1: cache the HttpResponseMessage.Version value once.
+    // `new Version(2, 0)` per RPC is one allocation per response on the
+    // unary hot path; the immutable singleton is safe to share.
+    private static readonly Version s_http20Version = new(2, 0);
+
     // Diagnostic counters for the wake-coalescing path; visible to bench.
     internal static long s_unaryRequests;
     internal static long s_streamingRequests;
@@ -268,8 +273,12 @@ public sealed class ShmControlHandler : HttpMessageHandler
 
         if (request.Content != null)
         {
-            var writeStream = new ShmGrpcRequestStream(stream);
-            _ = SendBodyAsync(writeStream, request.Content, stream, cancellationToken);
+            // Round-8 PR-C1: SendBodyAsync owns the ShmGrpcRequestStream
+            // lifecycle via `using` (was leaked here on every RPC where
+            // the marshaller didn't take the IDirectMessageWriter fast
+            // path — _bodyBuf rented by the multi-fragment WriteAsync
+            // path was never returned to ArrayPool).
+            _ = SendBodyAsync(request.Content, stream, cancellationToken);
         }
         else
         {
@@ -297,7 +306,7 @@ public sealed class ShmControlHandler : HttpMessageHandler
         var response = new HttpResponseMessage(HttpStatusCode.OK)
         {
             Content = responseContent,
-            Version = new Version(2, 0)
+            Version = s_http20Version
         };
         responseContent.SetTrailingHeaders(response.TrailingHeaders);
 
@@ -337,12 +346,23 @@ public sealed class ShmControlHandler : HttpMessageHandler
     /// Runs inline for unary calls (completes before yielding) and
     /// naturally yields for streaming calls via the async state machine.
     /// </summary>
+    /// <summary>
+    /// Sends the request body and half-close on the given stream.
+    /// Runs inline for unary calls (completes before yielding) and
+    /// naturally yields for streaming calls via the async state machine.
+    /// Round-8 PR-C1: constructs and OWNS the
+    /// <see cref="ShmGrpcRequestStream"/> lifecycle via <c>using</c>
+    /// to guarantee <c>_bodyBuf</c> returns to the pool on every exit
+    /// (success, exception, cancellation). Prior shape (caller-owned
+    /// stream + fire-and-forget call) leaked the pooled buffer on
+    /// custom HttpContent and multi-fragment WriteAsync paths.
+    /// </summary>
     private static async Task SendBodyAsync(
-        ShmGrpcRequestStream writeStream,
         HttpContent content,
         ShmGrpcStream stream,
         CancellationToken cancellationToken)
     {
+        using var writeStream = new ShmGrpcRequestStream(stream);
         try
         {
             await content.CopyToAsync(writeStream, cancellationToken).ConfigureAwait(false);
@@ -852,9 +872,21 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
     private int _bodyBufLen;
     private int _bodyExpected;
 
+    // Round-8 PR-C1: test-only counter that lets regression tests assert
+    // every constructed stream was matched by a Dispose. Tracks the number
+    // of instances currently outstanding (incremented in ctor, decremented
+    // in Dispose). A non-zero post-RPC value means SendBodyAsync (or
+    // another caller) leaked the stream and therefore leaked `_bodyBuf`
+    // back to GC instead of the ArrayPool. Live counter (not interlocked
+    // for raw value but the +/- pair is via Interlocked) so a thread-safe
+    // observer can read it.
+    internal static int LiveInstanceCount => Volatile.Read(ref s_liveInstanceCount);
+    private static int s_liveInstanceCount;
+
     public ShmGrpcRequestStream(ShmGrpcStream shmStream)
     {
         _shmStream = shmStream;
+        Interlocked.Increment(ref s_liveInstanceCount);
     }
 
     protected override void Dispose(bool disposing)
@@ -863,6 +895,10 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
         {
             ArrayPool<byte>.Shared.Return(_bodyBuf);
             _bodyBuf = null;
+        }
+        if (disposing)
+        {
+            Interlocked.Decrement(ref s_liveInstanceCount);
         }
         base.Dispose(disposing);
     }

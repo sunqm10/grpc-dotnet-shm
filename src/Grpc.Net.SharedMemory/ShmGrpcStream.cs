@@ -1405,7 +1405,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 
         while (true)
         {
-            var frame = await ReceiveFrameAsync(cancellationToken);
+            var frame = await ReceiveFrameAsync(cancellationToken).ConfigureAwait(false);
             if (frame == null)
                 throw new InvalidOperationException("Stream closed before receiving headers");
 
@@ -1520,7 +1520,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         {
             if (_cancelled) yield break;
 
-            var frame = await ReceiveFrameAsync(cancellationToken);
+            var frame = await ReceiveFrameAsync(cancellationToken).ConfigureAwait(false);
             if (frame == null)
             {
                 // If the send side failed, surface it instead of silently
@@ -1715,7 +1715,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             {
                 if (_cancelled) yield break;
 
-                var frame = await ReceiveFrameAsync(cancellationToken);
+                var frame = await ReceiveFrameAsync(cancellationToken).ConfigureAwait(false);
                 if (frame == null)
                 {
                     var sendEx = _sendFailure;
