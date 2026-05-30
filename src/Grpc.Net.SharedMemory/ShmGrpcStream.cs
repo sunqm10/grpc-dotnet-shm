@@ -102,6 +102,23 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
 {
     private readonly ShmConnection _connection;
     private readonly Channel<InboundFrame> _inboundFrames;
+    // Round-14 N1: per-stream decision made ONCE at construction. When
+    // true, ShmConnection.ProcessFrame skips ReceiveStriper.Enqueue and
+    // writes directly into _inboundFrames from the reader thread. Saves
+    // one ThreadPool wake-hop per frame (~10-17 us x64, ~25-45 us ARM64)
+    // for the single-stream Unary hot path while preserving per-stream
+    // FIFO (the decision never changes mid-stream, so every frame for
+    // this stream follows the same route).
+    //
+    // Inline continuations stay enabled in default (non-Fair) mode
+    // even when bypassing \u2014 the reader thread runs the consumer's
+    // awaiter continuation directly, saving an additional ThreadPool
+    // hop. The existing FairMaxFramePayload == int.MaxValue guard on
+    // inlineContinuations is sufficient to prevent the LazyChainRos
+    // sync-pull self-deadlock (multi-frame messages only occur under
+    // Fair caps, and only then can a sync-pull stall the reader
+    // waiting on a chunk only the reader can deliver).
+    internal readonly bool _bypassStriper;
     private readonly CancellationTokenSource _disposeCts;
     // Round-9 PR-I: lazy-allocate the call-cancellation CTS. The CLIENT-
     // side stream never reads CancellationToken (only the server-side
@@ -357,6 +374,26 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         StreamId = streamId;
         _connection = connection;
         IsServerStream = isServerStream;
+        // Round-14 N1: decide ONCE here whether this stream will bypass
+        // the ReceiveStriper. We bypass only when (a) the striper is
+        // enabled at all (otherwise the question is moot — DATA already
+        // goes direct), and (b) at the moment THIS stream was created
+        // there were no other active streams on the connection. The
+        // snapshot is intentionally taken before this stream is
+        // _streams.TryAdd'd (server) or before the increment is
+        // observable (client side is increment-then-construct, so
+        // ActiveStreamCount already includes this stream — hence the
+        // \u201c<= 1\u201d check, not \u201c== 0\u201d).
+        //
+        // The decision is locked in for the lifetime of the stream so
+        // every frame of this stream takes the same route, preserving
+        // per-stream FIFO. A second stream starting after us will get
+        // its own independent _bypassStriper decision (likely false at
+        // ActiveStreamCount=2) and route through the striper — that's
+        // fine, the two streams don't interfere because each has its
+        // own _inboundFrames Channel<T>.
+        _bypassStriper = connection.UseReceiveStriper
+            && connection.ActiveStreamCount <= 1;
         // Inline continuations: enabled when ANY of:
         //   (a) The connection has the receive striper enabled (default).
         //       Each stream's inbound frames are dispatched from
@@ -375,6 +412,21 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         // which would self-deadlock if the same Thread is doing both
         // chunk delivery and chunk consumption. Disable inline
         // continuations in that case regardless of opt-in.
+        //
+        // Round-14 N1 note: this guard ALSO covers the new bypass-the-
+        // striper path. With FairMaxFramePayload == int.MaxValue (the
+        // default), each LPM arrives in a single H2 DATA frame, so
+        // LazyChainRos's pullNext is never called for additional
+        // chunks \u2014 the reader thread running a user awaiter
+        // continuation inline cannot self-deadlock waiting on a chunk
+        // that only it could deliver. When the Fair frame cap IS in
+        // effect, the guard zeros inlineContinuations and the bypass
+        // path falls back to ThreadPool dispatch via TryWrite, which
+        // is still cheaper than the stripe-Thread hop. Hence: no
+        // additional !_bypassStriper guard is needed here \u2014 doing
+        // so would falsely break the explicit InlineReceiveContinuations
+        // opt-in contract verified by
+        // EndToEndTests.InlineReceiveContinuations_OptIn_RunsConsumerOnReaderThread.
         //
         // Self-join correctness: when a user awaiter continuation
         // runs inline on the stripe Thread and that continuation
