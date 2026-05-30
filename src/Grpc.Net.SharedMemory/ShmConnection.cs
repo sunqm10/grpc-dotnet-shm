@@ -34,6 +34,11 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     private readonly ConcurrentDictionary<uint, ShmGrpcStream> _streams;
     private readonly CancellationTokenSource _disposeCts;
     private readonly Task _frameReaderTask;
+    // Round-14 N1: see FrameReaderLoopAsync. Used by Dispose /
+    // DisposeAsync to detect self-join (reader inline-ran a user
+    // continuation that called Dispose) and skip the Wait that would
+    // otherwise deadlock against this same Thread.
+    private Thread? _frameReaderThread;
     private readonly Channel<ShmGrpcStream> _incomingStreamsChannel;
     private uint _nextStreamId;
     private int _disposed;
@@ -683,6 +688,17 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             IsBackground = true,
             Name = $"ShmFrameReader-{Name}"
         };
+        // Round-14 N1: capture the reader Thread so Dispose / DisposeAsync
+        // can self-join-guard. With the per-stream bypass-the-striper
+        // path active, ProcessFrame may run user awaiter continuations
+        // inline on this Thread (via Channel<T> AllowSynchronousContinuations),
+        // and those continuations can legitimately call connection.Dispose
+        // (e.g. EndToEndTests.H2_PayloadAtFrameBoundary_RoundTrip's
+        // `using var conn = ...` going out of scope inside the receive
+        // loop). Dispose's _frameReaderTask.Wait would then self-deadlock
+        // \u2014 mirror the existing ReceiveStriper.Stripe.Dispose
+        // self-join-guard pattern instead.
+        _frameReaderThread = thread;
         thread.Start();
         return tcs.Task;
     }
@@ -709,15 +725,38 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 // SetResult + ThreadPool.UnsafeQueueUserWorkItem tax for
                 // every frame. The legacy direct path remains as the
                 // fallback when SHM_RECEIVE_STRIPER=0.
-                if (_receiveStriper != null)
+                //
+                // Round-14 N1: per-stream bypass. A stream that was
+                // created when ActiveStreamCount <= 1 (snapshot at
+                // ctor — see ShmGrpcStream._bypassStriper) skips the
+                // stripe-Thread hop and writes directly into its
+                // _inboundFrames Channel<T>. Saves one ThreadPool wake
+                // per frame on the single-stream Unary hot path.
+                // The bypass decision is fixed for the stream's
+                // lifetime, so per-stream FIFO is preserved (every
+                // frame of stream N follows the same route, regardless
+                // of how ActiveStreamCount fluctuates afterwards).
+                if (_streams.TryGetValue(header.StreamId, out var stream))
                 {
+                    var frame = new InboundFrame(header.Type, payload, header.Flags);
+                    if (stream._bypassStriper || _receiveStriper == null)
+                    {
+                        stream.OnFrameReceived(frame);
+                    }
+                    else
+                    {
+                        _receiveStriper.Enqueue(header.StreamId, frame);
+                    }
+                }
+                else if (_receiveStriper != null)
+                {
+                    // Stream not yet visible to this reader (e.g. a
+                    // late HEADERS racing with us via the striper's
+                    // own queue). Hand the frame to the striper so it
+                    // can deliver in arrival order once the stream is
+                    // installed.
                     var frame = new InboundFrame(header.Type, payload, header.Flags);
                     _receiveStriper.Enqueue(header.StreamId, frame);
-                }
-                else if (_streams.TryGetValue(header.StreamId, out var stream))
-                {
-                    var frame = new InboundFrame(header.Type, payload, header.Flags);
-                    stream.OnFrameReceived(frame);
                 }
                 else
                 {
@@ -800,19 +839,21 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             // StreamId hash \u2014 HEADERS, DATA, Trailers for stream N
             // all land on stripe StripeIndex(N).
             //
-            // Keep direct path at ActiveStreamCount <= 1 to avoid
-            // adding a stripe-queue hop on the unary-microbench hot
-            // path. A false-negative (N grew between check and write)
-            // is just one frame taking the slower path: not a
-            // correctness issue.
+            // Round-14 N1: use the stream's locked-in _bypassStriper
+            // decision instead of a fresh ActiveStreamCount probe so
+            // HEADERS, DATA, and Trailers for stream N follow the
+            // SAME route for the stream's lifetime. Without this, a
+            // late HEADERS could take the direct path while earlier
+            // DATA frames were still pending on the stripe queue,
+            // breaking per-stream FIFO.
             var frame = new InboundFrame(header.Type, payload, header.Flags);
-            if (_receiveStriper != null && ActiveStreamCount > 1)
+            if (existingStream._bypassStriper || _receiveStriper == null)
             {
-                _receiveStriper.Enqueue(streamId, frame);
+                existingStream.OnFrameReceived(frame);
             }
             else
             {
-                existingStream.OnFrameReceived(frame);
+                _receiveStriper.Enqueue(streamId, frame);
             }
             return;
         }
@@ -1581,17 +1622,39 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         // The Linux FUTEX_WAIT path now wires the CT to FUTEX_WAKE so the
         // reader unparks within microseconds; 5 s is a generous safety
         // budget that mostly covers extremely slow CI scheduling.
-        try { _frameReaderTask.Wait(TimeSpan.FromSeconds(5)); }
-        catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.Dispose: frame reader: {ex.Message}"); }
-        if (!_frameReaderTask.IsCompleted)
+        //
+        // Round-14 N1 self-join guard: with the per-stream bypass-the-
+        // striper path, ProcessFrame may run user awaiter continuations
+        // inline on the reader Thread (via Channel<T> AllowSync).  Those
+        // continuations can legitimately call connection.Dispose (e.g.
+        // a `using var conn = …` going out of scope inside the receive
+        // loop). Waiting on _frameReaderTask in that case would deadlock
+        // against ourselves — the reader Thread IS the one calling
+        // Wait. Detect the self-join, skip the wait, and leak the
+        // Segment exactly as the 5-s-timeout path does. The reader
+        // Thread will observe _disposeCts.IsCancellationRequested on
+        // its next loop iteration (after this Dispose call unwinds and
+        // ProcessFrame returns) and exit naturally. Mirrors the same
+        // self-join skip in ReceiveStriper.Stripe.Dispose.
+        var readerSelfJoin = _frameReaderThread != null
+            && Thread.CurrentThread == _frameReaderThread;
+        if (!readerSelfJoin)
         {
-            // The reader did not honour cancellation in time. Skip the
+            try { _frameReaderTask.Wait(TimeSpan.FromSeconds(5)); }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.Dispose: frame reader: {ex.Message}"); }
+        }
+        if (readerSelfJoin || !_frameReaderTask.IsCompleted)
+        {
+            // Either the reader did not honour cancellation in time
+            // OR we are the reader Thread ourselves. Skip the
             // Segment.Dispose (it would munmap memory the reader is
-            // about to touch). This leaks the segment file/handles but
-            // keeps the process alive. Log so operators notice.
+            // about to touch / is currently using). This leaks the
+            // segment file/handles but keeps the process alive. Log
+            // so operators notice.
             System.Diagnostics.Debug.WriteLine(
-                "ShmConnection.Dispose: frame reader did not exit in 5 s; " +
-                "leaking Segment to avoid use-after-free.");
+                readerSelfJoin
+                    ? "ShmConnection.Dispose: called from reader Thread (inline continuation); leaking Segment to avoid use-after-free."
+                    : "ShmConnection.Dispose: frame reader did not exit in 5 s; leaking Segment to avoid use-after-free.");
         }
 
         // Stop the receive-side fan-out AFTER the reader Thread has
@@ -1625,8 +1688,12 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         Interlocked.Exchange(ref _serverStreamCount, 0);
 
         // Only dispose the Segment if the reader has confirmed it is
-        // outside any header.WriteIdx read.
-        if (_frameReaderTask.IsCompleted)
+        // outside any header.WriteIdx read. The readerSelfJoin path
+        // (Dispose called from the reader Thread itself via an inline
+        // user continuation) ALSO skips segment dispose because the
+        // reader is mid-ProcessFrame and will touch ring memory after
+        // this Dispose call unwinds.
+        if (!readerSelfJoin && _frameReaderTask.IsCompleted)
         {
             _segment.Dispose();
         }
@@ -1676,15 +1743,21 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
         }
 
         // See sync Dispose for rationale on the 5 s timeout + leak-on-
-        // timeout policy.
-        try { await _frameReaderTask.WaitAsync(TimeSpan.FromSeconds(5)); }
-        catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.DisposeAsync: frame reader: {ex.Message}"); }
-        var readerExited = _frameReaderTask.IsCompleted;
+        // timeout policy AND the self-join guard.
+        var readerSelfJoinAsync = _frameReaderThread != null
+            && Thread.CurrentThread == _frameReaderThread;
+        if (!readerSelfJoinAsync)
+        {
+            try { await _frameReaderTask.WaitAsync(TimeSpan.FromSeconds(5)); }
+            catch (Exception ex) { System.Diagnostics.Debug.WriteLine($"ShmConnection.DisposeAsync: frame reader: {ex.Message}"); }
+        }
+        var readerExited = !readerSelfJoinAsync && _frameReaderTask.IsCompleted;
         if (!readerExited)
         {
             System.Diagnostics.Debug.WriteLine(
-                "ShmConnection.DisposeAsync: frame reader did not exit in 5 s; " +
-                "leaking Segment to avoid use-after-free.");
+                readerSelfJoinAsync
+                    ? "ShmConnection.DisposeAsync: called from reader Thread (inline continuation); leaking Segment to avoid use-after-free."
+                    : "ShmConnection.DisposeAsync: frame reader did not exit in 5 s; leaking Segment to avoid use-after-free.");
         }
 
         // See sync Dispose for rationale on striper-after-reader ordering.
