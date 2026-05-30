@@ -279,6 +279,70 @@ internal sealed class ShmFrameWriter : IDisposable
         return lpmPayloadBytes <= ComputeCoalesceSafeThreshold((int)_ring.Capacity);
     }
 
+    /// <summary>
+    /// Per-call latency cap (in bytes) for any
+    /// <see cref="BeginInlineBatch"/> session — bounds how long the
+    /// WriterLoop is paused and how long control frames (Ping/Pong)
+    /// can be deferred. Round-11: bumped from 64 KiB to 128 KiB so
+    /// mid-payload sizes (32 KiB-128 KiB body) can coalesce in non-
+    /// Fair (Jumbo32 / unconstrained) windows; Fair mode is still
+    /// gated by <c>SendQuota &gt;= lpm</c> which caps eligible
+    /// payload at ~65530 bytes regardless of this constant.
+    /// </summary>
+    internal const int CoalesceLatencyCapBytes = 128 * 1024;
+
+    /// <summary>
+    /// Threshold for the multi-frame wake-coalesce predicate
+    /// (<see cref="CanCoalesceMultiFrameMessage"/>). Drops the
+    /// <see cref="ShmConstants.FairMaxFramePayload"/> clamp because
+    /// that constant controls on-wire H2 frame *chunking* (a fairness
+    /// knob), not ring *space* (the deadlock-safety bound). Cumulative
+    /// bytes in a suppressed-signal batch are still bounded by
+    /// <c>cap/8</c> so the ring cannot fill while wakes are deferred
+    /// (the F1 invariant from PR #21); the writer simply emits N
+    /// FairMax-sized H2 DATA frames under one suppressed wake instead
+    /// of N wakes.
+    /// </summary>
+    private static int ComputeMultiFrameCoalesceThreshold(int ringCapacity)
+    {
+        var t = Math.Max(1, ringCapacity / 8);
+        if (t > Wire.Http2FrameHeader.MaxAllowedPayloadLength)
+            t = Wire.Http2FrameHeader.MaxAllowedPayloadLength;
+        return t;
+    }
+
+    /// <summary>
+    /// Returns true iff a MESSAGE whose LPM payload (5-byte gRPC
+    /// header + protobuf body) is <paramref name="lpmPayloadBytes"/>
+    /// is safe to wrap in a <see cref="BeginInlineBatch"/> /
+    /// <see cref="EndInlineBatch"/> pair, EVEN WHEN the writer chunks
+    /// it into multiple H2 DATA frames at <see cref="ShmConstants.FairMaxFramePayload"/>
+    /// boundaries. Looser than <see cref="CanCoalesceInlineMessage"/>:
+    /// admits messages above the FairMax frame cap as long as
+    /// cumulative bytes ≤ <c>cap/8</c> ring space.
+    /// </summary>
+    /// <remarks>
+    /// Callers MUST additionally gate on:
+    /// <list type="bullet">
+    /// <item><c>lpm &lt;= <see cref="CoalesceLatencyCapBytes"/></c>
+    /// — bounds blast radius for concurrent control traffic.</item>
+    /// <item><c>stream.SendQuota &gt;= lpm AND
+    /// stream.Connection.ConnSendQuota &gt;= lpm</c> — prevents the
+    /// F2 deadlock where suppressed HEADERS hides our DATA from peer
+    /// while the inner per-chunk <c>ReserveSendQuotaOrBlock</c>
+    /// blocks waiting for a WINDOW_UPDATE that never arrives.</item>
+    /// <item><c>ActiveStreamCount &lt;= 1</c> via the outer
+    /// SingleStreamMode gate.</item>
+    /// </list>
+    /// The combination of these gates is the v1.1 multi-frame
+    /// coalesce contract (see PR description for the safety invariant
+    /// statement).
+    /// </remarks>
+    internal bool CanCoalesceMultiFrameMessage(int lpmPayloadBytes)
+    {
+        return lpmPayloadBytes <= ComputeMultiFrameCoalesceThreshold((int)_ring.Capacity);
+    }
+
 
     public ShmFrameWriter(ShmRing ring, CancellationTokenSource cts,
         System.Collections.Concurrent.ConcurrentDictionary<uint, ShmGrpcStream>? streamMap = null)

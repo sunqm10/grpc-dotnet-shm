@@ -1092,49 +1092,51 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
             {
                 var size = protoMsg.CalculateSize();
 
-                // Client-coalesce path (next-PR optimisation):
+                // Client-coalesce path (PR #21 + round-11 multi-frame
+                // expansion):
                 //
                 // When ShmControlHandler.SendOnStreamAsync detected a
                 // Unary-shaped request (PushUnaryContent / UnaryContent /
                 // WinHttpUnaryContent) it called StageRequestHeaders
                 // instead of SendRequestHeadersAsync, deferring the
                 // Headers wire write to right here. If the protobuf
-                // body fits in ONE wrap-safe H2 DATA frame AND the
-                // size is below the per-call latency cap, we open one
-                // inline batch and write HEADERS + DATA(END_STREAM)
+                // body fits within the multi-frame coalesce gate (lpm
+                // <= cap/8, no FairMaxFramePayload clamp), the size is
+                // below the per-call latency cap, and both stream + conn
+                // flow-control windows can absorb the full lpm, we open
+                // one inline batch and write HEADERS + DATA(END_STREAM)
                 // back-to-back -> 1 SignalData wake for the entire
-                // request (vs 3 wakes today: Headers + Data + HalfClose).
+                // request (vs 3 wakes today: Headers + Data + HalfClose;
+                // round-9 unary saved this for <= FairMax; round-11
+                // multi-frame extends to ~64 KiB Fair / 128 KiB Jumbo32).
                 //
-                // Two thresholds:
-                //   - writer.CanCoalesceInlineMessage(5 + size) is the
-                //     correctness gate (wrap-safe cap/8 from PR #21).
-                //   - CoalesceLatencyCapBytes is a per-call blast-radius
-                //     cap: even if cap/8 = 8 MiB allows a 1 MiB Unary
-                //     to "coalesce", holding the pause for that long
-                //     would starve other concurrent streams' wakes.
-                //     ~64 KiB matches the bench's small-Unary cell
-                //     range where the wake savings (10-15 us) dominate
-                //     over the marginal pause cost.
-                const int CoalesceLatencyCapBytes = 64 * 1024;
+                // Three thresholds:
+                //   - writer.CanCoalesceMultiFrameMessage(5 + size) is
+                //     the F1 correctness gate (cumulative bytes fit
+                //     cap/8 ring space — the writer may still emit N
+                //     FairMax-sized H2 DATA frames under the suppressed
+                //     wake without filling the ring).
+                //   - ShmFrameWriter.CoalesceLatencyCapBytes (128 KiB)
+                //     is a per-call blast-radius cap on how long the
+                //     paused WriterLoop / suppressed control frames
+                //     can be held — bounds tail latency for concurrent
+                //     control traffic.
+                //   - _shmStream.SendQuota >= lpm AND
+                //     _shmStream.Connection.ConnSendQuota >= lpm are
+                //     the F2 deadlock guard: suppressed HEADERS hides
+                //     our DATA from peer, so if inner per-chunk
+                //     ReserveSendQuotaOrBlock blocks waiting for WU
+                //     the peer would never know to send one. Pre-check
+                //     covers BOTH resources the reserve will debit
+                //     (stream + conn). Snapshot is sound because this
+                //     stream is single-producer for sends and WU only
+                //     INCREASES quota.
                 var lpmFramedSize = 5 + size;
-                // HTTP/2 send-quota gate: the coalesce branch opens
-                // BeginInlineBatch which SUPPRESSES the HEADERS wake until
-                // EndInlineBatch fires. WriteInlineDirectMultiFrame then
-                // calls ReserveSendQuotaOrBlock(lpmFramedSize) on the
-                // stream — if that blocks (quota < lpmFramedSize), the
-                // peer never sees the suppressed HEADERS, so no
-                // WINDOW_UPDATE can flow, deadlocking the stream
-                // (same F1/F2 shape as PR #21, just via FC quota).
-                // Pre-check the snapshot — this stream is single-producer
-                // for sends so the quota only grows from here until we
-                // call ReserveSendQuotaOrBlock. If insufficient, fall
-                // through to the safe non-batched fall-back path which
-                // commits HEADERS first (firing its own wake), letting
-                // the peer drain DATA and send WINDOW_UPDATE.
                 if (_shmStream.HasStagedHeaders
-                    && size <= CoalesceLatencyCapBytes
-                    && writer.CanCoalesceInlineMessage(lpmFramedSize)
+                    && lpmFramedSize <= ShmFrameWriter.CoalesceLatencyCapBytes
+                    && writer.CanCoalesceMultiFrameMessage(lpmFramedSize)
                     && _shmStream.SendQuota >= lpmFramedSize
+                    && _shmStream.Connection.ConnSendQuota >= lpmFramedSize
                     && writer.TryPauseWriterLoop())
                 {
                     try
@@ -1171,6 +1173,29 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
 
                 if (writer.TryPauseWriterLoop())
                 {
+                    // Round-11 multi-frame streaming coalesce: when the
+                    // protobuf body exceeds the FairMaxFramePayload H2
+                    // frame cap (e.g., 16 KiB Fair = 16389 lpm spilling
+                    // into 2 chunks), WriteInlineDirectMultiFrame today
+                    // emits per-chunk SignalData wakes. Wrap the whole
+                    // call in BeginInlineBatch so N chunks collapse to
+                    // 1 wake at EndInlineBatch.
+                    //
+                    // Gates mirror Site 1 (unary) minus HasStagedHeaders:
+                    //   - lpm <= 128 KiB latency cap
+                    //   - CanCoalesceMultiFrameMessage (cap/8 ring space,
+                    //     no FairMax clamp)
+                    //   - stream + conn SendQuota >= lpm (F2 deadlock guard)
+                    // size==0 path is a single WriteInline commit with
+                    // no multi-frame to coalesce — skip the batch (no
+                    // gain, ~10ns saved).
+                    // (lpmFramedSize already computed for Site 1 gate above.)
+                    bool coalesce = size > 0
+                        && lpmFramedSize <= ShmFrameWriter.CoalesceLatencyCapBytes
+                        && writer.CanCoalesceMultiFrameMessage(lpmFramedSize)
+                        && _shmStream.SendQuota >= lpmFramedSize
+                        && _shmStream.Connection.ConnSendQuota >= lpmFramedSize;
+                    if (coalesce) writer.BeginInlineBatch();
                     try
                     {
                         writer.WriteInlineDirectMultiFrame(_shmStream.StreamId, size, protoMsg, 0, default, _shmStream);
@@ -1178,6 +1203,7 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
                     }
                     finally
                     {
+                        if (coalesce) writer.EndInlineBatch();
                         writer.ResumeWriterLoop();
                     }
                 }

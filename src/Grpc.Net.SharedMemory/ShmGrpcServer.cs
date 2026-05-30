@@ -542,14 +542,26 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                     // signals the peer reader and prevents the deadlock.
                     //
                     // Coalesce HEADERS+MESSAGE+TRAILERS into a single
-                    // SignalData wake when safe. Safe iff the message
-                    // body fits in ONE H2 DATA frame (no chunking); the
-                    // canonical predicate is ShmFrameWriter.CanCoalesceInlineMessage
-                    // which mirrors WriteInlineDirectMultiFrame's actual
-                    // chunking decision. A gate looser than that lets a
-                    // multi-chunk write into the suppressed-signal batch
-                    // and deadlocks the ring.
-                    bool coalesce = writer.CanCoalesceInlineMessage(5 + size);
+                    // SignalData wake when safe. Round-11 multi-frame
+                    // expansion: relaxed from single-frame-only
+                    // (CanCoalesceInlineMessage) to multi-frame
+                    // (CanCoalesceMultiFrameMessage, cap/8 ring space
+                    // bound). The writer may emit N H2 DATA frames
+                    // chunked at FairMaxFramePayload, all under one
+                    // suppressed wake at EndInlineBatch.
+                    //
+                    // Safety invariant (F1 + F2):
+                    //   F1 = cumulative bytes <= cap/8 (cannot fill ring
+                    //        with wakes suppressed; CanCoalesceMultiFrame).
+                    //   F2 = SendQuota >= lpm on BOTH stream and conn
+                    //        (cannot block inner ReserveSendQuotaOrBlock
+                    //        on suppressed-HEADERS-waiting WU).
+                    // Plus a 128 KiB latency cap for blast-radius.
+                    var lpmFramedSize = 5 + size;
+                    bool coalesce = lpmFramedSize <= ShmFrameWriter.CoalesceLatencyCapBytes
+                        && writer.CanCoalesceMultiFrameMessage(lpmFramedSize)
+                        && stream.SendQuota >= lpmFramedSize
+                        && stream.Connection.ConnSendQuota >= lpmFramedSize;
                     if (coalesce) writer.BeginInlineBatch();
                     try
                     {
@@ -586,11 +598,15 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 writer.ExecuteInline(() =>
                 {
                     // Same coalescing as TryPause path \u2014 single wake for
-                    // HEADERS+MESSAGE+TRAILERS instead of three. Safe
-                    // iff the message body fits in ONE H2 DATA frame
-                    // (see TryPause path / CanCoalesceInlineMessage
-                    // for the chunking/deadlock rationale).
-                    bool coalesce = writer.CanCoalesceInlineMessage(5 + size);
+                    // HEADERS+MESSAGE+TRAILERS instead of three.
+                    // Round-11 multi-frame: see TryPause path above for
+                    // safety invariant (F1 cap/8 ring space + F2 stream
+                    // & conn SendQuota >= lpm + 128 KiB latency cap).
+                    var lpmFramedSize = 5 + size;
+                    bool coalesce = lpmFramedSize <= ShmFrameWriter.CoalesceLatencyCapBytes
+                        && writer.CanCoalesceMultiFrameMessage(lpmFramedSize)
+                        && stream.SendQuota >= lpmFramedSize
+                        && stream.Connection.ConnSendQuota >= lpmFramedSize;
                     if (coalesce) writer.BeginInlineBatch();
                     try
                     {
@@ -710,9 +726,14 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 if (writer.TryPauseWriterLoop())
                 {
                     // Size-gated wake coalescing (see UnaryHandler above
-                    // for full rationale). Safe iff the message fits in
-                    // ONE H2 DATA frame per ShmFrameWriter.CanCoalesceInlineMessage.
-                    bool coalesce = writer.CanCoalesceInlineMessage(5 + size);
+                    // for full rationale). Round-11 multi-frame expansion:
+                    // F1 cap/8 ring space + F2 stream & conn SendQuota >= lpm
+                    // + 128 KiB latency cap.
+                    var lpmFramedSize = 5 + size;
+                    bool coalesce = lpmFramedSize <= ShmFrameWriter.CoalesceLatencyCapBytes
+                        && writer.CanCoalesceMultiFrameMessage(lpmFramedSize)
+                        && stream.SendQuota >= lpmFramedSize
+                        && stream.Connection.ConnSendQuota >= lpmFramedSize;
                     if (coalesce) writer.BeginInlineBatch();
                     try
                     {
@@ -1729,6 +1750,28 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 // directly into ring, handling single-frame and multi-frame.
                 if (writer.TryPauseWriterLoop())
                 {
+                    // Round-11 multi-frame streaming coalesce: when the
+                    // protobuf body exceeds FairMaxFramePayload (16 KiB
+                    // Fair = 16389 lpm spilling to 2 chunks, 32 KiB = 3
+                    // chunks etc), WriteInlineDirectMultiFrame today
+                    // emits per-chunk SignalData wakes. Wrap the whole
+                    // call in BeginInlineBatch so N chunks collapse to
+                    // 1 wake at EndInlineBatch. Also covers HEADERS
+                    // (when !HeadersSent) inside the same batch for
+                    // 1 wake first-WriteAsync.
+                    //
+                    // Safety invariant (same as Sites 3-5):
+                    //   F1 = lpm <= cap/8 (CanCoalesceMultiFrame)
+                    //   F2 = stream & conn SendQuota >= lpm
+                    //   Plus 128 KiB latency cap.
+                    // size==0 skips batch (no DATA to coalesce).
+                    var lpmFramedSize = 5 + size;
+                    bool coalesce = size > 0
+                        && lpmFramedSize <= ShmFrameWriter.CoalesceLatencyCapBytes
+                        && writer.CanCoalesceMultiFrameMessage(lpmFramedSize)
+                        && _stream.SendQuota >= lpmFramedSize
+                        && _stream.Connection.ConnSendQuota >= lpmFramedSize;
+                    if (coalesce) writer.BeginInlineBatch();
                     try
                     {
                         if (!_context.HeadersSent)
@@ -1743,6 +1786,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                     }
                     finally
                     {
+                        if (coalesce) writer.EndInlineBatch();
                         writer.ResumeWriterLoop();
                     }
                     return Task.CompletedTask;
