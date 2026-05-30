@@ -311,4 +311,143 @@ public class WakeCountProbeTests
 
         Assert.Pass("Streaming probe complete; see test output for wakes/msg table.");
     }
+
+    /// <summary>
+    /// Profiling target: a tight 16 KiB Fair Unary loop with a single
+    /// SHM client+server pair in-process. Designed to be the only
+    /// non-trivial workload running while dotnet-trace samples — so
+    /// the resulting flamegraph reflects per-RPC hot paths cleanly.
+    /// Run via:
+    /// <code>
+    ///   $env:SHM_FAIR_MAX_FRAME='16384'; $env:SHM_INITIAL_WINDOW='65535'
+    ///   dotnet-trace collect --providers Microsoft-DotNETCore-SampleProfiler `
+    ///     -o trace_16k.nettrace -- `
+    ///     dotnet test --no-build -c Release `
+    ///       test/Grpc.Net.SharedMemory.Tests/Grpc.Net.SharedMemory.Tests.csproj `
+    ///       --filter "ProfileTarget_Fair16KUnary"
+    /// </code>
+    /// Then convert to Speedscope and inspect with the web viewer:
+    /// <code>
+    ///   dotnet-trace convert --format Speedscope trace_16k.nettrace
+    /// </code>
+    /// </summary>
+    [Test]
+    [Explicit("Profiling target; run only when collecting a trace.")]
+    [CancelAfter(180000)]
+    public async Task ProfileTarget_Fair16KUnary()
+    {
+        // Multi-size profiling: subtract size-invariant costs (frame overhead,
+        // wake count, channel hop, marshaller dispatch) by comparing across
+        // sizes. Per-size cost = (latency[N] - latency[0]) / N which gives
+        // bytes/RPC throughput-equivalent overhead.
+        int[] sizes = { 1, 1024, 4096, 16384, 32768, 65536 };
+        const int iterations = 30000;  // ~6s at ~200us/RPC
+
+        var segmentName = $"prof16k_{Guid.NewGuid():N}";
+
+        await using var server = new ShmGrpcServer(segmentName, singleStreamMode: true);
+        server.MapUnary<BytesValue, BytesValue>(
+            "/test.Echo/Unary",
+            (req, _) => Task.FromResult(new BytesValue { Value = req.Value }));
+
+        using var serverCts = new CancellationTokenSource();
+        var serverTask = Task.Run(() => server.RunAsync(serverCts.Token));
+        await WaitForServerAsync(segmentName);
+
+        try
+        {
+            using var handler = new ShmControlHandler(segmentName, new ShmClientTransportOptions
+            {
+                EnableMultipleConnections = false,
+                SingleStreamMode = true,
+                ConnectTimeout = TimeSpan.FromSeconds(5),
+            });
+            using var channel = GrpcChannel.ForAddress("http://localhost", new GrpcChannelOptions
+            {
+                HttpHandler = handler,
+                DisposeHttpClient = false,
+            });
+            var marshaller = Marshallers.Create<BytesValue>(
+                req => req.ToByteArray(),
+                bytes => BytesValue.Parser.ParseFrom(bytes));
+            var method = new Method<BytesValue, BytesValue>(
+                MethodType.Unary, "test.Echo", "Unary", marshaller, marshaller);
+            var invoker = channel.CreateCallInvoker();
+
+            // Warm-up at largest size to amortize JIT.
+            var warmupBody = new byte[sizes[^1]];
+            var warmupReq = new BytesValue { Value = ByteString.CopyFrom(warmupBody) };
+            for (var i = 0; i < 500; i++)
+            {
+                _ = await invoker.AsyncUnaryCall(method, host: null, new CallOptions(), warmupReq);
+            }
+
+            TestContext.Out.WriteLine($"=== ProfileTarget_Fair Unary Multi-Size ===");
+            TestContext.Out.WriteLine($"{"size",6} {"mean_us",10} {"sigs/RPC",10} {"hops/RPC",10} {"hop_us",10}");
+
+            foreach (var size in sizes)
+            {
+                var body = new byte[size];
+                if (size > 0) new Random(size).NextBytes(body);
+                var req = new BytesValue { Value = ByteString.CopyFrom(body) };
+
+                // Reset counters via burning a small batch + capture baseline.
+                _ = await invoker.AsyncUnaryCall(method, host: null, new CallOptions(), req);
+                var sigBefore = GetSignalDataCount();
+                long hopTicksBefore = 0, hopCountBefore = 0;
+                try
+                {
+                    var asm = typeof(Segment).Assembly;
+                    var streamType = asm.GetType("Grpc.Net.SharedMemory.ShmGrpcStream");
+                    var hopMethod = streamType?.GetMethod("GetHopDiag",
+                        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+                    if (hopMethod != null)
+                    {
+                        var hop = hopMethod.Invoke(null, null);
+                        var t = hop!.GetType();
+                        hopTicksBefore = (long)t.GetField("Item1")!.GetValue(hop)!;
+                        hopCountBefore = (long)t.GetField("Item2")!.GetValue(hop)!;
+                    }
+                } catch { }
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                for (var i = 0; i < iterations; i++)
+                {
+                    var resp = await invoker.AsyncUnaryCall(method, host: null, new CallOptions(), req);
+                    if (resp.Value.Length != size) Assert.Fail($"size {size}: mismatch {resp.Value.Length}");
+                }
+                sw.Stop();
+                var perRpc = sw.Elapsed.TotalMicroseconds / iterations;
+                var sigAfter = GetSignalDataCount();
+                var sigsPerRpc = (sigAfter - sigBefore) / (double)iterations;
+
+                double hopsPerRpc = 0, hopUs = 0;
+                try
+                {
+                    var asm = typeof(Segment).Assembly;
+                    var streamType = asm.GetType("Grpc.Net.SharedMemory.ShmGrpcStream");
+                    var hopMethod = streamType?.GetMethod("GetHopDiag",
+                        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+                    if (hopMethod != null)
+                    {
+                        var hop = hopMethod.Invoke(null, null);
+                        var t = hop!.GetType();
+                        var ticks = (long)t.GetField("Item1")!.GetValue(hop)! - hopTicksBefore;
+                        var count = (long)t.GetField("Item2")!.GetValue(hop)! - hopCountBefore;
+                        hopsPerRpc = count / (double)iterations;
+                        if (count > 0)
+                            hopUs = ticks / (double)System.Diagnostics.Stopwatch.Frequency * 1e6 / count;
+                    }
+                } catch { }
+
+                TestContext.Out.WriteLine($"{size,6} {perRpc,10:F2} {sigsPerRpc,10:F2} {hopsPerRpc,10:F2} {hopUs,10:F2}");
+            }
+        }
+        finally
+        {
+            serverCts.Cancel();
+            try { await serverTask; } catch { /* ignore */ }
+        }
+        Assert.Pass();
+    }
 }
