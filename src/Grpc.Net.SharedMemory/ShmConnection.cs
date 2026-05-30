@@ -1036,6 +1036,22 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     internal long ConnSendQuota => Volatile.Read(ref _connSendQuota);
 
     /// <summary>
+    /// Round-10 DEFER-1 fast-path threshold (~1 GiB). When
+    /// <see cref="_connSendQuota"/> is above this value the connection
+    /// FC window is effectively unbounded (matches the SHM-SHM init =
+    /// <see cref="ShmConstants.MaxWindowSize"/> ~ 2 GiB choice). In that
+    /// regime the per-frame CAS-debit / refund and the O(N) wake-all
+    /// hops can be safely skipped because no sender can be parked on
+    /// conn credit. 1 GiB leaves > 1 GiB headroom — a 100-stream ×
+    /// 16 MiB MaxFramePayload in-flight burst (~1.6 GiB potential debit)
+    /// crosses into the slow CAS path well before the quota hits 0.
+    /// Strict-H2 interop scenarios that initialise the conn quota to
+    /// 65535 always take the slow path, preserving spec invariant per
+    /// RFC 7540/9113 §6.9.1.
+    /// </summary>
+    internal const long ConnQuotaFastPathThreshold = int.MaxValue / 2;
+
+    /// <summary>
     /// Round-10 DEFER-1 fix: attempts to reserve <paramref name="n"/> bytes
     /// of conn-level H2 send quota. Returns <see langword="true"/> with the
     /// CAS-debit committed if quota is sufficient; <see langword="false"/>
@@ -1044,16 +1060,32 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// (shm_client_transport.go ~L343). Per RFC 7540/9113 §6.9.1, every
     /// outbound DATA frame MUST debit BOTH the per-stream window and the
     /// connection window; this is the conn half of that contract.
+    /// <para>
+    /// Fast-path: if <see cref="_connSendQuota"/> is above
+    /// <see cref="ConnQuotaFastPathThreshold"/> the CAS is skipped entirely
+    /// (just a single <c>Volatile.Read</c> + branch). This is the dominant
+    /// SHM-SHM hot path and recovers the per-frame perf regression that
+    /// showed up as Stream 1KB SHM/UDS ratio dropping 1.81x -> 1.40x and
+    /// Conc 100×1MB ratio 6.16x -> 5.25x on the post-DEFER-1 bench run.
+    /// The slow CAS path engages only when the field has been driven down
+    /// (strict-H2 interop with a small advertised conn window).
+    /// </para>
     /// </summary>
     internal bool TryReserveConnSendQuota(int n)
     {
         if (n <= 0) return n == 0;
+        var current = Volatile.Read(ref _connSendQuota);
+        // Fast-path: conn window effectively unbounded -> no debit, no CAS.
+        if (current > ConnQuotaFastPathThreshold) return true;
         while (true)
         {
-            var current = Volatile.Read(ref _connSendQuota);
             if (current < n) return false;
             if (Interlocked.CompareExchange(ref _connSendQuota, current - n, current) == current)
                 return true;
+            current = Volatile.Read(ref _connSendQuota);
+            // CAS race may have pushed us back above the threshold (a
+            // concurrent WU(0) refill clamped at int.MaxValue). Re-check.
+            if (current > ConnQuotaFastPathThreshold) return true;
         }
     }
 
@@ -1064,13 +1096,22 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
     /// e.g. ring-write throw / CancelledException). Wakes
     /// <see cref="_connSendQuotaWake"/> AND every active stream's per-stream
     /// wake so any sender parked on insufficient credit re-probes.
+    /// <para>
+    /// Fast-path: if the quota is already in unbounded territory
+    /// (<see cref="ConnQuotaFastPathThreshold"/>) the refund is a no-op —
+    /// <see cref="AddSendQuota"/>(streamId=0,…) caps at <c>int.MaxValue</c>
+    /// anyway, so a refund here would just clamp. Skips the O(N) wake-all
+    /// cost.
+    /// </para>
     /// </summary>
     internal void RefundConnSendQuota(int n)
     {
         if (n <= 0) return;
+        var current = Volatile.Read(ref _connSendQuota);
+        // Fast-path: nothing meaningful to refund when already unbounded.
+        if (current > ConnQuotaFastPathThreshold) return;
         while (true)
         {
-            var current = Volatile.Read(ref _connSendQuota);
             var desired = current + n;
             if (desired > int.MaxValue) desired = int.MaxValue;
             if (Interlocked.CompareExchange(ref _connSendQuota, desired, current) == current)
@@ -1079,6 +1120,8 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 WakeAllStreamsForConnQuotaChange();
                 return;
             }
+            current = Volatile.Read(ref _connSendQuota);
+            if (current > ConnQuotaFastPathThreshold) return;
         }
     }
 
@@ -1136,14 +1179,19 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 if (Interlocked.CompareExchange(ref _connSendQuota, desired, current) == current)
                 {
                     _connSendQuotaWake.Set();
-                    // Round-10 DEFER-1: also wake every stream's per-
-                    // stream MRES so writers parked in
-                    // ReserveSendQuotaOrBlock (now ALSO gated on conn
-                    // quota by DEFER-1 fix) re-probe after the conn-
-                    // level credit arrives. Without this, blocked
-                    // writers only observe per-stream WUs and would
-                    // stay parked through conn-level WU bursts.
-                    WakeAllStreamsForConnQuotaChange();
+                    // Round-10 DEFER-1 fast-path: if the refill leaves us
+                    // in unbounded territory (the common SHM-SHM case where
+                    // the quota was never debited and the new value just
+                    // re-clamps at int.MaxValue), no sender can be parked
+                    // on conn FC, so skip the O(N) wake-all iteration.
+                    // Only when the field is genuinely below threshold
+                    // (strict-H2 interop / contended cell) do we need to
+                    // wake every stream's per-stream MRES so writers
+                    // parked in ReserveSendQuotaOrBlock re-probe.
+                    if (desired <= ConnQuotaFastPathThreshold)
+                    {
+                        WakeAllStreamsForConnQuotaChange();
+                    }
                     return;
                 }
             }

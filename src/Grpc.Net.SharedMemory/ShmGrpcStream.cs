@@ -544,12 +544,16 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     internal bool TryReserveSendQuotaWithConn(int n)
     {
         if (n <= 0) return n == 0;
-        // Probe both first to fail fast without inducing CAS churn.
+        // Probe stream first (fail-fast without CAS) — conn quota check
+        // moved inside TryReserveConnSendQuota where the fast-path skip
+        // lives, so a redundant probe here would just add a wasted
+        // Volatile.Read in the dominant SHM-SHM hot path.
         if (Volatile.Read(ref _sendQuota) < n) return false;
-        if (_connection.ConnSendQuota < n) return false;
         // Reserve stream first.
         if (!TryReserveSendQuota(n)) return false;
-        // Reserve conn; roll back stream on race loss.
+        // Reserve conn (fast-path skip when conn quota effectively
+        // unbounded; see ShmConnection.TryReserveConnSendQuota for the
+        // threshold rationale). Rolls back the stream debit on conn race.
         if (!_connection.TryReserveConnSendQuota(n))
         {
             RefundSendQuota(n);
