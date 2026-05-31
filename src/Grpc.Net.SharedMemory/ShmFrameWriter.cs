@@ -153,11 +153,22 @@ internal sealed class ShmFrameWriter : IDisposable
     private volatile Action? _inlineAction;
     private readonly ManualResetEventSlim _inlineSignal = new(false);
 
-    // Cooperative pause fields for TryPauseWriterLoop / ResumeWriterLoop.
-    // Used by singleStreamMode handlers to get exclusive ring access.
-    private volatile bool _paused;
+    // Round-15 ARM64 ring-corruption fix: serializes concurrent slow-path
+    // ExecuteInline callers so they don't overwrite each other's
+    // _inlineAction slot (and confuse the single _inlineSignal MRES).
+    private readonly object _inlineActionLock = new();
+
+    // Round-15 ARM64 ring-corruption fix: writer lease. Acquired by both
+    // WriterLoop (CAS at top of every iteration before any ring write)
+    // and inline writers (via TryPauseWriterLoop CAS). Whoever holds it
+    // has exclusive ring-write access. Released via ResumeWriterLoop
+    // (inline) or before Phase 3 wait (WriterLoop).
+    //
+    // The legacy _paused / _idleInWait fields are removed: they had a
+    // StoreLoad race on ARM64 where WriterLoop and inline writer both
+    // missed each other's stores and concurrently called ReserveWrite,
+    // producing the "Unknown H2 frame type 0x20" demo hang.
     private int _inlineWriterActive;
-    private volatile bool _idleInWait;
     private volatile bool _singleStreamMode;
 
     // Diagnostic counters (env-gated SHM_DIAG_WRITERLOOP=1) for assessing
@@ -634,242 +645,212 @@ internal sealed class ShmFrameWriter : IDisposable
         {
             while (!_ct.IsCancellationRequested && !_completed)
             {
-                // Inline write request: handler submitted a callback to execute
-                // on this thread. Execute it immediately (with ring exclusivity)
-                // and signal completion. This is the primary singleStreamMode
-                // optimization path — no pause/resume needed.
-                var inlineAction = _inlineAction;
-                if (inlineAction != null)
+                // ===== Round-15 ARM64 ring-corruption fix =====================
+                // Single-writer lease: WriterLoop and inline writers ALL CAS
+                // _inlineWriterActive 0->1 before touching the ring. The old
+                // _paused/_idleInWait handshake had a StoreLoad race on ARM64
+                // (inline writer observed stale _idleInWait, WriterLoop missed
+                // _paused store on its top-of-loop reload). The lease is the
+                // sole serialization point now; failure to acquire means an
+                // inline writer is mid-write -> wait on _readySignal which
+                // they will Set() on release via ResumeWriterLoop.
+                if (Interlocked.CompareExchange(ref _inlineWriterActive, 1, 0) != 0)
                 {
-                    _inlineAction = null;
-                    // Drain any pending control frames before the inline write
-                    // (e.g., WindowUpdate that arrived during handler setup).
-                    if (!_controlQueue.IsEmpty)
-                        DrainControlFrames();
-                    try
-                    {
-                        inlineAction();
-                    }
-                    catch (Exception ex)
-                    {
-                        System.Diagnostics.Debug.WriteLine(
-                            $"WriterLoop inline action failed: {ex.Message}");
-                    }
-                    _inlineSignal.Set();
-                    continue;
-                }
-
-                // Cooperative pause: skip to Phase 3 when TryPauseWriterLoop
-                // needs exclusive ring access for inline writes.
-                if (_paused)
-                    goto phase3;
-
-                // Phase 1: immediate dequeue
-                if (!_controlQueue.IsEmpty)
-                    DrainControlFrames();
-
-                if (_queue.TryDequeue(out batch[0]))
-                {
-                    // Drain control frames within FlushBatch (before large
-                    // messages) rather than here — saves ~15ns per iteration.
-                    var count = 1;
-                    while (count < maxBatch && _queue.TryDequeue(out batch[count]))
-                        count++;
-                    FlushBatch(batch, count);
-                    continue;
-                }
-
-                // Phase 1.5: nothing in _queue, but Phase B might have
-                // deferred entries waiting on WU credit. Try to drain
-                // them — cheap when _deferredCount == 0, else wraps
-                // BeginBatch/EndBatch around a TryDrainDeferredLocked.
-                //
-                // Continue only when FlushDeferred returns true (made
-                // progress, i.e. at least one entry fully drained).
-                // Otherwise fall through to Phase 2/3 wait — spinning
-                // the FlushDeferred loop with no quota would burn CPU
-                // until the next WU arrives.
-                if (_deferredCount > 0)
-                {
-                    if (FlushDeferred())
-                        continue;
-                }
-
-                // Phase 2: spin-wait for data.
-                // Default is NO SPIN (matches grpc-go-shmem's
-                // shmSpinDefault = 0 policy — see Doug's "no
-                // lock-spinning" requirement for fair UDS/TCP
-                // comparison). Operators can opt in via env var
-                // SHM_WRITER_SPIN_ITERATIONS for sub-µs latency at
-                // the cost of idle CPU. See FrameTypes.cs.
-                var found = false;
-                var spinBudget = ShmConstants.WriterLoopSpinIterations;
-                for (int spin = 0; spin < spinBudget; spin++)
-                {
-                    // Check for inline write request (singleStreamMode).
-                    if (_inlineAction != null || _paused)
-                    {
-                        found = false;
-                        // Loop back to top where _inlineAction/_paused is handled.
-                        break;
-                    }
-
-                    Thread.SpinWait(1);
-                    if (_queue.TryDequeue(out batch[0]))
-                    {
-                        var count = 1;
-                        while (count < maxBatch && _queue.TryDequeue(out batch[count]))
-                            count++;
-                        FlushBatch(batch, count);
-                        found = true;
-                        break;
-                    }
-                }
-
-                if (found) continue;
-                // If broke due to _inlineAction/_paused, loop back to top.
-                if (_inlineAction != null || _paused) continue;
-
-                // Phase 2.5: yield before blocking (singleStreamMode only).
-                // Thread.Yield() is much cheaper than a kernel wait (~1us
-                // vs ~80us). In ping-pong the response often arrives during
-                // this window. Skip in multi-stream mode where the queue
-                // refills quickly and Yield wastes a scheduler quantum.
-                if (_singleStreamMode)
-                {
-                    Thread.Yield();
-                    if (_inlineAction != null || _paused) continue;
-                    if (_queue.TryDequeue(out batch[0]))
-                    {
-                        var count = 1;
-                        while (count < maxBatch && _queue.TryDequeue(out batch[count]))
-                            count++;
-                        FlushBatch(batch, count);
-                        continue;
-                    }
-                }
-
-                // Phase 3: blocking wait (lost-wake-safe pattern)
-                // Set _waiting BEFORE Reset to ensure writers see it and call Set().
-                phase3:
-                Volatile.Write(ref _waiting, 1);
-                _readySignal.Reset();
-
-                // SAW-WriterLoop safety: if we have a pending deferred
-                // signal and we're about to enter a path that does NOT
-                // go through the SAW combine point (inline action / pause
-                // branches), fire the signal eagerly so peer waiters
-                // aren't stranded waiting on our suppressed signal.
-                if (s_sawWriterLoop && _pendingDeferredSignal
-                    && (_inlineAction != null || _paused))
-                {
-                    _pendingDeferredSignal = false;
-                    _ring.FireDeferredSignalIfWaiters();
-                }
-
-                // Re-check inline action: handler may have set _inlineAction
-                // between Phase 2 exit and here. If so, execute it now.
-                if (_inlineAction != null)
-                {
-                    Volatile.Write(ref _waiting, 0);
-                    continue; // back to top → execute inline
-                }
-
-                // Re-check _paused: the direct writer may have set _paused
-                // between Phase 2 and here. If so, stay in _waiting state
-                // so TryPauseWriterLoop sees _idleInWait and succeeds.
-                if (_paused)
-                {
-                    _idleInWait = true;
-                    try { _readySignal.Wait(_ct); }
-                    finally { _idleInWait = false; Volatile.Write(ref _waiting, 0); }
-                    continue;
-                }
-
-                // Drain control frames before checking _queue — WindowUpdate
-                // frames in _controlQueue won't wake WriterLoop via Set()
-                // if they arrive during Phase 2 spin (_waiting=0).
-                DrainControlFrames();
-
-                if (_queue.TryDequeue(out batch[0]))
-                {
-                    // Data arrived between Phase 2 and Reset — no need to wait.
-                    Volatile.Write(ref _waiting, 0);
-                    var count2 = 1;
-                    while (count2 < maxBatch && _queue.TryDequeue(out batch[count2]))
-                        count2++;
-                    FlushBatch(batch, count2);
-                    continue;
-                }
-
-                // Lost-wake guard for the partial-write deferred path:
-                // a WU may have landed (via NotifyQuotaUpdated) between
-                // the previous FlushDeferred returning empty and Reset
-                // above. The sticky wake design lets _readySignal stay
-                // Set across our Reset only if NotifyQuotaUpdated fires
-                // AFTER the Reset; one that fired BEFORE Reset (in the
-                // narrow window between the Phase 1.5 FlushDeferred and
-                // Reset) leaves the wake lost. Drain deferred here so
-                // such a stale WU has a chance to advance an entry
-                // before we commit to the kernel wait. Keep _waiting=1
-                // during the drain so any concurrent
-                // NotifyQuotaUpdated re-fires the sticky Set — racy
-                // but harmless (one extra wake cycle at worst).
-                if (_deferredCount > 0)
-                {
-                    if (FlushDeferred())
+                    // Inline writer holds the lease. Park until it Sets the
+                    // ready signal (which Resume always does). Lost-wake-safe
+                    // double-check pattern: set _waiting before Reset, re-check
+                    // lease after Reset (inline writer may have released
+                    // between our CAS-fail and our Reset).
+                    Volatile.Write(ref _waiting, 1);
+                    _readySignal.Reset();
+                    if (Volatile.Read(ref _inlineWriterActive) == 0)
                     {
                         Volatile.Write(ref _waiting, 0);
-                        continue;
+                        continue; // race: retake the lease
                     }
-                    // No progress drained; fall through to wait. The
-                    // sticky NotifyQuotaUpdated Set is guaranteed to
-                    // fire on the next WU (its early-return is gated
-                    // only on _deferredCount==0 which is non-zero
-                    // here), so Wait will return promptly.
+                    try { _readySignal.Wait(_ct); }
+                    finally { Volatile.Write(ref _waiting, 0); }
+                    continue;
                 }
 
-                _idleInWait = true;
+                // ===== Lease HELD: safe to touch the ring =====================
+                var leaseHeld = true;
                 try
                 {
-                    if (s_diagWriterLoop) Interlocked.Increment(ref s_phase3Waits);
-
-                    // SAW-WriterLoop path: if we have a deferred SignalData,
-                    // combine it with the wait via SignalObjectAndWait — 1
-                    // kernel transition instead of 2 (saves ~5-10 µs per RT
-                    // on Windows no-spin server side). The kernel-handle
-                    // event was Set() by every Enqueue path that touched
-                    // _readySignal, so it's race-safe with respect to wakes
-                    // arriving between Reset() above and the wait here.
-                    if (s_sawWriterLoop && _pendingDeferredSignal)
+                    // Inline action handoff: an inline writer that failed
+                    // TryPauseWriterLoop's CAS will have routed its work
+                    // through ExecuteInline, which sets _inlineAction and
+                    // signals us. Execute it under our lease so all ring
+                    // writes are serialized.
+                    var inlineAction = _inlineAction;
+                    if (inlineAction != null)
                     {
-                        _pendingDeferredSignal = false;
-                        // _kernelReadySignal is AutoReset: if a producer
-                        // already Set() it (a wake between Phase 2 and here)
-                        // SAW returns immediately, we loop, see queue data,
-                        // and process — one harmless extra iteration. We do
-                        // NOT explicitly Reset here because Reset() is a
-                        // kernel call (~3-5 µs) that would offset most of
-                        // the SAW savings we're trying to gain.
-                        var saw = _ring.TryFireDeferredSignalAndWaitForLocal(
-                            _kernelReadyHandle, timeout: null, _ct);
-                        if (!saw)
+                        _inlineAction = null;
+                        if (!_controlQueue.IsEmpty)
+                            DrainControlFrames();
+                        try
                         {
-                            // SAW unsupported or no peer waiter: fire the
-                            // deferred signal manually (if waiters appeared),
-                            // then fall back to the legacy MRES wait.
-                            _ring.FireDeferredSignalIfWaiters();
-                            _readySignal.Wait(_ct);
+                            inlineAction();
+                        }
+                        catch (Exception ex)
+                        {
+                            System.Diagnostics.Debug.WriteLine(
+                                $"WriterLoop inline action failed: {ex.Message}");
+                        }
+                        _inlineSignal.Set();
+                        continue; // release lease in finally, then loop
+                    }
+
+                    // Phase 1: immediate dequeue
+                    if (!_controlQueue.IsEmpty)
+                        DrainControlFrames();
+
+                    if (_queue.TryDequeue(out batch[0]))
+                    {
+                        // Drain control frames within FlushBatch (before large
+                        // messages) rather than here — saves ~15ns per iteration.
+                        var count = 1;
+                        while (count < maxBatch && _queue.TryDequeue(out batch[count]))
+                            count++;
+                        FlushBatch(batch, count);
+                        continue;
+                    }
+
+                    // Phase 1.5: deferred-entry drain (FC quota became available).
+                    if (_deferredCount > 0)
+                    {
+                        if (FlushDeferred())
+                            continue;
+                    }
+
+                    // Phase 2: spin-wait for data.
+                    // Default is NO SPIN (matches grpc-go-shmem's
+                    // shmSpinDefault = 0 policy — Doug's "no
+                    // lock-spinning" requirement for fair UDS/TCP
+                    // comparison). Operators can opt in via env var
+                    // SHM_WRITER_SPIN_ITERATIONS for sub-µs latency at
+                    // the cost of idle CPU.
+                    var found = false;
+                    var spinBudget = ShmConstants.WriterLoopSpinIterations;
+                    for (int spin = 0; spin < spinBudget; spin++)
+                    {
+                        // Check for inline-action handoff during spin.
+                        if (_inlineAction != null)
+                        {
+                            found = false;
+                            break;
+                        }
+
+                        Thread.SpinWait(1);
+                        if (_queue.TryDequeue(out batch[0]))
+                        {
+                            var count = 1;
+                            while (count < maxBatch && _queue.TryDequeue(out batch[count]))
+                                count++;
+                            FlushBatch(batch, count);
+                            found = true;
+                            break;
                         }
                     }
-                    else
+                    if (found) continue;
+                    if (_inlineAction != null) continue;
+
+                    // Phase 2.5: yield before blocking (singleStreamMode only).
+                    // Thread.Yield() is cheaper than a kernel wait (~1µs vs ~80µs).
+                    // In ping-pong the response often arrives during this window.
+                    if (_singleStreamMode)
                     {
-                        _readySignal.Wait(_ct);
+                        Thread.Yield();
+                        if (_inlineAction != null) continue;
+                        if (_queue.TryDequeue(out batch[0]))
+                        {
+                            var count = 1;
+                            while (count < maxBatch && _queue.TryDequeue(out batch[count]))
+                                count++;
+                            FlushBatch(batch, count);
+                            continue;
+                        }
                     }
+
+                    // No work to do under our lease. Release it BEFORE entering
+                    // Phase 3 wait so inline writers can acquire it while we
+                    // park. This is the critical change vs the legacy
+                    // _paused/_idleInWait protocol.
+                    Volatile.Write(ref _inlineWriterActive, 0);
+                    leaseHeld = false;
                 }
                 finally
                 {
-                    _idleInWait = false;
+                    if (leaseHeld)
+                        Volatile.Write(ref _inlineWriterActive, 0);
+                }
+
+                // ===== Phase 3: blocking wait WITHOUT lease ===================
+                // No ring access possible until we reacquire the lease at the
+                // top of the next iteration. Inline writers are free to CAS
+                // the lease while we wait.
+                Volatile.Write(ref _waiting, 1);
+                _readySignal.Reset();
+
+                // Lost-wake guards: re-check ALL work sources after Reset.
+                if (_inlineAction != null
+                    || !_queue.IsEmpty
+                    || !_controlQueue.IsEmpty
+                    || (_deferredCount > 0))
+                {
+                    Volatile.Write(ref _waiting, 0);
+                    continue;
+                }
+
+                if (s_diagWriterLoop) Interlocked.Increment(ref s_phase3Waits);
+
+                try
+                {
+                    // SAW-WriterLoop path: if we have a deferred SignalData,
+                    // combine it with the wait via SignalObjectAndWait — 1
+                    // kernel transition instead of 2 (saves ~5-10 µs per RT
+                    // on Windows no-spin server side).
+                    //
+                    // Note: SAW deferred-signal must fire from a lease-holder
+                    // because it touches the ring's signal infrastructure.
+                    // We released the lease above, so reacquire briefly to
+                    // fire the deferred signal under the lease, then release
+                    // and wait. If reacquire fails, an inline writer will
+                    // observe _waiting and Set _readySignal on release, so
+                    // the wait will return promptly without our help.
+                    if (s_sawWriterLoop && _pendingDeferredSignal)
+                    {
+                        if (Interlocked.CompareExchange(ref _inlineWriterActive, 1, 0) == 0)
+                        {
+                            try
+                            {
+                                _pendingDeferredSignal = false;
+                                var saw = _ring.TryFireDeferredSignalAndWaitForLocal(
+                                    _kernelReadyHandle, timeout: null, _ct);
+                                if (!saw)
+                                {
+                                    _ring.FireDeferredSignalIfWaiters();
+                                }
+                            }
+                            finally
+                            {
+                                Volatile.Write(ref _inlineWriterActive, 0);
+                            }
+                            if (!s_sawWriterLoop)
+                            {
+                                // unreachable, defensive
+                                _readySignal.Wait(_ct);
+                            }
+                            continue;
+                        }
+                        // Couldn't reacquire — fall through to plain wait;
+                        // the lease-holder will Set _readySignal on release.
+                    }
+
+                    _readySignal.Wait(_ct);
+                }
+                finally
+                {
                     Volatile.Write(ref _waiting, 0);
                 }
             }
@@ -1766,10 +1747,11 @@ internal sealed class ShmFrameWriter : IDisposable
     /// </summary>
     internal void ExecuteInline(Action action)
     {
-        // Fast path: if WriterLoop is idle in Phase 3, execute directly
-        // on the caller's thread. TryPause succeeds instantly when
-        // _idleInWait=true (no spin needed).
-        if (_idleInWait && TryPauseWriterLoop())
+        // Fast path: try to grab the writer lease directly. If WriterLoop
+        // currently holds it (mid-batch), CAS fails and we fall back to
+        // the slow path. No more _idleInWait pre-check (round-15: that
+        // flag participated in the ARM64 StoreLoad race we just fixed).
+        if (TryPauseWriterLoop())
         {
             try
             {
@@ -1782,83 +1764,89 @@ internal sealed class ShmFrameWriter : IDisposable
             return;
         }
 
-        // WriterLoop is active (Phase 2 spin) — standard inline execution.
-        // Phase 2 checks _inlineAction every iteration, so detection is
-        // near-instant.
-        _inlineSignal.Reset();
-        _inlineAction = action;
-
-        // Always signal _readySignal regardless of _waiting state.
-        // On Linux, checking _waiting before Set() creates a lost-wake window:
-        //   WriterLoop exits Phase 2 spin (_waiting=0) → context switch →
-        //   handler sets _inlineAction, sees _waiting==0, skips Set() →
-        //   WriterLoop enters Phase 3, _readySignal.Reset(), re-checks
-        //   _inlineAction (should see it), but on Linux/ARM64 the volatile
-        //   read may not yet observe the store due to cross-core propagation
-        //   delay → Wait() blocks indefinitely.
-        // Unconditional Set() adds a spurious wakeup (~50ns) but eliminates
-        // the lost-wake entirely. Phase 2 spin + FlushBatch ignore Set()
-        // (ManualResetEventSlim stays set until Reset in Phase 3, which
-        // re-checks _inlineAction before Wait).
-        if (_disposed == 0)
+        // Slow path: hand the action to WriterLoop via _inlineAction slot.
+        // Round-15 fix: this slot is single-writer and the legacy code
+        // allowed two concurrent slow-path callers to overwrite each
+        // other (silent action loss + completion-signal confusion).
+        // Serialize slow-path callers with _inlineActionLock; only one
+        // can be parked on _inlineAction at a time. Concurrent callers
+        // wait their turn — the lock is held only across the handoff,
+        // not across WriterLoop's execution.
+        lock (_inlineActionLock)
         {
-            try { _readySignal.Set(); _kernelReadySignal.Set(); } catch (ObjectDisposedException) { }
-        }
+            _inlineSignal.Reset();
+            _inlineAction = action;
 
-        // Wait for WriterLoop to pick up and execute the action.
-        _inlineSignal.Wait(_ct);
+            // Always signal _readySignal regardless of _waiting state.
+            // On Linux, checking _waiting before Set() creates a lost-wake
+            // window: WriterLoop exits Phase 2 spin (_waiting=0), handler
+            // sets _inlineAction, sees _waiting==0, skips Set(), WriterLoop
+            // enters Phase 3 wait and never sees the action. Unconditional
+            // Set() adds a spurious wakeup (~50ns) but eliminates the
+            // lost-wake entirely.
+            if (_disposed == 0)
+            {
+                try { _readySignal.Set(); _kernelReadySignal.Set(); } catch (ObjectDisposedException) { }
+            }
+
+            // Wait for WriterLoop to pick up and execute the action.
+            // Hold the lock across the wait so the next slow-path caller
+            // doesn't overwrite _inlineAction (and our pending _inlineSignal)
+            // before WriterLoop processes ours.
+            _inlineSignal.Wait(_ct);
+        }
     }
 
     /// <summary>
     /// Tries to pause the WriterLoop within a bounded spin.
     /// Returns true if paused successfully (exclusive ring access).
-    /// Returns false if WriterLoop is busy — caller should use fallback.
+    /// Returns false if WriterLoop currently holds the lease — caller
+    /// should fall back to <see cref="ExecuteInline"/> or the queue.
     /// </summary>
+    /// <remarks>
+    /// Round-15 ARM64 ring-corruption fix (2026-05-31): this is now a
+    /// pure single-shot CAS on the <see cref="_inlineWriterActive"/>
+    /// writer lease. The legacy <c>_paused</c> / <c>_idleInWait</c>
+    /// handshake had a StoreLoad race on ARM64 weak memory model where
+    /// the inline writer would observe a stale <c>_idleInWait==true</c>
+    /// captured BEFORE WriterLoop's wake from Phase 3, set
+    /// <c>_paused=true</c>, then WriterLoop's top-of-loop
+    /// <c>if (_paused)</c> would observe <c>_paused==false</c> (reorder
+    /// window) and execute one more ring write concurrently with the
+    /// inline writer's reservation \u2014 producing the "Unknown H2
+    /// frame type 0x20" corruption (~5% on x64 / ~100% on ARM64).
+    ///
+    /// In the new design WriterLoop also takes this CAS (see
+    /// <see cref="WriterLoop"/>) before any TxRing write, so the lease
+    /// is the SOLE serialization point. The pause/idle dance is gone.
+    /// Inline writer failure means WriterLoop is mid-batch \u2014 caller
+    /// should fall back to <see cref="ExecuteInline"/>.
+    /// </remarks>
     internal bool TryPauseWriterLoop()
     {
-        // CAS guard: only one inline writer at a time.
-        if (Interlocked.CompareExchange(ref _inlineWriterActive, 1, 0) != 0)
-            return false;
-
-        // Fast path: WriterLoop is already idle in Phase 3 wait.
-        // In ping-pong benchmarks this is the common case — the queue
-        // is empty and WriterLoop is sleeping. Skip the 2000-spin.
-        if (_idleInWait)
-        {
-            _paused = true;
-            return true;
-        }
-
-        _paused = true;
-        // Spin until WriterLoop is truly idle (_idleInWait = true).
-        // Phase 2's _paused check (every iteration) ensures WriterLoop
-        // exits spin quickly and enters Phase 3 → _idleInWait = true.
-        for (int i = 0; i < 2000; i++)
-        {
-            if (_idleInWait)
-                return true;
-            Thread.SpinWait(1);
-        }
-        _paused = false;
-        Volatile.Write(ref _inlineWriterActive, 0);
-        return false;
+        // Single CAS. No spin, no fast/slow path. WriterLoop also
+        // takes this lease; whoever wins runs to completion before the
+        // other can proceed.
+        return Interlocked.CompareExchange(ref _inlineWriterActive, 1, 0) == 0;
     }
 
-    /// <summary>Resumes the WriterLoop after a pause.</summary>
+    /// <summary>Releases the writer lease and wakes WriterLoop.</summary>
+    /// <remarks>
+    /// Round-15: simplified after the lease overhaul. We always wake
+    /// WriterLoop on release because (a) WriterLoop may have parked
+    /// while we held the lease and have queued work to drain, and
+    /// (b) the previous singleStreamMode short-circuit relied on
+    /// <c>_queue.IsEmpty &amp;&amp; _controlQueue.IsEmpty</c> being a
+    /// reliable indicator that no work was pending \u2014 it isn't
+    /// once reader-thread <c>OnDataFrame</c> can enqueue WU while we
+    /// hold the lease (which can happen between our queue-check and
+    /// our release). The cost of an unnecessary <c>Set()</c> is one
+    /// uncontended MRES atomic; WriterLoop's next Phase 2 spin / Wait
+    /// re-arms cheaply if it had nothing to do.
+    /// </remarks>
     internal void ResumeWriterLoop()
     {
-        _paused = false;
         Volatile.Write(ref _inlineWriterActive, 0);
-
-        // In singleStreamMode with an empty queue, skip the wake —
-        // WriterLoop stays in Phase 3 idle for instant next TryPause.
-        // But if frames were enqueued while paused (other streams or
-        // control frames), we MUST wake WriterLoop to process them.
-        // Without this, s=16 concurrent streams regress 56% because
-        // queue consumers find WriterLoop asleep with no signal coming.
-        if (_singleStreamMode && _queue.IsEmpty && _controlQueue.IsEmpty)
-            return;
-
         try { _readySignal.Set(); _kernelReadySignal.Set(); } catch (ObjectDisposedException) { }
     }
 

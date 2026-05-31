@@ -1538,20 +1538,25 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             return;
         }
 
-        _frameWriter?.Dispose();
-
+        // Round-15: route GOAWAY through the writer BEFORE disposing it,
+        // so the writer lease serialises this frame with any in-flight
+        // inline writes. The legacy direct FrameProtocol.WriteFrame(TxRing,
+        // ...) call after _frameWriter.Dispose() bypassed the lease and
+        // could race a still-running ThreadPool handler's inline write
+        // during teardown — same SPSC-violation bug class as the
+        // demo's mid-stream 0x20 hang.
         if (Volatile.Read(ref _goAwaySent) == 0)
         {
             Interlocked.Exchange(ref _goAwaySent, 1);
             try
             {
-                using var goAwayCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
                 var payload = System.Text.Encoding.UTF8.GetBytes("Connection disposed");
-                var header = new FrameHeader(FrameType.GoAway, 0, (uint)payload.Length, GoAwayFlags.Draining);
-                FrameProtocol.WriteFrame(TxRing, header, payload, goAwayCts.Token);
+                _frameWriter?.Enqueue(FrameType.GoAway, 0, (byte)GoAwayFlags.Draining, payload);
             }
-            catch { /* best-effort */ }
+            catch { /* best-effort; writer may already be disposed */ }
         }
+
+        _frameWriter?.Dispose();
 
         _incomingStreamsChannel.Writer.TryComplete();
         _disposeCts.Cancel();
@@ -1649,20 +1654,21 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
             return;
         }
 
-        _frameWriter?.Dispose();
-
+        // Round-15: see sync Dispose. Route GOAWAY through the writer
+        // queue BEFORE disposing it so it serialises with in-flight
+        // inline writes via the writer lease (no SPSC violation on teardown).
         if (Volatile.Read(ref _goAwaySent) == 0)
         {
             Interlocked.Exchange(ref _goAwaySent, 1);
             try
             {
-                using var goAwayCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
                 var payload = System.Text.Encoding.UTF8.GetBytes("Connection disposed");
-                var header = new FrameHeader(FrameType.GoAway, 0, (uint)payload.Length, GoAwayFlags.Draining);
-                FrameProtocol.WriteFrame(TxRing, header, payload, goAwayCts.Token);
+                _frameWriter?.Enqueue(FrameType.GoAway, 0, (byte)GoAwayFlags.Draining, payload);
             }
-            catch { /* best-effort */ }
+            catch { /* best-effort; writer may already be disposed */ }
         }
+
+        _frameWriter?.Dispose();
 
         _incomingStreamsChannel.Writer.TryComplete();
         _disposeCts.Cancel();
