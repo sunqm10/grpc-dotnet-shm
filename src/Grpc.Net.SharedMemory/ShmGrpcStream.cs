@@ -394,48 +394,51 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         // own _inboundFrames Channel<T>.
         _bypassStriper = connection.UseReceiveStriper
             && connection.ActiveStreamCount <= 1;
-        // Inline continuations: enabled when ANY of:
-        //   (a) The connection has the receive striper enabled (default).
-        //       Each stream's inbound frames are dispatched from
-        //       exactly one stripe Thread, so the stripe Thread can
-        //       safely inline-run the user's awaiter continuation
-        //       \u2014 the per-frame ThreadPool dispatch this saves is
-        //       the main win path for the 1000\u00d764B Windows cell
-        //       (where each ThreadPool wake costs ~17 us).
-        //   (b) The explicit per-connection opt-in
-        //       ShmConnection.InlineReceiveContinuations is set
-        //       (the Stage 1A path, gated on caller-promised
-        //       single-active-stream semantics).
-        //   (c) The legacy process-wide env var SHM_CHANNEL_INLINE=1.
+        // Inline continuations: enables `AllowSynchronousContinuations=true`
+        // on the per-stream inbound channel. When enabled, the user's
+        // awaiter continuation runs synchronously on whatever Thread
+        // produced the frame, avoiding a ~17 us ThreadPool hop per
+        // received frame on Windows.
+        //
+        // HARD CORRECTNESS INVARIANT: an inline continuation MUST NOT
+        // run on the SHM frame-reader Thread. If it does, the user's
+        // awaiter can issue a follow-up flow-controlled blocking send
+        // (`ReserveSendQuotaOrBlock` parking on `_sendQuotaWake`) that
+        // parks the reader Thread itself — at which point no inbound
+        // WINDOW_UPDATE can be processed and the call deadlocks.
+        // Repro: max-profile 32+ MiB unary, where the LPM exceeds the
+        // 32 MiB initial window and the test loop's continuation
+        // issues the NEXT warmup inline from the previous Trailers'
+        // completion. Bug masked in earlier rounds because tiny diag
+        // perturbations rescheduled the continuation off the reader
+        // Thread.
+        //
+        // The reader Thread delivers frames inline iff there is NO
+        // stripe Thread between the reader and the inbound channel
+        // writer — i.e. `_bypassStriper == true` (the Round-14 N1
+        // single-stream Unary fast path) OR `!connection.UseReceiveStriper`.
+        // Only the *contrapositive* — `UseReceiveStriper && !_bypassStriper`
+        // — has a STRIPE Thread (not the reader Thread) as the channel
+        // writer, and only THAT configuration is safe for inline
+        // continuations.
+        //
+        // (a) Default striper path: safe iff `!_bypassStriper`. Saves
+        //     ~17 us/hop on the 1000×64B Windows cell.
+        // (b) Per-connection opt-in `ShmConnection.InlineReceiveContinuations`:
+        //     callers MAY force inline even on the unsafe reader-Thread
+        //     delivery path IF AND ONLY IF they guarantee their
+        //     awaiter continuations will NOT issue a large
+        //     flow-controlled send (else the deadlock above is
+        //     unavoidable). Treated as a caller-owned footgun.
+        // (c) Legacy env var `SHM_CHANNEL_INLINE=1`: same caller-owned
+        //     footgun semantics as (b), process-wide.
         // Safety guard: when the strict-fair frame cap is in effect,
         // multi-frame messages activate LazyChainRos's sync-pull path
         // which would self-deadlock if the same Thread is doing both
         // chunk delivery and chunk consumption. Disable inline
         // continuations in that case regardless of opt-in.
-        //
-        // Round-14 N1 note: this guard ALSO covers the new bypass-the-
-        // striper path. With FairMaxFramePayload == int.MaxValue (the
-        // default), each LPM arrives in a single H2 DATA frame, so
-        // LazyChainRos's pullNext is never called for additional
-        // chunks \u2014 the reader thread running a user awaiter
-        // continuation inline cannot self-deadlock waiting on a chunk
-        // that only it could deliver. When the Fair frame cap IS in
-        // effect, the guard zeros inlineContinuations and the bypass
-        // path falls back to ThreadPool dispatch via TryWrite, which
-        // is still cheaper than the stripe-Thread hop. Hence: no
-        // additional !_bypassStriper guard is needed here \u2014 doing
-        // so would falsely break the explicit InlineReceiveContinuations
-        // opt-in contract verified by
-        // EndToEndTests.InlineReceiveContinuations_OptIn_RunsConsumerOnReaderThread.
-        //
-        // Self-join correctness: when a user awaiter continuation
-        // runs inline on the stripe Thread and that continuation
-        // synchronously calls connection.Dispose, the resulting
-        // ReceiveStriper.Dispose \u2192 Stripe.Dispose path would
-        // self-Join the stripe Thread. ReceiveStriper.Stripe.Dispose
-        // detects this and skips the Join (the stripe Thread exits
-        // on its own once the queue is observed completed).
-        var inlineContinuations = (connection.UseReceiveStriper
+        var inlineContinuations = (
+                (connection.UseReceiveStriper && !_bypassStriper)
                 || s_channelInlineContinuations
                 || connection.InlineReceiveContinuations)
             && ShmConstants.FairMaxFramePayload == int.MaxValue;
