@@ -648,6 +648,12 @@ public sealed class ShmConnection : IDisposable, IAsyncDisposable
                 {
                     var (header, payload) = FrameProtocol.ReadFramePayload(
                         RxRing, _disposeCts.Token, zeroCopy: ZeroCopyRead);
+                    // Marker enables the safe-inline-receive deadlock guard
+                    // in ShmGrpcStream.SendMessageAsync: outbound writes that
+                    // detect IsOnReaderThread AND would block on flow-control
+                    // quota hop to the ThreadPool before the blocking wait.
+                    // See ShmReaderThreadContext for the full invariant.
+                    using var readerScope = ShmReaderThreadContext.Enter();
                     try
                     {
                         ProcessFrame(header, payload);

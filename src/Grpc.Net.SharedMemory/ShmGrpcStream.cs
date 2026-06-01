@@ -526,6 +526,32 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     internal long SendQuota => Volatile.Read(ref _sendQuota);
 
     /// <summary>
+    /// Cheap best-effort predicate: would a send of <paramref name="bytes"/>
+    /// be unable to reserve quota right now on either the per-stream or
+    /// per-connection window? Two <see cref="Volatile.Read"/> calls; no CAS.
+    /// </summary>
+    /// <remarks>
+    /// Used by <see cref="SendMessageAsync(System.ReadOnlyMemory{byte}, System.Threading.CancellationToken)"/>
+    /// together with <see cref="ShmReaderThreadContext.IsOnReaderThread"/>
+    /// to decide whether the outbound write must hop off the SHM frame-reader
+    /// thread BEFORE descending into <see cref="ReserveSendQuotaOrBlock"/> —
+    /// otherwise a flow-controlled send issued from an inline-receive
+    /// continuation deadlocks the connection. The check is intentionally
+    /// approximate: a stale "false" simply means we did NOT hop and the
+    /// blocking wait's <see cref="System.Diagnostics.Debug.Assert"/>
+    /// tripwire would catch the slip in DEBUG builds. A stale "true"
+    /// costs at most one <see cref="System.Threading.Tasks.Task.Yield"/>
+    /// hop for a write that turned out not to need it.
+    /// </remarks>
+    internal bool WouldBlockSendQuota(int bytes)
+    {
+        if (bytes <= 0) return false;
+        if (Volatile.Read(ref _sendQuota) < bytes) return true;
+        if (_connection.ConnSendQuota < bytes) return true;
+        return false;
+    }
+
+    /// <summary>
     /// Attempts to reserve <paramref name="n"/> bytes of send-window quota
     /// for an outbound DATA chunk. Returns <see langword="true"/> with the
     /// quota debited if the reservation succeeds; returns <see langword="false"/>
@@ -739,6 +765,19 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             // they are not stranded behind a blocked DATA write while
             // we wait for the peer to grant more quota.
             drainBeforeWait?.Invoke();
+            // TRIPWIRE: blocking on the SHM frame-reader thread parks the
+            // very thread that processes peer WINDOW_UPDATEs → guaranteed
+            // deadlock. Callers entering the slow path from an inline
+            // receive continuation MUST first hop off via the
+            // WouldBlockSendQuota pre-flight in SendMessageAsync (see
+            // ShmReaderThreadContext). DEBUG-only assert keeps the
+            // release-build cost zero while surfacing missed call sites
+            // during test runs.
+            System.Diagnostics.Debug.Assert(
+                !ShmReaderThreadContext.IsOnReaderThread,
+                "ReserveSendQuotaOrBlock would block on the SHM reader thread — " +
+                "an outbound send path is missing a WouldBlockSendQuota pre-flight hop. " +
+                "See ShmReaderThreadContext for the deadlock invariant.");
             _sendQuotaWake.Wait(cancellationToken);
         }
     }
@@ -1053,6 +1092,22 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         ThrowIfDisposed();
         ThrowIfCannotSendMessage();
 
+        // SAFE-INLINE-RECEIVE DEADLOCK GUARD: if a user inline-receive
+        // continuation is calling us on the SHM frame-reader thread AND
+        // the upcoming send would block on per-stream or connection
+        // send-quota, hop to the ThreadPool before descending — otherwise
+        // ReserveSendQuotaOrBlock parks the reader thread on
+        // _sendQuotaWake and the peer's WINDOW_UPDATE can never be
+        // processed (no thread left to read it).  See
+        // ShmReaderThreadContext for the full invariant. The hop is paid
+        // ONLY for inline-RX writes that would block — common-case fast
+        // path (quota available) stays sync.
+        if (ShmReaderThreadContext.IsOnReaderThread
+            && WouldBlockSendQuota(data.Length))
+        {
+            return SendMessageWithReaderThreadHopAsync(data, cancellationToken);
+        }
+
         // No per-stream flow control: the ring's WaitForSpace provides
         // back-pressure via the SPSC ring buffer.
         var ct = cancellationToken.CanBeCanceled ? cancellationToken : _disposeCts.Token;
@@ -1087,6 +1142,14 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     {
         ThrowIfDisposed();
         ThrowIfCannotSendMessage();
+
+        // SAFE-INLINE-RECEIVE DEADLOCK GUARD: same invariant as
+        // SendMessageAsync — see ShmReaderThreadContext for details.
+        if (ShmReaderThreadContext.IsOnReaderThread
+            && WouldBlockSendQuota(data.Length))
+        {
+            return SendMessageAndHalfCloseWithReaderThreadHopAsync(data, cancellationToken);
+        }
 
         var ct = cancellationToken.CanBeCanceled ? cancellationToken : _disposeCts.Token;
 
@@ -1127,6 +1190,32 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Slow-path helper for <see cref="SendMessageAsync(System.ReadOnlyMemory{byte}, System.Threading.CancellationToken)"/>:
+    /// hops off the SHM frame-reader thread via <see cref="Task.Yield"/>
+    /// before recursing into the normal send path. After the yield the
+    /// continuation runs on a ThreadPool worker, so
+    /// <see cref="ShmReaderThreadContext.IsOnReaderThread"/> is false and
+    /// the recursive call takes the fast sync path (or blocks safely on
+    /// the worker thread, never on the reader). See
+    /// <see cref="ShmReaderThreadContext"/> for the deadlock invariant.
+    /// </summary>
+    private async Task SendMessageWithReaderThreadHopAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
+    {
+        await Task.Yield();
+        await SendMessageAsync(data, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Slow-path helper for <see cref="SendMessageAndHalfCloseAsync"/> —
+    /// see <see cref="SendMessageWithReaderThreadHopAsync"/> for rationale.
+    /// </summary>
+    private async Task SendMessageAndHalfCloseWithReaderThreadHopAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken)
+    {
+        await Task.Yield();
+        await SendMessageAndHalfCloseAsync(data, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Sends a message payload using zero-copy. The <paramref name="pooledBuffer"/>
     /// is returned to <see cref="ArrayPool{T}"/> after the data has been written
     /// to the ring buffer, replacing the caller's <c>finally</c> block.
@@ -1144,9 +1233,29 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             throw;
         }
 
+        // SAFE-INLINE-RECEIVE DEADLOCK GUARD: same invariant as
+        // SendMessageAsync — hop off the SHM frame-reader thread if the
+        // upcoming write may block on per-stream / connection send-quota.
+        // See ShmReaderThreadContext for the full invariant.
+        if (ShmReaderThreadContext.IsOnReaderThread
+            && WouldBlockSendQuota(data.Length))
+        {
+            return SendMessageZeroCopyWithReaderThreadHopAsync(data, pooledBuffer, cancellationToken);
+        }
+
         // No per-stream flow control: ring WaitForSpace provides back-pressure.
         var ct = cancellationToken.CanBeCanceled ? cancellationToken : _disposeCts.Token;
         return SendFrameZeroCopyAsync(FrameType.Message, 0, data, pooledBuffer, ct);
+    }
+
+    /// <summary>
+    /// Slow-path helper for <see cref="SendMessageZeroCopyAsync"/> — see
+    /// <see cref="SendMessageWithReaderThreadHopAsync"/> for rationale.
+    /// </summary>
+    private async Task SendMessageZeroCopyWithReaderThreadHopAsync(ReadOnlyMemory<byte> data, byte[] pooledBuffer, CancellationToken cancellationToken)
+    {
+        await Task.Yield();
+        await SendMessageZeroCopyAsync(data, pooledBuffer, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
