@@ -522,6 +522,25 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 if (cfg.MaxSendMessageSize > 0 && cfg.MaxSendMessageSize < int.MaxValue && size > cfg.MaxSendMessageSize)
                     throw new RpcException(new Status(StatusCode.ResourceExhausted,
                         $"Sending message exceeds limit ({size} vs {cfg.MaxSendMessageSize})"));
+
+                // SAFE-INLINE-RECEIVE DEADLOCK GUARD (2026-06-01): the
+                // user's handler may resume inline on the SHM frame-reader
+                // Thread when AllowSynchronousContinuations=true and may
+                // produce a response too large for the current send window.
+                // The inline WriteInlineDirectMultiFrame path's internal
+                // ReserveSendQuotaOrBlock would then park the reader
+                // Thread on _sendQuotaWake, preventing the peer's
+                // WINDOW_UPDATE from ever being read — hard deadlock.
+                // Confirmed by dotnet-dump on the demo bench 64 MiB max
+                // ping-pong hang. Hop off via Task.Yield before
+                // descending; the resumed continuation will land on a
+                // ThreadPool worker where the blocking wait is safe.
+                if (ShmReaderThreadContext.IsOnReaderThread
+                    && stream.WouldBlockSendQuota(5 + size))
+                {
+                    await Task.Yield();
+                }
+
                 var writer = stream.Connection.FrameWriter!;
                 var msg = (IMessage)response;
 
@@ -981,8 +1000,8 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                                     $"({lpmBodyLen} vs {maxReceiveMessageSize})"));
                             }
 
-                            return ParseUncompressedMultiFrameLazy<TReq>(
-                                stream, f, lpmBodyLen, pooledDeserialization, parser, ct);
+                            return await ParseUncompressedMultiFrameSafeAsync<TReq>(
+                                stream, f, lpmBodyLen, pooledDeserialization, parser, ct).ConfigureAwait(false);
                         }
 
                         bool useChain;
@@ -1192,6 +1211,90 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     }
 
     /// <summary>
+    /// Multi-frame uncompressed LPM parse path for server unary
+    /// requests. Hybrid dispatch (see <see cref="InboundChainHelper"/>):
+    /// <list type="bullet">
+    ///   <item><description>≤ <see cref="ShmRing.ChainZcBudget"/>:
+    ///     eager async pre-fetch + non-lazy <c>MergeFrom</c>. Safe
+    ///     under inline-receive-continuations because the
+    ///     <c>await ReceiveFrameAsync</c> unwinds the producer
+    ///     Thread between chunks.</description></item>
+    ///   <item><description>&gt; <see cref="ShmRing.ChainZcBudget"/>:
+    ///     <see cref="Task.Yield"/> off the reader Thread, then
+    ///     reuse the existing <see cref="LazyChainRos"/> sync-pull
+    ///     path. Keeps pool footprint at the lazy ~2-frame minimum
+    ///     for huge messages while still avoiding the
+    ///     reader-Thread self-deadlock.</description></item>
+    /// </list>
+    /// </summary>
+    private static async Task<TReq> ParseUncompressedMultiFrameSafeAsync<TReq>(
+        ShmGrpcStream stream, InboundFrame firstFrame, int lpmBodyLen,
+        bool pooledDeserialization, MessageParser<TReq> parser,
+        CancellationToken ct)
+        where TReq : class, IMessage<TReq>, new()
+    {
+        _ = pooledDeserialization; // PooledProtoParser is span-only; multi-frame ROS path doesn't use it.
+
+        if (!InboundChainHelper.ShouldEagerPrefetch(stream, lpmBodyLen))
+        {
+            // Huge non-ZC fallback. The existing LazyChainRos path
+            // keeps the ~2-frame pool footprint, but its sync pull
+            // would deadlock on the reader Thread. Hop off via
+            // Task.Yield (no-op when already on a TP worker) so the
+            // sync pull blocks a TP thread, freeing the reader Thread
+            // to deliver subsequent chunks.
+            await InboundChainHelper.HopOffReaderThreadIfNeededAsync().ConfigureAwait(false);
+            return ParseUncompressedMultiFrameLazy<TReq>(
+                stream, firstFrame, lpmBodyLen, pooledDeserialization, parser, ct);
+        }
+
+        // Eager pre-fetch: holding all chunks costs zero extra ring
+        // memory for chain-ZC (ZC anchor already freezes header.ReadIdx
+        // for the LPM duration); for the non-ZC fallthrough that
+        // happens to fit ChainZcBudget we hold ≤ ChainZcBudget bytes
+        // of pool memory, which is the same ceiling chain-ZC itself
+        // enforces. No new memory regression vs the lazy path.
+        List<InboundFrame> chunks;
+        try
+        {
+            chunks = await InboundChainHelper.PrefetchAllChunksAsync(
+                stream, firstFrame, firstFrameBodyOffset: 5,
+                totalBodyLen: lpmBodyLen,
+                onEndStream: null,  // unary: caller drains Trailers separately
+                cancellationToken: ct).ConfigureAwait(false);
+        }
+        catch (IOException ioex)
+        {
+            throw new RpcException(new Status(StatusCode.Internal,
+                $"Truncated request message: {ioex.Message}"));
+        }
+
+        try
+        {
+            var ros = InboundChainHelper.BuildSequence(
+                chunks, firstFrameBodyOffset: 5, totalBodyLen: lpmBodyLen);
+            try
+            {
+                var msg = new TReq();
+                Google.Protobuf.MessageExtensions.MergeFrom(msg, ros);
+                return msg;
+            }
+            catch (Google.Protobuf.InvalidProtocolBufferException ipbex)
+            {
+                throw new RpcException(new Status(StatusCode.Internal,
+                    $"Failed to parse request message: {ipbex.Message}"));
+            }
+        }
+        finally
+        {
+            // Releasing the last chunk fires EndZcReservation (chain
+            // anchor close); see FramePayload.Release. Must run on
+            // both success and failure paths.
+            InboundChainHelper.ReleaseAll(chunks);
+        }
+    }
+
+    /// <summary>
     /// Lazy-streaming parse path for uncompressed multi-frame messages.
     /// Hands the protobuf parser a <see cref="LazyChainRos"/> that pulls
     /// each subsequent frame on demand and releases its predecessor as
@@ -1207,7 +1310,12 @@ public sealed class ShmGrpcServer : IAsyncDisposable
     /// <para>
     /// The synchronous <see cref="ShmGrpcStream.ReceiveFrameSync"/> pull
     /// is safe under SHM's threadpool-based handler dispatch (no
-    /// SyncCtx capture; producer runs on a different task).
+    /// SyncCtx capture; producer runs on a different task) AS LONG AS
+    /// this method is NOT invoked on the SHM frame-reader Thread.
+    /// Callers MUST hop off the reader Thread first (see
+    /// <see cref="InboundChainHelper.HopOffReaderThreadIfNeededAsync"/>);
+    /// the <c>ParseUncompressedMultiFrameSafeAsync</c> entry point
+    /// handles this.
     /// </para>
     /// </remarks>
     private static TReq ParseUncompressedMultiFrameLazy<TReq>(
@@ -1325,6 +1433,16 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             InboundFrame frame;
             while (_stream.TryReceiveFrame(out frame))
             {
+                // Multi-frame uncompressed first chunk: takes the
+                // safe async path (hybrid eager pre-fetch + lazy
+                // fallback; see InboundChainHelper). Must be detected
+                // BEFORE the sync ProcessFrame switch because the
+                // safe helper is async.
+                if (TryDetectMultiFrameUncompressedFirstChunk(frame, out int lpmBodyLen))
+                {
+                    return await ParseMultiFrameUncompressedAsync(frame, lpmBodyLen, cancellationToken)
+                        .ConfigureAwait(false);
+                }
                 if (ProcessFrame(frame))
                     return true;
                 // Break out only if no multi-frame is in flight (neither
@@ -1345,6 +1463,11 @@ public sealed class ShmGrpcServer : IAsyncDisposable
 
                     while (_stream.TryReceiveFrame(out frame))
                     {
+                        if (TryDetectMultiFrameUncompressedFirstChunk(frame, out int lpmBodyLen))
+                        {
+                            return await ParseMultiFrameUncompressedAsync(frame, lpmBodyLen, ct)
+                                .ConfigureAwait(false);
+                        }
                         if (ProcessFrame(frame))
                             return true;
                         if (_endOfStream || (_assembledPos == 0 && _chainHead == null))
@@ -1362,6 +1485,125 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             }
         }
 
+        /// <summary>
+        /// Returns <see langword="true"/> iff <paramref name="frame"/>
+        /// is the first chunk of a multi-frame UNCOMPRESSED LPM that
+        /// the streaming reader has not yet started accumulating
+        /// (so the safe async multi-frame parse path applies). Sets
+        /// <paramref name="lpmBodyLen"/> to the body length declared
+        /// in the LPM header. Frame is left in the caller's hands —
+        /// the caller passes it to
+        /// <see cref="ParseMultiFrameUncompressedAsync"/> on a true
+        /// return, or to <c>ProcessFrame</c> otherwise.
+        /// </summary>
+        private bool TryDetectMultiFrameUncompressedFirstChunk(
+            InboundFrame frame, out int lpmBodyLen)
+        {
+            lpmBodyLen = 0;
+            if (frame.Type != FrameType.Message) return false;
+            if ((frame.Flags & MessageFlags.More) == 0) return false;
+            // Must be the first chunk: no multi-frame already in flight.
+            if (_chainHead != null || _assembledPos != 0) return false;
+            // Header sanity + compFlag == 0 (uncompressed only — the
+            // compressed multi-frame branch needs the contiguous
+            // _assembled buffer because decompressors require single
+            // span input).
+            if (frame.Length < 5) return false;
+            if (frame.Memory.Span[0] != 0) return false;
+            lpmBodyLen = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(
+                frame.Memory.Span.Slice(1, 4));
+            return true;
+        }
+
+        /// <summary>
+        /// Async parse of a multi-frame uncompressed LPM via the
+        /// deadlock-safe <see cref="InboundChainHelper"/>. Sets
+        /// <see cref="_current"/>, returns <see langword="true"/> on
+        /// success (one message parsed; caller's MoveNext returns true).
+        /// Captures <see cref="MessageFlags.EndStream"/> from any
+        /// chunk and updates <see cref="_endOfStream"/> + the stream's
+        /// half-close flag.
+        /// </summary>
+        private async Task<bool> ParseMultiFrameUncompressedAsync(
+            InboundFrame firstFrame, int lpmBodyLen, CancellationToken cancellationToken)
+        {
+            // Mid-LPM size limit — same as the lazy path. Free the
+            // first chunk before throwing so its ZC anchor / pool
+            // buffer is not stranded.
+            if (_maxReceiveMessageSize > 0 && lpmBodyLen > _maxReceiveMessageSize)
+            {
+                firstFrame.ReturnToPool();
+                throw new RpcException(new Status(StatusCode.ResourceExhausted,
+                    $"Received message exceeds the maximum configured message size " +
+                    $"({lpmBodyLen} vs {_maxReceiveMessageSize})"));
+            }
+
+            var ct = cancellationToken.CanBeCanceled ? cancellationToken : _stream.DisposeCancellationToken;
+            bool sawEndStream = false;
+            Action onEndStream = () => sawEndStream = true;
+
+            if (!InboundChainHelper.ShouldEagerPrefetch(_stream, lpmBodyLen))
+            {
+                // Huge non-ZC fallback: hop off the reader Thread,
+                // then reuse the existing lazy path (sync pull blocks
+                // a TP worker, not the reader Thread).
+                await InboundChainHelper.HopOffReaderThreadIfNeededAsync().ConfigureAwait(false);
+                return ParseUncompressedMultiFrameLazy(firstFrame, lpmBodyLen);
+            }
+
+            // Eager pre-fetch: async-await every chunk. Each await
+            // unwinds the producer Thread between chunks, breaking
+            // the inline-cont self-deadlock.
+            List<InboundFrame> chunks;
+            try
+            {
+                chunks = await InboundChainHelper.PrefetchAllChunksAsync(
+                    _stream, firstFrame, firstFrameBodyOffset: 5,
+                    totalBodyLen: lpmBodyLen,
+                    onEndStream: onEndStream,
+                    cancellationToken: ct).ConfigureAwait(false);
+            }
+            catch (IOException ioex)
+            {
+                throw new RpcException(new Status(StatusCode.Internal,
+                    $"Truncated request message: {ioex.Message}"));
+            }
+
+            try
+            {
+                var ros = InboundChainHelper.BuildSequence(
+                    chunks, firstFrameBodyOffset: 5, totalBodyLen: lpmBodyLen);
+
+                T msg;
+                try
+                {
+                    msg = new T();
+                    Google.Protobuf.MessageExtensions.MergeFrom(msg, ros);
+                }
+                catch (Google.Protobuf.InvalidProtocolBufferException ipbex)
+                {
+                    throw new RpcException(new Status(StatusCode.Internal,
+                        $"Failed to parse request message: {ipbex.Message}"));
+                }
+
+                _current = msg;
+                _previousFrame = default;
+                if (sawEndStream)
+                {
+                    _stream.MarkHalfCloseReceived();
+                    _endOfStream = true;
+                }
+                return true;
+            }
+            finally
+            {
+                // Releasing the last chunk closes the chain-ZC anchor
+                // (see FramePayload.Release). Must run on both success
+                // and failure paths.
+                InboundChainHelper.ReleaseAll(chunks);
+            }
+        }
+
         private bool ProcessFrame(InboundFrame frame)
         {
             switch (frame.Type)
@@ -1374,26 +1616,15 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                         // gRPC LPM compression flag (byte 0).
                         bool firstChunk = _chainHead == null && _assembledPos == 0;
 
-                        // Lazy-streaming parse for uncompressed multi-frame:
-                        // synchronously pull subsequent frames as the
-                        // protobuf parser advances; pool-buffer footprint
-                        // stays at ~2 frames regardless of total message
-                        // size. Compressed multi-frame still falls through
-                        // to the contiguous _assembled buffer below.
-                        if (firstChunk && frame.Length >= 5 && frame.Memory.Span[0] == 0)
-                        {
-                            var lpmBodyLen = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(
-                                frame.Memory.Span.Slice(1, 4));
-                            if (_maxReceiveMessageSize > 0 && lpmBodyLen > _maxReceiveMessageSize)
-                            {
-                                frame.ReturnToPool();
-                                throw new RpcException(new Status(StatusCode.ResourceExhausted,
-                                    $"Received message exceeds the maximum configured message size " +
-                                    $"({lpmBodyLen} vs {_maxReceiveMessageSize})"));
-                            }
-
-                            return ParseUncompressedMultiFrameLazy(frame, lpmBodyLen);
-                        }
+                        // NOTE: the multi-frame UNCOMPRESSED first-chunk
+                        // case is intercepted earlier in MoveNext by
+                        // TryDetectMultiFrameUncompressedFirstChunk +
+                        // ParseMultiFrameUncompressedAsync (the safe
+                        // hybrid eager-pre-fetch / yield-then-lazy path).
+                        // ProcessFrame should never see that case as a
+                        // first chunk; only compressed multi-frame first
+                        // chunks and subsequent chunks of an already
+                        // accumulating chain reach here.
 
                         bool useChain;
                         if (firstChunk)
@@ -1743,6 +1974,19 @@ public sealed class ShmGrpcServer : IAsyncDisposable
                 if (_maxSendMessageSize > 0 && _maxSendMessageSize < int.MaxValue && size > _maxSendMessageSize)
                     throw new RpcException(new Status(StatusCode.ResourceExhausted,
                         $"Sending message exceeds limit ({size} vs {_maxSendMessageSize})"));
+
+                // SAFE-INLINE-RECEIVE DEADLOCK GUARD (2026-06-01): see
+                // UnaryHandler.HandleAsync comment for rationale. The
+                // WriteInlineDirectMultiFrame path's inner
+                // ReserveSendQuotaOrBlock would deadlock the reader
+                // Thread when inline-cont resumed it AND the response
+                // exceeds the current send window.
+                if (ShmReaderThreadContext.IsOnReaderThread
+                    && _stream.WouldBlockSendQuota(5 + size))
+                {
+                    return WriteAsyncWithReaderThreadHopAsync(message);
+                }
+
                 var writer = _stream.Connection.FrameWriter!;
                 IMessage msg = message;
 
@@ -1846,6 +2090,19 @@ public sealed class ShmGrpcServer : IAsyncDisposable
         {
             await headersTask.ConfigureAwait(false);
             await SendProtobufMessageAsync(_stream, message, _compression, _maxSendMessageSize, default).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Slow-path helper for <see cref="WriteAsync(T)"/>: hops off
+        /// the SHM frame-reader Thread via <see cref="Task.Yield"/>
+        /// before recursing into the inline write path. See
+        /// <see cref="ShmReaderThreadContext"/> for the deadlock
+        /// invariant.
+        /// </summary>
+        private async Task WriteAsyncWithReaderThreadHopAsync(T message)
+        {
+            await Task.Yield();
+            await WriteAsync(message).ConfigureAwait(false);
         }
     }
 

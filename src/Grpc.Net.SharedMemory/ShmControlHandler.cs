@@ -1071,6 +1071,28 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
         Action<TMessage, Grpc.Core.SerializationContext> serializer,
         CancellationToken cancellationToken)
     {
+        // SAFE-INLINE-RECEIVE DEADLOCK GUARD (2026-06-01): when the
+        // caller is running inline on the SHM frame-reader Thread (a
+        // direct consequence of AllowSynchronousContinuations=true
+        // on the inbound channel) AND the upcoming write would block
+        // on per-stream / connection send quota, hop off to a
+        // ThreadPool worker before descending into the inline-direct
+        // path — otherwise WriteInlineDirectMultiFrame's inner
+        // ReserveSendQuotaOrBlock parks the reader Thread on
+        // _sendQuotaWake and the peer's WINDOW_UPDATE can never be
+        // processed (no Thread left to read it). Confirmed by
+        // dotnet-dump on the demo bench 64 MiB max ping-pong hang.
+        // Mirrors the same guard already present on
+        // ShmGrpcStream.SendMessageAsync; required here because this
+        // path takes the WriteInlineDirectMultiFrame fast path that
+        // bypasses SendMessageAsync.
+        if (ShmReaderThreadContext.IsOnReaderThread
+            && message is Google.Protobuf.IMessage protoSizeProbe
+            && _shmStream.WouldBlockSendQuota(5 + protoSizeProbe.CalculateSize()))
+        {
+            return WriteSerializedMessageWithReaderThreadHopAsync(message, serializer, cancellationToken);
+        }
+
         // Fast path: for protobuf IMessage types in singleStreamMode,
         // serialize directly into the ring buffer via
         // WriteInlineDirectMultiFrame (zero intermediate buffer).
@@ -1219,6 +1241,21 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
         var ctx = new DirectWriteSerializationContext(_shmStream);
         serializer(message, ctx);
         return ctx.SendResult(cancellationToken);
+    }
+
+    /// <summary>
+    /// Slow-path helper for <see cref="WriteSerializedMessageAsync"/>:
+    /// hops off the SHM frame-reader Thread via <see cref="Task.Yield"/>
+    /// before recursing into the normal send path. See
+    /// <see cref="ShmReaderThreadContext"/> for the deadlock invariant.
+    /// </summary>
+    private async Task WriteSerializedMessageWithReaderThreadHopAsync<TMessage>(
+        TMessage message,
+        Action<TMessage, Grpc.Core.SerializationContext> serializer,
+        CancellationToken cancellationToken)
+    {
+        await Task.Yield();
+        await WriteSerializedMessageAsync(message, serializer, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task WriteFlushHeadersThenMessageAsync<TMessage>(
@@ -1523,6 +1560,19 @@ internal sealed class ShmControlResponseContent : HttpContent,
     private LazyChainRos? _lazyChain;
     private bool _lazyChainSawEndStream;
 
+    // Multi-frame eager-pre-fetch state (deadlock-safe replacement for
+    // <see cref="LazyChainRos"/> on chain-ZC-budget-fitting LPMs;
+    // see <see cref="InboundChainHelper"/>). When non-null, holds every
+    // chunk of the most-recently-returned multi-frame uncompressed
+    // message. Same ownership protocol as <see cref="_lazyChain"/>:
+    // released at the top of the next <c>ReadNextMessage*</c> call,
+    // and if any chunk carried <see cref="MessageFlags.EndStream"/>
+    // we surface <c>(Empty, true)</c> on that next call (preserving
+    // the existing caller contract that EndStream is observed AFTER
+    // the message ROS is fully consumed).
+    private List<InboundFrame>? _prefetchedChunks;
+    private bool _prefetchedSawEndStream;
+
     // Multi-frame accumulation (compressed path only). Allocated lazily
     // via ArrayPool when the compressed code path needs a contiguous
     // buffer; returned to ArrayPool on Dispose. ArrayPool's LOH bucket
@@ -1719,9 +1769,31 @@ internal sealed class ShmControlResponseContent : HttpContent,
             }
         }
 
+        // Same release/EOS pattern for the eager-pre-fetch path.
+        if (_prefetchedChunks != null)
+        {
+            InboundChainHelper.ReleaseAll(_prefetchedChunks);
+            _prefetchedChunks = null;
+            if (_prefetchedSawEndStream)
+            {
+                _prefetchedSawEndStream = false;
+                _stream.MarkHalfCloseReceived();
+                ApplyTrailers();
+                return new ValueTask<(ReadOnlySequence<byte>, bool)>((ReadOnlySequence<byte>.Empty, true));
+            }
+        }
+
         // Fast path: try sync read.
         while (_stream.TryReceiveFrame(out var frame))
         {
+            // Multi-frame uncompressed first-chunk: take the
+            // deadlock-safe async path (hybrid eager-pre-fetch or
+            // yield-then-lazy; see InboundChainHelper). Must be
+            // dispatched as ValueTask because the helper is async.
+            if (TryDetectMultiFrameUncompressedFirstChunk(frame, out int lpmBodyLen))
+            {
+                return PrefetchMultiFrameAndBuildAsync(frame, lpmBodyLen, cancellationToken);
+            }
             var result = ProcessReceivedFrame(frame);
             if (result.Payload.Length == 0 && !result.EndOfStream)
                 continue;
@@ -1729,6 +1801,108 @@ internal sealed class ShmControlResponseContent : HttpContent,
         }
 
         return ReadNextMessageSlowAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Returns <see langword="true"/> iff <paramref name="frame"/>
+    /// is the first chunk of a multi-frame UNCOMPRESSED LPM the
+    /// caller has not yet started accumulating. Sets
+    /// <paramref name="lpmBodyLen"/> from the LPM header. Mirrors
+    /// the server-side detector in
+    /// <c>ShmAsyncStreamReader.TryDetectMultiFrameUncompressedFirstChunk</c>.
+    /// </summary>
+    private bool TryDetectMultiFrameUncompressedFirstChunk(
+        InboundFrame frame, out int lpmBodyLen)
+    {
+        lpmBodyLen = 0;
+        if (frame.Type != FrameType.Message) return false;
+        if ((frame.Flags & MessageFlags.More) == 0) return false;
+        // Must be the first chunk: no multi-frame already in flight
+        // (neither the legacy lazy-chain compressed path nor a chain
+        // segment list nor the legacy _assembled compressed buffer).
+        if (_chainHead != null || _assembledPos != 0 || _lazyChain != null) return false;
+        if (frame.Length < 5) return false;
+        if (frame.Memory.Span[0] != 0) return false;
+        lpmBodyLen = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(
+            frame.Memory.Span.Slice(1, 4));
+        return true;
+    }
+
+    /// <summary>
+    /// Deadlock-safe async parse of a multi-frame uncompressed LPM.
+    /// Hybrid dispatch: eager pre-fetch when the LPM fits the chain-ZC
+    /// budget (no extra memory cost because chain-ZC already freezes
+    /// the ring for the LPM duration); Task.Yield off the reader
+    /// Thread + existing <see cref="LazyChainRos"/> otherwise (keeps
+    /// pool footprint at ~2 frames for messages &gt; budget).
+    /// On the eager path the returned ROS is fully materialised so
+    /// the caller's <c>MergeFrom(ROS)</c> never pulls — safe under
+    /// inline-receive-continuations.
+    /// </summary>
+    private async ValueTask<(ReadOnlySequence<byte> Payload, bool EndOfStream)> PrefetchMultiFrameAndBuildAsync(
+        InboundFrame firstFrame, int lpmBodyLen, CancellationToken cancellationToken)
+    {
+        var ct = cancellationToken.CanBeCanceled
+            ? cancellationToken
+            : _stream.DisposeCancellationToken;
+
+        if (!InboundChainHelper.ShouldEagerPrefetch(_stream, lpmBodyLen))
+        {
+            // Huge non-ZC fallback: build a LazyChainRos that pulls
+            // chunks synchronously inside MergeFrom, but FIRST hop
+            // off the reader Thread so the sync pulls block a TP
+            // worker (not the reader Thread that's responsible for
+            // delivering subsequent chunks).
+            await InboundChainHelper.HopOffReaderThreadIfNeededAsync().ConfigureAwait(false);
+
+            // EndStream on the first chunk is unusual but valid.
+            if ((firstFrame.Flags & MessageFlags.EndStream) != 0)
+            {
+                _lazyChainSawEndStream = true;
+            }
+
+            InboundFrame? Pull(CancellationToken pullCt)
+            {
+                var pulled = _stream.ReceiveFrameSync(pullCt);
+                if (pulled is null) return null;
+                if (pulled.Value.Type != FrameType.Message)
+                {
+                    pulled.Value.ReturnToPool();
+                    return null;
+                }
+                if ((pulled.Value.Flags & MessageFlags.EndStream) != 0)
+                {
+                    _lazyChainSawEndStream = true;
+                }
+                return pulled.Value;
+            }
+
+            _lazyChain = new LazyChainRos(
+                firstFrame, firstFrameBodyOffset: 5,
+                totalBodyLen: lpmBodyLen,
+                pullNext: Pull,
+                ct: _stream.DisposeCancellationToken);
+            return (_lazyChain.Sequence, false);
+        }
+
+        // Eager pre-fetch path.
+        bool sawEndStream = false;
+        Action onEndStream = () => sawEndStream = true;
+
+        var chunks = await InboundChainHelper.PrefetchAllChunksAsync(
+            _stream, firstFrame, firstFrameBodyOffset: 5,
+            totalBodyLen: lpmBodyLen,
+            onEndStream: onEndStream,
+            cancellationToken: ct).ConfigureAwait(false);
+
+        var ros = InboundChainHelper.BuildSequence(
+            chunks, firstFrameBodyOffset: 5, totalBodyLen: lpmBodyLen);
+        _prefetchedChunks = chunks;
+        _prefetchedSawEndStream = sawEndStream;
+        // Preserve the legacy contract: return (ROS, false) here and
+        // surface EndStream on the NEXT ReadNextMessageAsync call
+        // (after the caller has consumed the ROS).
+        return (ros, false);
     }
 
     private (ReadOnlySequence<byte> Payload, bool EndOfStream) ProcessReceivedFrame(InboundFrame frame)
@@ -1755,57 +1929,18 @@ internal sealed class ShmControlResponseContent : HttpContent,
                 //     _assembled until END.
                 if ((frame.Flags & MessageFlags.More) != 0)
                 {
-                    bool firstChunk = _chainHead == null && _assembledPos == 0 && _lazyChain == null;
+                    bool firstChunk = _chainHead == null && _assembledPos == 0 && _lazyChain == null && _prefetchedChunks == null;
 
-                    // Multi-frame UNCOMPRESSED messages take the
-                    // LazyChainRos path. Synchronously pulls subsequent
-                    // chunks as the caller's MergeFrom advances; pool
-                    // buffer footprint drops from O(message-size) to ~2
-                    // chunks. EndStream is captured by the puller closure
-                    // and surfaced on the NEXT ReadNextMessage* call.
-                    if (firstChunk && frame.Length >= 5 && frame.Memory.Span[0] == 0)
-                    {
-                        var lpmBodyLen = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(
-                            frame.Memory.Span.Slice(1, 4));
-
-                        InboundFrame? Pull(CancellationToken pullCt)
-                        {
-                            var pulled = _stream.ReceiveFrameSync(pullCt);
-                            if (pulled is null) return null;
-                            if (pulled.Value.Type != FrameType.Message)
-                            {
-                                // Non-Message frame mid-LPM-body: release
-                                // and treat as truncation; the original
-                                // frame will be re-processed on the next
-                                // ReadNextMessage call.
-                                pulled.Value.ReturnToPool();
-                                return null;
-                            }
-                            if ((pulled.Value.Flags & MessageFlags.EndStream) != 0)
-                            {
-                                _lazyChainSawEndStream = true;
-                            }
-                            return pulled.Value;
-                        }
-
-                        // EndStream may also be set on the FIRST chunk
-                        // itself (More=1 + EndStream is unusual but
-                        // theoretically valid).
-                        if ((frame.Flags & MessageFlags.EndStream) != 0)
-                        {
-                            _lazyChainSawEndStream = true;
-                        }
-
-                        _lazyChain = new LazyChainRos(
-                            frame, firstFrameBodyOffset: 5,
-                            totalBodyLen: lpmBodyLen,
-                            pullNext: Pull,
-                            ct: _stream.DisposeCancellationToken);
-                        // Return ROS to the caller. EndStream is NOT yet
-                        // known - it surfaces on the NEXT ReadNextMessage
-                        // call once the puller sees the final chunk.
-                        return (_lazyChain.Sequence, false);
-                    }
+                    // NOTE: the multi-frame UNCOMPRESSED first-chunk
+                    // case is intercepted earlier in
+                    // ReadNextMessageAsync / ReadNextMessageSlowAsync
+                    // via TryDetectMultiFrameUncompressedFirstChunk +
+                    // PrefetchMultiFrameAndBuildAsync (the safe
+                    // hybrid eager-pre-fetch / yield-then-lazy path).
+                    // ProcessReceivedFrame should never see that case
+                    // as a first chunk; only compressed multi-frame
+                    // first chunks and subsequent chunks of an already
+                    // accumulating chain reach here.
 
                     bool useChain;
                     if (firstChunk)
@@ -2000,6 +2135,11 @@ internal sealed class ShmControlResponseContent : HttpContent,
 
                 if (_stream.TryReceiveFrame(out var frame))
                 {
+                    if (TryDetectMultiFrameUncompressedFirstChunk(frame, out int lpmBodyLen))
+                    {
+                        return await PrefetchMultiFrameAndBuildAsync(frame, lpmBodyLen, ct)
+                            .ConfigureAwait(false);
+                    }
                     var result = ProcessReceivedFrame(frame);
                     if (result.Payload.Length == 0 && !result.EndOfStream)
                         continue;
@@ -2187,6 +2327,13 @@ internal sealed class ShmControlResponseContent : HttpContent,
             {
                 _lazyChain.Dispose();
                 _lazyChain = null;
+            }
+
+            if (_prefetchedChunks != null)
+            {
+                InboundChainHelper.ReleaseAll(_prefetchedChunks);
+                _prefetchedChunks = null;
+                _prefetchedSawEndStream = false;
             }
 
             if (_assembled != null)

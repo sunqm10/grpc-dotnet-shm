@@ -437,6 +437,20 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         // which would self-deadlock if the same Thread is doing both
         // chunk delivery and chunk consumption. Disable inline
         // continuations in that case regardless of opt-in.
+        //
+        // The same deadlock previously applied in MAX mode whenever
+        // multi-frame chain-ZC was reachable, because chain-ZC's
+        // per-chunk More-flagged surface drove the same LazyChainRos
+        // sync-pull from the consumer. The 2026-06-01 hybrid eager
+        // pre-fetch refactor (see <c>InboundChainHelper</c>) replaces
+        // the sync-pull <c>LazyChainRos</c> activation in chain-ZC
+        // streams with an async pre-fetch loop that unwinds the reader
+        // Thread between chunks; the > <c>ChainZcBudget</c> non-ZC
+        // path keeps <c>LazyChainRos</c> but hops off the reader
+        // Thread first via <see cref="ShmReaderThreadContext"/>. With
+        // those fixes inline continuations are safe on chain-ZC
+        // streams; only the strict-fair frame cap remains as a
+        // structural inline-cont blocker.
         var inlineContinuations = (
                 (connection.UseReceiveStriper && !_bypassStriper)
                 || s_channelInlineContinuations
