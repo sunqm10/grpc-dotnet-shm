@@ -1,13 +1,26 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
-Benchmark runner and plotter for .NET gRPC SHM vs TCP transport.
-Matches grpc-go-shmem/benchmark/shmemtcp/benchmark_runner.py â€” same plot
-structure adapted for 2 transports (SHM, TCP) instead of 3.
+Benchmark runner and plotter for the gRFC G3 transport matrix.
+
+Reads the cross-language `grfc-g3-bench-v1` results.json emitted by
+`ringbench --matrix` (see ringbench/Matrix.cs). That schema is a FLAT
+`runs[]` array keyed by (workload, transport, payload_bytes, concurrency),
+so any transport set plots without touching the plotting code.
+
+UDS IS THE BASELINE. gRFC G3 compares shared memory against the fastest
+portable local transport, which is a Unix domain socket; every ratio printed
+or plotted here is `uds / shm` for latency (>1 means SHM is faster) and
+`shm / uds` for throughput. TCP is kept as a supplementary series only.
+
+Nothing is estimated or extrapolated: a cell that was not measured is left
+as a hole in the plot and labelled "No data".
 
 Usage:
-    python benchmark_runner.py              # Plot from cached results (or run if none exist)
-    python benchmark_runner.py --run        # Force rerun benchmarks, then plot
+    python benchmark_runner.py              # Plot from cached results (or run if none)
+    python benchmark_runner.py --run        # Force rerun the matrix, then plot
     python benchmark_runner.py --plot-only  # Only plot (fail if no cached results)
+    python benchmark_runner.py --run --fair # Run the fair arm instead of tuned
+    python benchmark_runner.py --compare    # Cross-platform comparison plots
 """
 
 import argparse
@@ -15,7 +28,6 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
 
 import matplotlib
@@ -23,83 +35,56 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Directory setup â€” matches Go's out/<platform>/ convention
+# Directory setup -- matches Go's out/<platform>/ convention
 SCRIPT_DIR = Path(__file__).parent.absolute()
 OUT_ROOT = SCRIPT_DIR / "out"
 PLATFORM_NAME = "windows" if os.name == "nt" else ("linux" if sys.platform.startswith("linux") else sys.platform)
 OUT_DIR = OUT_ROOT / PLATFORM_NAME
 RESULTS_FILE = OUT_DIR / "results.json"
 
+# gRFC G3 cross-language contract
+SCHEMA = "grfc-g3-bench-v1"
+BASELINE = "uds"
 
-def run_ringbench() -> dict:
-    """Run .NET gRPC benchmarks and return JSON results."""
-    print("=" * 70)
-    print("Running .NET gRPC Benchmarks (SHM vs TCP)...")
-    print("=" * 70)
+# Latency statistics available in `latency_us`; anything else is a top-level
+# numeric field of the run (throughput_mb_per_s, cpu_us_per_op, ...).
+LATENCY_STATS = ("p50", "p90", "p99", "mean")
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+# Transport presentation. Transports not listed here still plot, using a
+# fallback colour -- the data structure never hard-codes the transport set.
+TRANSPORT_ORDER = ["shm", "uds", "tcp"]
+TRANSPORT_COLORS = {'shm': '#00cc6a', 'uds': '#4472C4', 'tcp': '#ff5555'}
+TRANSPORT_LABELS = {'shm': 'SHM', 'uds': 'UDS', 'tcp': 'TCP'}
+FALLBACK_COLORS = ['#ED7D31', '#7030A0', '#808080', '#C00000']
 
-    cmd = [
-        "dotnet", "run",
-        "--project", str(SCRIPT_DIR / "ringbench" / "RingBench.csproj"),
-        "-c", "Release",
-        "--",
-        "--out", str(OUT_ROOT)
-    ]
-
-    print(f"Running: {' '.join(cmd)}")
-    print("-" * 70)
-
-    try:
-        result = subprocess.run(cmd, capture_output=False, text=True, timeout=1800)
-        if result.returncode != 0:
-            print(f"ERROR: Benchmark exited with code {result.returncode}")
-            return None
-    except subprocess.TimeoutExpired:
-        print("ERROR: Benchmark timed out after 1800s")
-        return None
-    except Exception as e:
-        print(f"ERROR: Failed to run benchmarks: {e}")
-        return None
-
-    print("-" * 70)
-
-    try:
-        with open(RESULTS_FILE) as f:
-            results = json.load(f)
-        nu = len(results.get("unary", []))
-        ns = len(results.get("streaming", []))
-        print(f"Parsed {nu} unary + {ns} streaming results")
-        return results
-    except Exception as e:
-        print(f"ERROR: Failed to load results: {e}")
-        return None
+# Default timeout for a full matrix run. The contract sweep is
+# transports x workloads x payloads x concurrency x repetitions at
+# >= 35 s per repetition, which runs for hours -- 1800 s is nowhere near
+# enough. Override with --timeout (0 disables the timeout entirely).
+DEFAULT_RUN_TIMEOUT_S = 8 * 3600
 
 
-def save_results(results: dict):
-    """Save benchmark results to JSON file."""
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    with open(RESULTS_FILE, 'w') as f:
-        json.dump(results, f, indent=2)
-    print(f"Saved results to: {RESULTS_FILE}")
+def transport_color(transport: str) -> str:
+    if transport in TRANSPORT_COLORS:
+        return TRANSPORT_COLORS[transport]
+    idx = abs(hash(transport)) % len(FALLBACK_COLORS)
+    return FALLBACK_COLORS[idx]
 
 
-def load_results() -> dict:
-    """Load benchmark results from cached JSON file."""
-    if RESULTS_FILE.exists():
-        try:
-            with open(RESULTS_FILE) as f:
-                results = json.load(f)
-            print(f"Loaded results from: {RESULTS_FILE}")
-            print(f"  Timestamp: {results.get('timestamp', 'unknown')}")
-            print(f"  CPU: {results.get('cpu', 'unknown')}")
-            return results
-        except Exception:
-            pass
-    return None
+def transport_label(transport: str) -> str:
+    return TRANSPORT_LABELS.get(transport, transport.upper())
+
+
+def order_transports(transports) -> list:
+    """Sort transports into the canonical order, unknown ones last."""
+    known = [t for t in TRANSPORT_ORDER if t in transports]
+    extra = sorted(t for t in transports if t not in TRANSPORT_ORDER)
+    return known + extra
 
 
 def format_size(b):
+    if b is None:
+        return '?'
     if b == 0:
         return '0B'
     if b >= 1048576:
@@ -109,115 +94,382 @@ def format_size(b):
     return f'{b}B'
 
 
-def extract_data(results: dict) -> dict:
-    """Extract plotting data from .NET benchmark results.
-
-    Maps .NET JSON format into the same data structure used by the Go
-    benchmark_runner.py so the plotting code is structurally identical.
-    """
-    # Build lookup tables: (transport, size_bytes) -> entry
-    unary_lookup = {}
-    for e in results.get("unary", []):
-        unary_lookup[(e["transport"], e["size_bytes"])] = e
-
-    stream_lookup = {}
-    for e in results.get("streaming", []):
-        stream_lookup[(e["transport"], e["size_bytes"])] = e
-
-    # --- Size groups (matching Go's split) ---
-    # Small streaming sizes  (Go: 64B-1MB; .NET: 1B-4MB)
-    # Small streaming sizes  (0B-4MB)
-    sizes = [0, 1, 1024, 4096, 16384, 65536, 262144, 524288, 1048576, 2097152, 4194304]
-    size_labels = [format_size(s) for s in sizes]
-
-    # Small unary/roundtrip sizes  (0B-64KB)
-    rt_sizes = [0, 1, 1024, 4096, 16384, 65536]
-    rt_labels = [format_size(s) for s in rt_sizes]
-
-    # Large payload sizes  (Go: 1MB-256MB; .NET: 1MB-256MB)
-    large_sizes = [1048576, 2097152, 4194304, 16777216, 67108864, 268435456]
-    large_size_labels = [format_size(s) for s in large_sizes]
-
-    # --- Helpers ---
-    def _get(lookup, transport, sz_list, field, scale=1.0):
-        """Return values for *transport* at each size, scaled."""
-        out = []
-        for s in sz_list:
-            entry = lookup.get((transport, s))
-            if entry is not None and entry.get(field) is not None:
-                out.append(entry[field] * scale)
-            else:
-                out.append(None)
-        return out
-
-    # .NET stores latency in us -- convert to ns (*1000) to match Go plots.
-    US_TO_NS = 1000.0
-
-    data = {
-        "sizes": sizes,
-        "size_labels": size_labels,
-        "large_sizes": large_sizes,
-        "large_size_labels": large_size_labels,
-        "rt_sizes": rt_sizes,
-        "rt_size_labels": rt_labels,
-        "cpu": results.get("cpu", "Unknown CPU"),
-        "runtime": results.get("runtime", ""),
-        "timestamp": results.get("timestamp", ""),
-    }
-
-    # Streaming (one-way ping-pong) -- small sizes
-    data["shm_stream_latency"]    = _get(stream_lookup, "shm", sizes, "avg_latency_us", US_TO_NS)
-    data["tcp_stream_latency"]    = _get(stream_lookup, "tcp", sizes, "avg_latency_us", US_TO_NS)
-    data["shm_stream_throughput"] = _get(stream_lookup, "shm", sizes, "throughput_mb_per_s")
-    data["tcp_stream_throughput"] = _get(stream_lookup, "tcp", sizes, "throughput_mb_per_s")
-
-    # Unary (roundtrip) -- small sizes
-    data["shm_rt_latency"] = _get(unary_lookup, "shm", rt_sizes, "avg_latency_us", US_TO_NS)
-    data["tcp_rt_latency"] = _get(unary_lookup, "tcp", rt_sizes, "avg_latency_us", US_TO_NS)
-
-    # Large payload STREAMING
-    data["shm_large_stream_throughput"] = _get(stream_lookup, "shm", large_sizes, "throughput_mb_per_s")
-    data["shm_large_stream_latency"]   = _get(stream_lookup, "shm", large_sizes, "avg_latency_us", US_TO_NS)
-    data["tcp_large_stream_throughput"] = _get(stream_lookup, "tcp", large_sizes, "throughput_mb_per_s")
-    data["tcp_large_stream_latency"]   = _get(stream_lookup, "tcp", large_sizes, "avg_latency_us", US_TO_NS)
-
-    # Large payload UNARY (roundtrip)
-    data["shm_large_rt_throughput"] = _get(unary_lookup, "shm", large_sizes, "throughput_mb_per_s")
-    data["shm_large_rt_latency"]   = _get(unary_lookup, "shm", large_sizes, "avg_latency_us", US_TO_NS)
-    data["tcp_large_rt_throughput"] = _get(unary_lookup, "tcp", large_sizes, "throughput_mb_per_s")
-    data["tcp_large_rt_latency"]   = _get(unary_lookup, "tcp", large_sizes, "avg_latency_us", US_TO_NS)
-
-    return data
-
-
-# =========================================================================
-# Helpers
-# =========================================================================
-
-def _filter_numeric(seq):
-    """Return only numeric entries from a sequence."""
-    return [v for v in seq if isinstance(v, (int, float))]
-
-
-def _has_numeric(seq) -> bool:
-    return bool(_filter_numeric(seq))
-
-
-def _safe_number(seq, idx):
-    if idx < len(seq):
-        v = seq[idx]
-        if isinstance(v, (int, float)):
-            return v
+def _num(v):
+    """Return *v* as a float if it is a real number, else None."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
     return None
 
 
 # =========================================================================
-# Plot generation -- mirrors Go's generate_plots + generate_consolidated_plot
+# Transport-generic view over a grfc-g3-bench-v1 results.json
 # =========================================================================
 
-def generate_plots(data: dict):
-    """Generate benchmark plots (patterns + summary + large payloads)."""
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+class Matrix:
+    """Indexed view over the flat `runs[]` array.
+
+    Cells are stored under the full contract key so that adding a transport
+    (or a concurrency level, or a payload) needs no code change:
+
+        self.cells[(workload, transport, payload_bytes, concurrency)] -> run
+
+    All accessors return None for a missing cell or a null metric; callers
+    are expected to leave such points out of the plot rather than fill them.
+    """
+
+    def __init__(self, results: dict, source: Path = None):
+        self.source = source
+        self.meta = {k: v for k, v in results.items() if k not in ("runs", "skipped")}
+        self.skipped = list(results.get("skipped") or [])
+        self.cells = {}
+        for r in results.get("runs") or []:
+            if not isinstance(r, dict):
+                continue
+            key = (r.get("workload"), r.get("transport"),
+                   r.get("payload_bytes"), r.get("concurrency"))
+            self.cells[key] = r
+
+        self.transports = order_transports({k[1] for k in self.cells if k[1]})
+        workloads = {k[0] for k in self.cells if k[0]}
+        self.workloads = ([w for w in ("unary", "streaming") if w in workloads]
+                          + sorted(w for w in workloads if w not in ("unary", "streaming")))
+        self.payloads = sorted({k[2] for k in self.cells if k[2] is not None})
+        self.concurrency = sorted({k[3] for k in self.cells if k[3] is not None})
+
+    # ---- identity -------------------------------------------------------
+
+    def __bool__(self):
+        return bool(self.cells)
+
+    @property
+    def cpu(self) -> str:
+        return self.meta.get("cpu") or "Unknown CPU"
+
+    @property
+    def arm(self) -> str:
+        return self.meta.get("arm") or "?"
+
+    @property
+    def os_label(self) -> str:
+        return self.meta.get("os") or "?"
+
+    @property
+    def commit(self) -> str:
+        sha = self.meta.get("commit") or "unknown"
+        short = sha[:12]
+        return short + ("+dirty" if self.meta.get("dirty") else "")
+
+    def subtitle(self) -> str:
+        """One-line provenance string for plot titles."""
+        cores = self.meta.get("cores")
+        threads = self.meta.get("threads")
+        topo = f'{cores}c/{threads}t' if cores and threads else ''
+        bits = [self.cpu[:40], self.os_label, self.meta.get("arch", ""), topo,
+                f'arm={self.arm}', self.commit]
+        return ' • '.join(b for b in bits if b)
+
+    # ---- cell access ----------------------------------------------------
+
+    def cell(self, workload, transport, payload, conc):
+        return self.cells.get((workload, transport, payload, conc))
+
+    def value(self, workload, transport, payload, conc, metric):
+        """Metric for one cell: a latency_us stat, or a top-level field."""
+        c = self.cell(workload, transport, payload, conc)
+        if c is None:
+            return None
+        if metric in LATENCY_STATS:
+            lat = c.get("latency_us")
+            return _num(lat.get(metric)) if isinstance(lat, dict) else None
+        return _num(c.get(metric))
+
+    def series(self, workload, transport, payloads, conc, metric) -> list:
+        """Metric across *payloads* at fixed concurrency; None marks holes."""
+        return [self.value(workload, transport, p, conc, metric) for p in payloads]
+
+    def conc_series(self, workload, transport, payload, concurrency, metric) -> list:
+        """Metric across *concurrency* at fixed payload; None marks holes."""
+        return [self.value(workload, transport, payload, c, metric) for c in concurrency]
+
+    def transport_series(self, workload, payloads, conc, metric, transports=None) -> list:
+        """[(transport, values)] for every transport present, in plot order."""
+        return [(t, self.series(workload, t, payloads, conc, metric))
+                for t in (transports or self.transports)]
+
+    # ---- baseline-relative ratios (UDS is the baseline) -----------------
+
+    def latency_speedup(self, workload, transport, payload, conc,
+                        stat="p50", baseline=BASELINE):
+        """baseline_latency / transport_latency -- >1 means *transport* wins.
+
+        Returns None when either side is missing, so the caller plots a hole
+        instead of a fabricated 1.0x.
+        """
+        base = self.value(workload, baseline, payload, conc, stat)
+        val = self.value(workload, transport, payload, conc, stat)
+        if base is None or val is None or val <= 0:
+            return None
+        return base / val
+
+    def throughput_ratio(self, workload, transport, payload, conc,
+                         baseline=BASELINE):
+        """transport_throughput / baseline_throughput -- >1 means it wins."""
+        base = self.value(workload, baseline, payload, conc, "throughput_mb_per_s")
+        val = self.value(workload, transport, payload, conc, "throughput_mb_per_s")
+        if base is None or val is None or base <= 0:
+            return None
+        return val / base
+
+    def speedup_series(self, workload, payloads, conc, stat="p50",
+                       baseline=BASELINE) -> list:
+        """[(transport, speedups)] for every non-baseline transport."""
+        out = []
+        for t in self.transports:
+            if t == baseline:
+                continue
+            out.append((t, [self.latency_speedup(workload, t, p, conc, stat, baseline)
+                            for p in payloads]))
+        return out
+
+    def has_baseline(self, baseline=BASELINE) -> bool:
+        return baseline in self.transports
+
+    # ---- axis selection -------------------------------------------------
+
+    def ref_payload(self, preferred=1024):
+        """Reference payload: *preferred* if measured, else the closest one.
+
+        Never returns a payload under a wrong label -- callers label panels
+        with format_size() of the value returned here.
+        """
+        if not self.payloads:
+            return None
+        if preferred in self.payloads:
+            return preferred
+        return min(self.payloads, key=lambda p: abs(p - preferred))
+
+    def ref_concurrency(self, preferred=1):
+        """Reference concurrency for latency panels (lowest by default)."""
+        if not self.concurrency:
+            return None
+        if preferred in self.concurrency:
+            return preferred
+        return min(self.concurrency)
+
+    def peak_concurrency(self):
+        return max(self.concurrency) if self.concurrency else None
+
+    def large_payloads(self, threshold=1048576) -> list:
+        return [p for p in self.payloads if p >= threshold]
+
+    # ---- aggregates -----------------------------------------------------
+
+    def extremum(self, transport, metric, workload=None, how=max):
+        """max/min of *metric* over all cells of *transport*, or None."""
+        vals = []
+        for (w, t, p, c), _cell in self.cells.items():
+            if t != transport or (workload is not None and w != workload):
+                continue
+            v = self.value(w, t, p, c, metric)
+            if v is not None and v > 0:
+                vals.append(v)
+        return how(vals) if vals else None
+
+
+def _load_json(path: Path) -> dict:
+    with open(path, encoding='utf-8') as f:
+        return json.load(f)
+
+
+def load_matrix(path: Path, quiet=False) -> Matrix:
+    """Load and validate a grfc-g3-bench-v1 results.json."""
+    if not Path(path).exists():
+        return None
+    try:
+        results = _load_json(Path(path))
+    except Exception as e:
+        print(f"ERROR: Failed to parse {path}: {e}")
+        return None
+
+    schema = results.get("schema")
+    if schema != SCHEMA:
+        if "unary" in results or "streaming" in results:
+            print(f"ERROR: {path} uses the retired pre-matrix format "
+                  f"(top-level unary[]/streaming[]). Re-run with --run to "
+                  f"produce a '{SCHEMA}' results.json.")
+        else:
+            print(f"ERROR: {path} has schema '{schema}', expected '{SCHEMA}'.")
+        return None
+
+    m = Matrix(results, source=Path(path))
+    if not quiet:
+        print(f"Loaded results from: {path}")
+        print(f"  Schema:      {schema} ({m.meta.get('lang', '?')})")
+        print(f"  Commit:      {m.commit}")
+        print(f"  Platform:    {m.os_label}/{m.meta.get('arch', '?')}  arm={m.arm}")
+        print(f"  CPU:         {m.cpu}")
+        print(f"  Cells:       {len(m.cells)} "
+              f"(transports: {', '.join(m.transports) or 'none'})")
+        if m.skipped:
+            print(f"  Skipped:     {len(m.skipped)} cell-repetition(s)")
+    return m
+
+
+# =========================================================================
+# Benchmark execution -- drives ringbench's gRFC G3 matrix mode
+# =========================================================================
+
+def run_ringbench(args, results_file: Path) -> Matrix:
+    """Run the .NET gRFC G3 matrix sweep and return the parsed results."""
+    print("=" * 70)
+    print(f"Running .NET gRPC gRFC G3 benchmark matrix "
+          f"({'fair' if args.fair else 'tuned'} arm)...")
+    print("=" * 70)
+
+    results_file.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "dotnet", "run",
+        "--project", str(SCRIPT_DIR / "ringbench" / "RingBench.csproj"),
+        "-c", "Release",
+        "--",
+        "--matrix",
+        "--matrix-out", str(results_file),
+    ]
+    if args.fair:
+        cmd.append("--fair")
+    for flag, value in (("--matrix-transports", args.transports),
+                        ("--matrix-workloads", args.workloads),
+                        ("--matrix-payloads", args.payloads),
+                        ("--matrix-concurrency", args.concurrency),
+                        ("--matrix-warmup-s", args.warmup_s),
+                        ("--matrix-duration-s", args.duration_s),
+                        ("--matrix-reps", args.reps)):
+        if value is not None:
+            cmd += [flag, str(value)]
+
+    timeout = args.timeout if args.timeout and args.timeout > 0 else None
+    print(f"Running: {' '.join(cmd)}")
+    print(f"Timeout: {str(timeout) + 's' if timeout else 'none'}")
+    print("-" * 70)
+
+    try:
+        result = subprocess.run(cmd, capture_output=False, text=True, timeout=timeout)
+        if result.returncode != 0:
+            print(f"ERROR: Benchmark exited with code {result.returncode}")
+            return None
+    except subprocess.TimeoutExpired:
+        print(f"ERROR: Benchmark timed out after {timeout}s "
+              f"(raise it with --timeout, or 0 to disable)")
+        return None
+    except Exception as e:
+        print(f"ERROR: Failed to run benchmarks: {e}")
+        return None
+
+    print("-" * 70)
+    return load_matrix(results_file)
+
+
+# =========================================================================
+# Plot helpers
+# =========================================================================
+
+def _no_data(ax, title: str):
+    """Mark a panel that has nothing measured to show."""
+    ax.text(0.5, 0.5, 'No data', ha='center', va='center',
+            transform=ax.transAxes, fontsize=11, color='#888888')
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title(title)
+
+
+def _any_value(series) -> bool:
+    """True if any (transport, values) pair carries at least one number."""
+    return any(v is not None for _t, values in series for v in values)
+
+
+def grouped_bars(ax, labels, series, total_width=0.8, fontsize=9):
+    """Draw an N-way grouped bar chart over an arbitrary transport set.
+
+    *series* is [(transport, values)]; a None value is a cell that was not
+    measured and simply gets no bar -- never a substituted number. Columns
+    where every transport is missing are tagged "No data".
+
+    Returns (x positions, per-bar width) for callers that annotate.
+    """
+    x = np.arange(len(labels))
+    n = max(len(series), 1)
+    width = total_width / n
+
+    for i, (transport, values) in enumerate(series):
+        offset = (i - (n - 1) / 2) * width
+        heights = [np.nan if v is None else v for v in values]
+        ax.bar(x + offset, heights, width, label=transport_label(transport),
+               color=transport_color(transport), edgecolor='black', linewidth=0.5)
+
+    # Holes are called out explicitly instead of silently looking like a
+    # zero. The axes-fraction y keeps the marker visible on log scales too.
+    small = max(fontsize - 2, 6)
+    for i in range(len(labels)):
+        if all(values[i] is None for _t, values in series):
+            ax.annotate('No data', xy=(x[i], 0.03), xycoords=('data', 'axes fraction'),
+                        ha='center', va='bottom', fontsize=small,
+                        color='#888888', rotation=90)
+            continue
+        for j, (_transport, values) in enumerate(series):
+            if values[i] is None:
+                offset = (j - (n - 1) / 2) * width
+                ax.annotate('n/a', xy=(x[i] + offset, 0.03),
+                            xycoords=('data', 'axes fraction'), ha='center',
+                            va='bottom', fontsize=small, color='#888888', rotation=90)
+
+    # Pin the x range: autoscale over partially missing groups otherwise
+    # stretches a lone bar across the whole panel.
+    ax.set_xlim(-0.5, len(labels) - 0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    return x, width
+
+
+def annotate_speedup(ax, x, width, series, speedups, transport='shm', fontsize=8):
+    """Annotate the *transport* bars with their speedup over the baseline."""
+    try:
+        idx = [t for t, _v in series].index(transport)
+    except ValueError:
+        return
+    n = max(len(series), 1)
+    offset = (idx - (n - 1) / 2) * width
+    values = series[idx][1]
+    for i, (v, s) in enumerate(zip(values, speedups)):
+        if v is None or s is None:
+            continue
+        ax.annotate(f'{s:.1f}x', xy=(x[i] + offset, v), xytext=(0, 4),
+                    textcoords='offset points', ha='center', fontsize=fontsize,
+                    color=transport_color(transport), fontweight='bold')
+
+
+def _log_if_wide(ax, series, factor=50.0):
+    """Use a log y-axis when the plotted range spans more than *factor*."""
+    vals = [v for _t, values in series for v in values if v is not None and v > 0]
+    if vals and max(vals) / min(vals) > factor:
+        ax.set_yscale('log')
+
+
+def _baseline_note(m: Matrix) -> str:
+    if m.has_baseline():
+        return f'baseline: {transport_label(BASELINE)}'
+    return f'{transport_label(BASELINE)} baseline MISSING'
+
+
+# =========================================================================
+# Plot generation
+# =========================================================================
+
+def generate_plots(m: Matrix, out_dir: Path):
+    """Main dashboard + summary + large-payload plots."""
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     plt.style.use('default')
     plt.rcParams.update({
@@ -228,296 +480,166 @@ def generate_plots(data: dict):
         'font.size': 10,
     })
 
-    colors = {'shm': '#00cc6a', 'tcp': '#ff5555'}
-
-    cpu = data.get("cpu", "")
-    runtime = data.get("runtime", "")
-    timestamp = data.get("timestamp", "")[:10]
-
-    width = 0.35  # 2-transport bar width
+    payloads = m.payloads
+    labels = [format_size(p) for p in payloads]
+    conc = m.ref_concurrency()
+    ref_payload = m.ref_payload(1024)
+    ref_label = format_size(ref_payload)
 
     # ================================================================
     # Plot 1: Communication Pattern Benchmarks (main dashboard)
     # ================================================================
-    fig, axes = plt.subplots(3, 2, figsize=(14, 14))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     fig.suptitle(
-        f'gRPC Shared Memory Transport - Communication Pattern Benchmarks\n'
-        f'64 MiB Ring Buffers \u2022 {cpu[:40]}',
-        fontsize=14, fontweight='bold')
+        f'gRPC Shared Memory Transport — gRFC G3 Matrix ({_baseline_note(m)})\n'
+        f'concurrency={conc} • {m.subtitle()}',
+        fontsize=13, fontweight='bold')
 
-    # --- Row 1: Unary (Roundtrip) ---
-    rt_labels = data["rt_size_labels"]
-    x = np.arange(len(rt_labels))
+    for row, workload in enumerate(("unary", "streaming")):
+        tag = 'UNARY' if workload == 'unary' else 'STREAM'
+        title = 'Unary RPC' if workload == 'unary' else 'Unidirectional Streaming'
 
-    shm_rt = data["shm_rt_latency"]
-    tcp_rt = data["tcp_rt_latency"]
+        # Latency (p50)
+        ax = axes[row, 0]
+        lat = m.transport_series(workload, payloads, conc, "p50")
+        if _any_value(lat):
+            x, width = grouped_bars(ax, labels, lat)
+            ax.set_xlabel('Payload Size')
+            ax.set_ylabel('Latency p50 (µs)')
+            ax.set_title(f'[{tag}] {title} — Latency p50\n(lower is better)')
+            ax.legend(loc='upper left', fontsize=8)
+            _log_if_wide(ax, lat)
+            speedups = [m.latency_speedup(workload, 'shm', p, conc) for p in payloads]
+            annotate_speedup(ax, x, width, lat, speedups)
+        else:
+            _no_data(ax, f'[{tag}] {title} — Latency p50')
 
-    ax = axes[0, 0]
-    if all(v is not None for v in shm_rt + tcp_rt):
-        ax.bar(x - width / 2, shm_rt, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x + width / 2, tcp_rt, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Latency (ns)')
-        ax.set_title('[UNARY] Unary RPC (Ping-Pong) - Latency\n(lower is better)')
-        ax.set_xticks(x); ax.set_xticklabels(rt_labels)
-        ax.legend(loc='upper right')
-        for i, (shm, tcp) in enumerate(zip(shm_rt, tcp_rt)):
-            if shm and tcp:
-                speedup = tcp / shm
-                ax.annotate(f'{speedup:.1f}x', xy=(i - width / 2, shm), xytext=(0, 5),
-                           textcoords='offset points', ha='center', fontsize=9,
-                           color=colors['shm'], fontweight='bold')
-    else:
-        ax.text(0.5, 0.5, 'No roundtrip data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('[UNARY] Unary RPC - Latency')
+        # Throughput
+        ax = axes[row, 1]
+        tp = m.transport_series(workload, payloads, conc, "throughput_mb_per_s")
+        if _any_value(tp):
+            grouped_bars(ax, labels, tp)
+            ax.set_xlabel('Payload Size')
+            ax.set_ylabel('Throughput (MB/s)')
+            ax.set_title(f'[{tag}] {title} — Throughput\n(higher is better)')
+            ax.legend(loc='upper left', fontsize=8)
+            _log_if_wide(ax, tp)
+        else:
+            _no_data(ax, f'[{tag}] {title} — Throughput')
 
-    ax = axes[0, 1]
-    if all(v is not None for v in shm_rt + tcp_rt):
-        shm_ops = [1e9 / lat / 1000 for lat in shm_rt]
-        tcp_ops = [1e9 / lat / 1000 for lat in tcp_rt]
-        ax.bar(x - width / 2, shm_ops, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x + width / 2, tcp_ops, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Throughput (Kops/s)')
-        ax.set_title('[UNARY] Unary RPC - Throughput\n(higher is better)')
-        ax.set_xticks(x); ax.set_xticklabels(rt_labels)
-        ax.legend(loc='upper right')
-    else:
-        ax.text(0.5, 0.5, 'No roundtrip data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('[UNARY] Unary RPC - Throughput')
-
-    # --- Row 2: Streaming ---
-    size_labels = data["size_labels"]
-    x = np.arange(len(size_labels))
-
-    shm_lat = data["shm_stream_latency"]
-    tcp_lat = data["tcp_stream_latency"]
-
-    ax = axes[1, 0]
-    if all(v is not None for v in shm_lat + tcp_lat):
-        ax.bar(x - width / 2, shm_lat, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x + width / 2, tcp_lat, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Latency (ns)')
-        ax.set_title('[STREAM] Unidirectional Streaming - Latency\n(lower is better)')
-        ax.set_xticks(x); ax.set_xticklabels(size_labels)
-        ax.legend(loc='upper left')
-        ax.set_yscale('log')
-        for i, (shm, tcp) in enumerate(zip(shm_lat, tcp_lat)):
-            if shm and tcp:
-                speedup = tcp / shm
-                ax.annotate(f'{speedup:.1f}x', xy=(i - width / 2, shm), xytext=(0, 5),
-                           textcoords='offset points', ha='center', fontsize=8,
-                           color=colors['shm'], fontweight='bold')
-    else:
-        ax.text(0.5, 0.5, 'No streaming data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('[STREAM] Streaming - Latency')
-
-    ax = axes[1, 1]
-    shm_tp = data["shm_stream_throughput"]
-    tcp_tp = data["tcp_stream_throughput"]
-    if all(v is not None for v in shm_tp + tcp_tp):
-        ax.bar(x - width / 2, shm_tp, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x + width / 2, tcp_tp, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Throughput (MB/s)')
-        ax.set_title('[STREAM] Streaming - Throughput\n(higher is better)')
-        ax.set_xticks(x); ax.set_xticklabels(size_labels)
-        ax.legend(loc='upper left')
-        ax.set_yscale('log')
-    else:
-        ax.text(0.5, 0.5, 'No streaming data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('[STREAM] Streaming - Throughput')
-
-    # --- Row 3: Bidirectional Streaming (estimated) ---
-    bidi_overhead = 1.15
-
-    ax = axes[2, 0]
-    if all(v is not None for v in shm_lat + tcp_lat):
-        bidi_shm = [v * 2 * bidi_overhead for v in shm_lat]
-        bidi_tcp = [v * 2 * bidi_overhead for v in tcp_lat]
-        ax.bar(x - width / 2, bidi_shm, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x + width / 2, bidi_tcp, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Latency (ns)')
-        ax.set_title('[BIDI] Bidirectional Streaming - Latency (est.)\n(lower is better)')
-        ax.set_xticks(x); ax.set_xticklabels(size_labels)
-        ax.legend(loc='upper left')
-        ax.set_yscale('log')
-    else:
-        ax.text(0.5, 0.5, 'No streaming data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('[BIDI] Bidirectional Streaming - Latency')
-
-    ax = axes[2, 1]
-    if all(v is not None for v in shm_tp + tcp_tp):
-        bidi_shm_tp = [v * 0.85 for v in shm_tp]
-        bidi_tcp_tp = [v * 0.80 for v in tcp_tp]
-        ax.bar(x - width / 2, bidi_shm_tp, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x + width / 2, bidi_tcp_tp, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Throughput (MB/s)')
-        ax.set_title('[BIDI] Bidirectional Streaming - Throughput (est.)\n(higher is better)')
-        ax.set_xticks(x); ax.set_xticklabels(size_labels)
-        ax.legend(loc='upper left')
-        ax.set_yscale('log')
-    else:
-        ax.text(0.5, 0.5, 'No streaming data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('[BIDI] Bidirectional Streaming - Throughput')
-
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    patterns_file = OUT_DIR / "benchmark_patterns.png"
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    patterns_file = out_dir / "benchmark_patterns.png"
     plt.savefig(patterns_file, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close()
     print(f"Created: {patterns_file}")
 
     # ================================================================
-    # Plot 2: Summary Comparison
+    # Plot 2: Summary Comparison (at the reference payload)
     # ================================================================
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle(f'gRPC Transport Performance Summary\n{timestamp}', fontsize=14, fontweight='bold')
+    fig.suptitle(f'gRPC Transport Performance Summary — {_baseline_note(m)}\n'
+                 f'{m.subtitle()}', fontsize=13, fontweight='bold')
 
-    idx_1k = 1  # 1KB index in rt_sizes
+    workloads = m.workloads or ["unary", "streaming"]
+    cat_labels = [w.capitalize() for w in workloads]
 
+    # Latency at the reference payload, per workload
     ax = axes[0, 0]
-    if (shm_rt[idx_1k] and tcp_rt[idx_1k] and
-            shm_lat[1] and tcp_lat[1]):
-        categories = ['Unary RPC\n(Roundtrip)', 'Streaming\n(One-way)']
-        shm_vals = [shm_rt[idx_1k], shm_lat[1]]
-        tcp_vals = [tcp_rt[idx_1k], tcp_lat[1]]
-        xc = np.arange(len(categories))
-        ax.bar(xc - width / 2, shm_vals, width, label='SHM', color=colors['shm'], edgecolor='black')
-        ax.bar(xc + width / 2, tcp_vals, width, label='TCP', color=colors['tcp'], edgecolor='black')
-        ax.set_ylabel('Latency (ns)')
-        ax.set_title('Latency @ 1KB Message Size')
-        ax.set_xticks(xc); ax.set_xticklabels(categories)
-        ax.legend()
-        ax.set_yscale('log')
+    lat_cat = [(t, [m.value(w, t, ref_payload, conc, "p50") for w in workloads])
+               for t in m.transports]
+    if _any_value(lat_cat):
+        grouped_bars(ax, cat_labels, lat_cat)
+        ax.set_ylabel('Latency p50 (µs)')
+        ax.set_title(f'Latency p50 @ {ref_label}, concurrency={conc}')
+        ax.legend(fontsize=8)
+        _log_if_wide(ax, lat_cat)
+    else:
+        _no_data(ax, f'Latency p50 @ {ref_label}')
 
+    # Peak throughput per transport
     ax = axes[0, 1]
-    if _has_numeric(shm_tp) and _has_numeric(tcp_tp):
-        transports = ['SHM', 'TCP']
-        max_tp = [max(_filter_numeric(shm_tp)), max(_filter_numeric(tcp_tp))]
-        bars = ax.bar(transports, max_tp, color=[colors['shm'], colors['tcp']], edgecolor='black')
+    peaks = [(t, m.extremum(t, "throughput_mb_per_s")) for t in m.transports]
+    peaks = [(t, v) for t, v in peaks if v is not None]
+    if peaks:
+        bars = ax.bar([transport_label(t) for t, _v in peaks], [v for _t, v in peaks],
+                      color=[transport_color(t) for t, _v in peaks], edgecolor='black')
         ax.set_ylabel('Throughput (MB/s)')
-        ax.set_title('Peak Throughput (Streaming)')
-        for bar, val in zip(bars, max_tp):
+        ax.set_title('Peak Throughput (all cells)')
+        for bar, (_t, val) in zip(bars, peaks):
             label = f'{val / 1000:.1f} GB/s' if val >= 1000 else f'{val:.0f} MB/s'
             ax.annotate(label, xy=(bar.get_x() + bar.get_width() / 2, val),
-                       xytext=(0, 5), textcoords='offset points', ha='center', fontweight='bold')
+                        xytext=(0, 5), textcoords='offset points',
+                        ha='center', fontweight='bold')
+    else:
+        _no_data(ax, 'Peak Throughput')
 
+    # Latency speedup over the UDS baseline, per workload
     ax = axes[1, 0]
-    if (shm_rt[idx_1k] and tcp_rt[idx_1k] and shm_lat[1] and tcp_lat[1]):
-        categories = ['Unary\nvs TCP', 'Stream\nvs TCP']
-        speedups = [
-            tcp_rt[idx_1k] / shm_rt[idx_1k],
-            tcp_lat[1] / shm_lat[1],
-        ]
-        bars = ax.bar(categories, speedups, color=[colors['tcp'], colors['tcp']],
-                      edgecolor='black', alpha=0.7)
-        ax.set_ylabel('Speedup Factor (x)')
-        ax.set_title('SHM Latency Speedup (1KB)')
+    sp_cat = [(t, [m.latency_speedup(w, t, ref_payload, conc) for w in workloads])
+              for t in m.transports if t != BASELINE]
+    if _any_value(sp_cat):
+        grouped_bars(ax, cat_labels, sp_cat)
+        ax.set_ylabel('Speedup vs UDS (x)')
+        ax.set_title(f'Latency Speedup over {transport_label(BASELINE)} @ {ref_label}')
         ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
-        for bar, val in zip(bars, speedups):
-            ax.annotate(f'{val:.1f}x', xy=(bar.get_x() + bar.get_width() / 2, val),
-                       xytext=(0, 5), textcoords='offset points', ha='center', fontweight='bold')
+        ax.legend(fontsize=8)
+    else:
+        _no_data(ax, f'Latency Speedup over {transport_label(BASELINE)}')
 
+    # Text summary
     ax = axes[1, 1]
     ax.axis('off')
-    summary_text = f"""
-BENCHMARK SUMMARY
-{'=' * 45}
-
-CPU: {cpu[:50]}
-Runtime: {runtime}
-Date: {timestamp}
-
-KEY RESULTS (1KB messages):
-"""
-    if shm_rt[idx_1k] and tcp_rt[idx_1k]:
-        unary_speedup = tcp_rt[idx_1k] / shm_rt[idx_1k]
-        summary_text += f"""
-\u2022 Unary RPC:
-  SHM: {shm_rt[idx_1k]:.0f} ns
-  TCP: {tcp_rt[idx_1k]:.0f} ns
-  Speedup: {unary_speedup:.1f}x
-"""
-
-    if shm_lat[1] and tcp_lat[1]:
-        stream_speedup = tcp_lat[1] / shm_lat[1]
-        summary_text += f"""
-\u2022 Streaming:
-  SHM: {shm_lat[1]:.0f} ns
-  TCP: {tcp_lat[1]:.0f} ns
-  Speedup: {stream_speedup:.1f}x
-"""
-
-    if _has_numeric(shm_tp):
-        summary_text += f"""
-\u2022 Peak Throughput:
-  SHM: {max(_filter_numeric(shm_tp)) / 1000:.2f} GB/s
-  TCP: {max(_filter_numeric(tcp_tp)) / 1000:.2f} GB/s
-"""
-
-    ax.text(0.1, 0.9, summary_text, transform=ax.transAxes, fontsize=11,
-            verticalalignment='top', fontfamily='monospace',
+    ax.text(0.02, 0.98, _summary_text(m, ref_payload, conc), transform=ax.transAxes,
+            fontsize=9, verticalalignment='top', fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    summary_file = OUT_DIR / "benchmark_summary.png"
+    plt.tight_layout(rect=[0, 0, 1, 0.93])
+    summary_file = out_dir / "benchmark_summary.png"
     plt.savefig(summary_file, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close()
     print(f"Created: {summary_file}")
 
-    # ================================================================
-    # Plot 3: Large Payload Benchmarks (1MB - 128MB)
-    # ================================================================
-    shm_large_tp = data.get("shm_large_stream_throughput", [])
-    tcp_large_tp = data.get("tcp_large_stream_throughput", [])
-    shm_large_lat = data.get("shm_large_stream_latency", [])
-    tcp_large_lat = data.get("tcp_large_stream_latency", [])
-    large_labels = data.get("large_size_labels", [])
-
     plot_files = [patterns_file, summary_file]
 
-    if shm_large_tp and any(v is not None for v in shm_large_tp):
+    # ================================================================
+    # Plot 3: Large Payloads (>= 1 MiB)
+    # ================================================================
+    large = m.large_payloads()
+    if large:
+        large_labels = [format_size(p) for p in large]
         fig, axes_lp = plt.subplots(1, 2, figsize=(14, 6))
-        fig.suptitle(
-            f'Large Payload Performance - All Transports (64 MiB Ring Buffer)\n{cpu[:40]}',
-            fontsize=14, fontweight='bold')
+        fig.suptitle(f'Large Payload Performance (>= 1MB, streaming, '
+                     f'concurrency={conc})\n{m.subtitle()}',
+                     fontsize=13, fontweight='bold')
 
-        valid_idx = [i for i, v in enumerate(shm_large_tp) if v is not None]
-        if valid_idx:
-            valid_labels = [large_labels[i] for i in valid_idx]
-            xl = np.arange(len(valid_labels))
-            w = 0.35
-
-            shm_vals = [shm_large_tp[i] or 0 for i in valid_idx]
-            tcp_vals = [tcp_large_tp[i] or 0 for i in valid_idx]
-
-            ax = axes_lp[0]
-            ax.bar(xl - w / 2, shm_vals, w, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-            ax.bar(xl + w / 2, tcp_vals, w, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-            ax.set_xlabel('Message Size')
+        ax = axes_lp[0]
+        tp = m.transport_series("streaming", large, conc, "throughput_mb_per_s")
+        if _any_value(tp):
+            grouped_bars(ax, large_labels, tp)
+            ax.set_xlabel('Payload Size')
             ax.set_ylabel('Throughput (MB/s)')
             ax.set_title('Large Payload Throughput\n(higher is better)')
-            ax.set_xticks(xl); ax.set_xticklabels(valid_labels)
-            ax.legend(loc='upper right')
-            ax.set_yscale('log')
+            ax.legend(loc='upper left', fontsize=8)
+            _log_if_wide(ax, tp)
+        else:
+            _no_data(ax, 'Large Payload Throughput')
 
-            shm_lat_vals = [(shm_large_lat[i] or 0) / 1e6 for i in valid_idx]
-            tcp_lat_vals = [(tcp_large_lat[i] or 0) / 1e6 for i in valid_idx]
-
-            ax = axes_lp[1]
-            ax.bar(xl - w / 2, shm_lat_vals, w, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-            ax.bar(xl + w / 2, tcp_lat_vals, w, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-            ax.set_xlabel('Message Size')
-            ax.set_ylabel('Latency (ms)')
+        ax = axes_lp[1]
+        lat = m.transport_series("streaming", large, conc, "p50")
+        if _any_value(lat):
+            x, width = grouped_bars(ax, large_labels, lat)
+            ax.set_xlabel('Payload Size')
+            ax.set_ylabel('Latency p50 (µs)')
             ax.set_title('Large Payload Latency\n(lower is better)')
-            ax.set_xticks(xl); ax.set_xticklabels(valid_labels)
-            ax.legend(loc='upper left')
+            ax.legend(loc='upper left', fontsize=8)
+            _log_if_wide(ax, lat)
+            speedups = [m.latency_speedup("streaming", 'shm', p, conc) for p in large]
+            annotate_speedup(ax, x, width, lat, speedups)
+        else:
+            _no_data(ax, 'Large Payload Latency')
 
-        plt.tight_layout(rect=[0, 0, 1, 0.94])
-        large_file = OUT_DIR / "benchmark_large_payloads.png"
+        plt.tight_layout(rect=[0, 0, 1, 0.92])
+        large_file = out_dir / "benchmark_large_payloads.png"
         plt.savefig(large_file, dpi=150, bbox_inches='tight', facecolor='white')
         plt.close()
         print(f"Created: {large_file}")
@@ -526,19 +648,64 @@ KEY RESULTS (1KB messages):
     return plot_files
 
 
-def generate_consolidated_plot(data: dict):
-    """Generate a single consolidated plot with all benchmark results.
+def _summary_text(m: Matrix, ref_payload, conc) -> str:
+    """Key numbers at the reference payload, UDS-relative."""
+    ref_label = format_size(ref_payload)
+    lines = [
+        "BENCHMARK SUMMARY",
+        "=" * 46,
+        f"Schema:   {m.meta.get('schema', '?')} / {m.meta.get('lang', '?')}",
+        f"Commit:   {m.commit}",
+        f"Host:     {m.cpu[:38]}",
+        f"OS/Arch:  {m.os_label} / {m.meta.get('arch', '?')}  "
+        f"({m.meta.get('cores', '?')}c/{m.meta.get('threads', '?')}t)",
+        f"Arm:      {m.arm}    Baseline: {transport_label(BASELINE)}",
+        "",
+        f"KEY RESULTS @ {ref_label}, concurrency={conc}:",
+    ]
 
-    Layout matches grpc-go-shmem's consolidated plot:
-      Row 1 -- UNARY RPC (Small):     Latency | Throughput | Speedup
-      Row 2 -- STREAMING (Small):     Latency | Throughput | Speedup
-      Row 3 -- STREAMING (Large):     Throughput | Latency  | Speedup
-      Row 4 -- UNARY RPC (Large):     Throughput | Latency  | Speedup
-      Row 5 -- Pattern comparisons:   SHM Stream vs Unary | TCP Stream vs Unary | Combined Speedup
-      Row 6 -- Summary metrics:       Peak Throughput | Min Latency | Performance Advantage
+    for workload in (m.workloads or []):
+        lines.append("")
+        lines.append(f"• {workload.capitalize()}:")
+        any_row = False
+        for t in m.transports:
+            lat = m.value(workload, t, ref_payload, conc, "p50")
+            tp = m.value(workload, t, ref_payload, conc, "throughput_mb_per_s")
+            if lat is None and tp is None:
+                continue
+            any_row = True
+            lat_s = f'{lat:>9.2f} us' if lat is not None else '        n/a'
+            tp_s = f'{tp:>9.1f} MB/s' if tp is not None else '        n/a'
+            lines.append(f"  {transport_label(t):<4} p50 {lat_s}   {tp_s}")
+        for t in m.transports:
+            if t == BASELINE:
+                continue
+            sp = m.latency_speedup(workload, t, ref_payload, conc)
+            if sp is not None:
+                lines.append(f"  {transport_label(t)} vs {transport_label(BASELINE)}: "
+                             f"{sp:.2f}x latency")
+        if not any_row:
+            lines.append("  No data")
+
+    if m.skipped:
+        lines += ["", f"SKIPPED CELLS: {len(m.skipped)} (see results.json)"]
+
+    return "\n".join(lines)
+
+
+def generate_consolidated_plot(m: Matrix, out_dir: Path):
+    """Single consolidated plot with every measured dimension.
+
+    Layout (all transports present in results.json, UDS as baseline):
+      Row 1 -- UNARY:        Latency p50 | Throughput | Speedup vs UDS
+      Row 2 -- STREAMING:    Latency p50 | Throughput | Speedup vs UDS
+      Row 3 -- TAIL LATENCY: Unary p99   | Streaming p99 | p99/p50 ratio
+      Row 4 -- CONCURRENCY:  Latency     | Throughput  | Speedup vs UDS
+      Row 5 -- EFFICIENCY:   CPU us/op (unary) | CPU us/op (streaming) | RSS peak
+      Row 6 -- SUMMARY:      Peak throughput | Min latency | Advantage vs UDS
       Row 7 -- Text summary
     """
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     plt.style.use('default')
     plt.rcParams.update({
@@ -549,500 +716,310 @@ def generate_consolidated_plot(data: dict):
         'font.size': 9,
     })
 
-    colors = {'shm': '#00cc6a', 'tcp': '#ff5555'}
-
-    cpu = data.get("cpu", "")
-    runtime = data.get("runtime", "")
-    timestamp = data.get("timestamp", "")[:10]
+    payloads = m.payloads
+    labels = [format_size(p) for p in payloads]
+    conc = m.ref_concurrency()
+    ref_payload = m.ref_payload(1024)
+    ref_label = format_size(ref_payload)
 
     fig = plt.figure(figsize=(18, 36))
-    gs = fig.add_gridspec(7, 3, hspace=0.40, wspace=0.25,
-                          height_ratios=[1, 1, 1, 1, 1, 1, 0.6])
+    gs = fig.add_gridspec(7, 3, hspace=0.45, wspace=0.25, top=0.955, bottom=0.03,
+                          height_ratios=[1, 1, 1, 1, 1, 1, 0.9])
 
     fig.suptitle(
-        f'gRPC Shared Memory Transport - Complete Benchmark Results\n'
-        f'64 MiB Ring Buffers \u2022 {cpu} \u2022 {timestamp}',
-        fontsize=16, fontweight='bold', y=0.98)
-
-    width = 0.35  # 2-transport
-
-    panel_status = []  # track which panels rendered data vs 'No data'
+        f'gRPC Shared Memory Transport — Complete gRFC G3 Matrix '
+        f'({_baseline_note(m)})\n{m.subtitle()}',
+        fontsize=15, fontweight='bold', y=0.985)
 
     # ============================================================
-    # ROW 1: Unary RPC (Roundtrip) -- Small Payloads
+    # ROWS 1-2: per-workload latency / throughput / speedup
     # ============================================================
-    rt_labels = data["rt_size_labels"]
-    x_rt = np.arange(len(rt_labels))
+    for row, workload in enumerate(("unary", "streaming")):
+        tag = workload.upper()
 
-    shm_rt = data["shm_rt_latency"]
-    tcp_rt = data["tcp_rt_latency"]
+        ax = fig.add_subplot(gs[row, 0])
+        lat = m.transport_series(workload, payloads, conc, "p50")
+        if _any_value(lat):
+            x, width = grouped_bars(ax, labels, lat, fontsize=8)
+            ax.set_xlabel('Payload Size')
+            ax.set_ylabel('Latency p50 (µs)')
+            ax.set_title(f'{tag} — Latency p50 (c={conc})\n(lower is better)',
+                         fontweight='bold')
+            ax.set_xticklabels(labels, rotation=45, ha='right')
+            ax.legend(loc='upper left', fontsize=8)
+            _log_if_wide(ax, lat)
+            speedups = [m.latency_speedup(workload, 'shm', p, conc) for p in payloads]
+            annotate_speedup(ax, x, width, lat, speedups, fontsize=7)
+        else:
+            _no_data(ax, f'{tag} — Latency p50')
 
-    # Unary Latency
-    ax = fig.add_subplot(gs[0, 0])
-    if all(v is not None for v in shm_rt + tcp_rt):
-        ax.bar(x_rt - width / 2, shm_rt, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x_rt + width / 2, tcp_rt, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Latency (ns)')
-        ax.set_title('UNARY RPC (Small) - Latency\n(lower is better)', fontweight='bold')
-        ax.set_xticks(x_rt); ax.set_xticklabels(rt_labels)
-        ax.legend(loc='upper right', fontsize=8)
-        for i, (shm, tcp) in enumerate(zip(shm_rt, tcp_rt)):
-            if shm and tcp:
-                speedup = tcp / shm
-                ax.annotate(f'{speedup:.1f}x', xy=(i - width / 2, shm), xytext=(0, 3),
-                           textcoords='offset points', ha='center', fontsize=7,
-                           color=colors['shm'], fontweight='bold')
-    else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('UNARY RPC (Small) - Latency')
+        ax = fig.add_subplot(gs[row, 1])
+        tp = m.transport_series(workload, payloads, conc, "throughput_mb_per_s")
+        if _any_value(tp):
+            grouped_bars(ax, labels, tp, fontsize=8)
+            ax.set_xlabel('Payload Size')
+            ax.set_ylabel('Throughput (MB/s)')
+            ax.set_title(f'{tag} — Throughput (c={conc})\n(higher is better)',
+                         fontweight='bold')
+            ax.set_xticklabels(labels, rotation=45, ha='right')
+            ax.legend(loc='upper left', fontsize=8)
+            _log_if_wide(ax, tp)
+        else:
+            _no_data(ax, f'{tag} — Throughput')
 
-    # Unary Throughput (ops/sec)
-    ax = fig.add_subplot(gs[0, 1])
-    if all(v is not None for v in shm_rt + tcp_rt):
-        shm_ops = [1e9 / lat / 1000 for lat in shm_rt]
-        tcp_ops = [1e9 / lat / 1000 for lat in tcp_rt]
-        ax.bar(x_rt - width / 2, shm_ops, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x_rt + width / 2, tcp_ops, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Throughput (Kops/s)')
-        ax.set_title('UNARY RPC (Small) - Throughput\n(higher is better)', fontweight='bold')
-        ax.set_xticks(x_rt); ax.set_xticklabels(rt_labels)
-        ax.legend(loc='upper right', fontsize=8)
-    else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('UNARY RPC (Small) - Throughput')
-
-    # Unary Speedup
-    ax = fig.add_subplot(gs[0, 2])
-    if all(v is not None for v in shm_rt + tcp_rt):
-        tcp_speedups = [tcp / shm for shm, tcp in zip(shm_rt, tcp_rt)]
-        ax.bar(x_rt, tcp_speedups, 0.5, label='vs TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Speedup Factor')
-        ax.set_title('UNARY RPC (Small) - SHM Speedup\n(higher is better)', fontweight='bold')
-        ax.set_xticks(x_rt); ax.set_xticklabels(rt_labels)
-        ax.legend(loc='upper right', fontsize=8)
-        ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
-        for i, s in enumerate(tcp_speedups):
-            ax.annotate(f'{s:.1f}x', xy=(i, s), xytext=(0, 3),
-                       textcoords='offset points', ha='center', fontsize=7, fontweight='bold')
-    else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('UNARY RPC (Small) - SHM Speedup')
-
-    # ============================================================
-    # ROW 2: Streaming (Small)
-    # ============================================================
-    size_labels = data["size_labels"]
-    x_stream = np.arange(len(size_labels))
-
-    shm_lat = data["shm_stream_latency"]
-    tcp_lat = data["tcp_stream_latency"]
-
-    # Streaming Latency
-    ax = fig.add_subplot(gs[1, 0])
-    if all(v is not None for v in shm_lat + tcp_lat):
-        ax.bar(x_stream - width / 2, shm_lat, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x_stream + width / 2, tcp_lat, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Latency (ns)')
-        ax.set_title('STREAMING (Small) - Latency\n(lower is better)', fontweight='bold')
-        ax.set_xticks(x_stream); ax.set_xticklabels(size_labels, rotation=45, ha='right')
-        ax.legend(loc='upper left', fontsize=8)
-        ax.set_yscale('log')
-    else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('STREAMING (Small) - Latency')
-
-    # Streaming Throughput
-    ax = fig.add_subplot(gs[1, 1])
-    shm_tp = data["shm_stream_throughput"]
-    tcp_tp = data["tcp_stream_throughput"]
-    if all(v is not None for v in shm_tp + tcp_tp):
-        ax.bar(x_stream - width / 2, shm_tp, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x_stream + width / 2, tcp_tp, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Throughput (MB/s)')
-        ax.set_title('STREAMING (Small) - Throughput\n(higher is better)', fontweight='bold')
-        ax.set_xticks(x_stream); ax.set_xticklabels(size_labels, rotation=45, ha='right')
-        ax.legend(loc='upper left', fontsize=8)
-        ax.set_yscale('log')
-    else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('STREAMING (Small) - Throughput')
-
-    # Streaming Speedup
-    ax = fig.add_subplot(gs[1, 2])
-    if all(v is not None for v in shm_lat + tcp_lat):
-        tcp_speedups = [tcp / shm for shm, tcp in zip(shm_lat, tcp_lat)]
-        ax.bar(x_stream, tcp_speedups, 0.5, label='vs TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Speedup Factor')
-        ax.set_title('STREAMING (Small) - SHM Speedup\n(higher is better)', fontweight='bold')
-        ax.set_xticks(x_stream); ax.set_xticklabels(size_labels, rotation=45, ha='right')
-        ax.legend(loc='upper right', fontsize=8)
-        ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
-    else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('STREAMING (Small) - SHM Speedup')
-
-    # ============================================================
-    # ROW 3: Large Payload STREAMING (1MB -- 128MB)
-    # ============================================================
-    shm_large_stream_tp = data.get("shm_large_stream_throughput", [])
-    shm_large_stream_lat = data.get("shm_large_stream_latency", [])
-    tcp_large_stream_tp = data.get("tcp_large_stream_throughput", [])
-    tcp_large_stream_lat = data.get("tcp_large_stream_latency", [])
-    large_labels = data.get("large_size_labels", [])
-
-    valid_stream_idx = [i for i in range(len(large_labels))
-                        if (i < len(shm_large_stream_tp) and shm_large_stream_tp[i] is not None)]
-
-    # Large Streaming Throughput
-    ax = fig.add_subplot(gs[2, 0])
-    if valid_stream_idx:
-        valid_labels = [large_labels[i] for i in valid_stream_idx]
-        x_large = np.arange(len(valid_labels))
-        shm_vals = [shm_large_stream_tp[i] or 0 for i in valid_stream_idx]
-        tcp_vals = [tcp_large_stream_tp[i] or 0 for i in valid_stream_idx]
-        ax.bar(x_large - width / 2, shm_vals, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x_large + width / 2, tcp_vals, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Throughput (MB/s)')
-        ax.set_title('STREAMING (Large 1-128MB) - Throughput\n(higher is better)', fontweight='bold')
-        ax.set_xticks(x_large); ax.set_xticklabels(valid_labels)
-        ax.legend(loc='upper right', fontsize=8)
-    else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('STREAMING (Large) - Throughput')
-
-    # Large Streaming Latency
-    ax = fig.add_subplot(gs[2, 1])
-    if valid_stream_idx:
-        valid_labels = [large_labels[i] for i in valid_stream_idx]
-        x_large = np.arange(len(valid_labels))
-        shm_lat_vals = [(shm_large_stream_lat[i] or 0) / 1e6 for i in valid_stream_idx]
-        tcp_lat_vals = [(tcp_large_stream_lat[i] or 0) / 1e6 for i in valid_stream_idx]
-        ax.bar(x_large - width / 2, shm_lat_vals, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x_large + width / 2, tcp_lat_vals, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Latency (ms)')
-        ax.set_title('STREAMING (Large 1-128MB) - Latency\n(lower is better)', fontweight='bold')
-        ax.set_xticks(x_large); ax.set_xticklabels(valid_labels)
-        ax.legend(loc='upper left', fontsize=8)
-    else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('STREAMING (Large) - Latency')
-
-    # Large Streaming Speedup
-    ax = fig.add_subplot(gs[2, 2])
-    if valid_stream_idx and any(shm_large_stream_lat[i] for i in valid_stream_idx if i < len(shm_large_stream_lat)):
-        valid_labels = [large_labels[i] for i in valid_stream_idx]
-        x_large = np.arange(len(valid_labels))
-        tcp_speedups = []
-        for i in valid_stream_idx:
-            shm_l = shm_large_stream_lat[i] if i < len(shm_large_stream_lat) and shm_large_stream_lat[i] else 1
-            tcp_l = tcp_large_stream_lat[i] if i < len(tcp_large_stream_lat) and tcp_large_stream_lat[i] else shm_l
-            tcp_speedups.append(tcp_l / shm_l if shm_l else 1)
-
-        ax.bar(x_large, tcp_speedups, 0.5, label='vs TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Speedup Factor')
-        ax.set_title('STREAMING (Large) - SHM Speedup\n(higher is better)', fontweight='bold')
-        ax.set_xticks(x_large); ax.set_xticklabels(valid_labels)
-        ax.legend(loc='upper right', fontsize=8)
-        ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
-        for i, s in enumerate(tcp_speedups):
-            ax.annotate(f'{s:.1f}x', xy=(i, s), xytext=(0, 3),
-                       textcoords='offset points', ha='center', fontsize=7, fontweight='bold')
-    else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('STREAMING (Large) - SHM Speedup')
-
-    # ============================================================
-    # ROW 4: Large Payload UNARY/ROUNDTRIP (1MB -- 128MB)
-    # ============================================================
-    shm_large_rt_tp = data.get("shm_large_rt_throughput", [])
-    shm_large_rt_lat = data.get("shm_large_rt_latency", [])
-    tcp_large_rt_tp = data.get("tcp_large_rt_throughput", [])
-    tcp_large_rt_lat = data.get("tcp_large_rt_latency", [])
-
-    valid_rt_idx = [i for i in range(len(large_labels))
-                    if (i < len(shm_large_rt_tp) and shm_large_rt_tp[i] is not None)]
-
-    # Large Unary Throughput
-    ax = fig.add_subplot(gs[3, 0])
-    if valid_rt_idx:
-        valid_labels = [large_labels[i] for i in valid_rt_idx]
-        x_large = np.arange(len(valid_labels))
-        shm_vals = [shm_large_rt_tp[i] or 0 for i in valid_rt_idx]
-        tcp_vals = [tcp_large_rt_tp[i] or 0 for i in valid_rt_idx]
-        ax.bar(x_large - width / 2, shm_vals, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x_large + width / 2, tcp_vals, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Throughput (MB/s)')
-        ax.set_title('UNARY RPC (Large 1-128MB) - Throughput\n(higher is better)', fontweight='bold')
-        ax.set_xticks(x_large); ax.set_xticklabels(valid_labels)
-        ax.legend(loc='upper right', fontsize=8)
-    else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('UNARY RPC (Large) - Throughput')
-
-    # Large Unary Latency
-    ax = fig.add_subplot(gs[3, 1])
-    if valid_rt_idx:
-        valid_labels = [large_labels[i] for i in valid_rt_idx]
-        x_large = np.arange(len(valid_labels))
-        shm_lat_vals = [(shm_large_rt_lat[i] or 0) / 1e6 for i in valid_rt_idx]
-        tcp_lat_vals = [(tcp_large_rt_lat[i] or 0) / 1e6 for i in valid_rt_idx]
-        ax.bar(x_large - width / 2, shm_lat_vals, width, label='SHM', color=colors['shm'], edgecolor='black', linewidth=0.5)
-        ax.bar(x_large + width / 2, tcp_lat_vals, width, label='TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Latency (ms)')
-        ax.set_title('UNARY RPC (Large 1-128MB) - Latency\n(lower is better)', fontweight='bold')
-        ax.set_xticks(x_large); ax.set_xticklabels(valid_labels)
-        ax.legend(loc='upper left', fontsize=8)
-    else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('UNARY RPC (Large) - Latency')
-
-    # Large Unary Speedup
-    ax = fig.add_subplot(gs[3, 2])
-    if valid_rt_idx and any(shm_large_rt_lat[i] for i in valid_rt_idx if i < len(shm_large_rt_lat)):
-        valid_labels = [large_labels[i] for i in valid_rt_idx]
-        x_large = np.arange(len(valid_labels))
-        tcp_speedups = []
-        for i in valid_rt_idx:
-            shm_l = shm_large_rt_lat[i] if i < len(shm_large_rt_lat) and shm_large_rt_lat[i] else 1
-            tcp_l = tcp_large_rt_lat[i] if i < len(tcp_large_rt_lat) and tcp_large_rt_lat[i] else shm_l
-            tcp_speedups.append(tcp_l / shm_l if shm_l else 1)
-
-        ax.bar(x_large, tcp_speedups, 0.5, label='vs TCP', color=colors['tcp'], edgecolor='black', linewidth=0.5)
-        ax.set_xlabel('Message Size')
-        ax.set_ylabel('Speedup Factor')
-        ax.set_title('UNARY RPC (Large) - SHM Speedup\n(higher is better)', fontweight='bold')
-        ax.set_xticks(x_large); ax.set_xticklabels(valid_labels)
-        ax.legend(loc='upper right', fontsize=8)
-        ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
-        for i, s in enumerate(tcp_speedups):
-            ax.annotate(f'{s:.1f}x', xy=(i, s), xytext=(0, 3),
-                       textcoords='offset points', ha='center', fontsize=7, fontweight='bold')
-    else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('UNARY RPC (Large) - SHM Speedup')
-
-    # ============================================================
-    # ROW 5: Streaming vs Unary Comparison for Large Payloads
-    # ============================================================
-
-    # SHM: Streaming vs Unary Throughput
-    ax = fig.add_subplot(gs[4, 0])
-    if valid_stream_idx and valid_rt_idx:
-        common_idx = [i for i in valid_stream_idx if i in valid_rt_idx]
-        if common_idx:
-            labels = [large_labels[i] for i in common_idx]
-            x = np.arange(len(labels))
-            stream_vals = [shm_large_stream_tp[i] / 1000 for i in common_idx]
-            rt_vals = [shm_large_rt_tp[i] / 1000 for i in common_idx]
-            ax.bar(x - 0.15, stream_vals, 0.3, label='Streaming', color='#00aa55', edgecolor='black', linewidth=0.5)
-            ax.bar(x + 0.15, rt_vals, 0.3, label='Unary', color='#00dd88', edgecolor='black', linewidth=0.5)
-            ax.set_xlabel('Message Size')
-            ax.set_ylabel('Throughput (GB/s)')
-            ax.set_title('SHM: Streaming vs Unary\n(higher is better)', fontweight='bold')
-            ax.set_xticks(x); ax.set_xticklabels(labels)
-            ax.legend(loc='upper right', fontsize=8)
-    else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('SHM: Streaming vs Unary')
-
-    # TCP: Streaming vs Unary Throughput
-    ax = fig.add_subplot(gs[4, 1])
-    if valid_stream_idx and valid_rt_idx:
-        common_idx = [i for i in valid_stream_idx if i in valid_rt_idx]
-        if common_idx:
-            labels = [large_labels[i] for i in common_idx]
-            x = np.arange(len(labels))
-            stream_vals = [(tcp_large_stream_tp[i] or 0) / 1000 for i in common_idx]
-            rt_vals = [(tcp_large_rt_tp[i] or 0) / 1000 for i in common_idx]
-            ax.bar(x - 0.15, stream_vals, 0.3, label='Streaming', color='#cc3333', edgecolor='black', linewidth=0.5)
-            ax.bar(x + 0.15, rt_vals, 0.3, label='Unary', color='#ff7777', edgecolor='black', linewidth=0.5)
-            ax.set_xlabel('Message Size')
-            ax.set_ylabel('Throughput (GB/s)')
-            ax.set_title('TCP: Streaming vs Unary\n(higher is better)', fontweight='bold')
-            ax.set_xticks(x); ax.set_xticklabels(labels)
-            ax.legend(loc='upper right', fontsize=8)
-    else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('TCP: Streaming vs Unary')
-
-    # Combined Speedup: SHM over TCP at each large size
-    ax = fig.add_subplot(gs[4, 2])
-    if valid_stream_idx and valid_rt_idx:
-        common_idx = [i for i in valid_stream_idx if i in valid_rt_idx]
-        if common_idx:
-            labels = [large_labels[i] for i in common_idx]
-            x = np.arange(len(labels))
-            stream_speedups = []
-            unary_speedups = []
-            for i in common_idx:
-                shm_sl = shm_large_stream_lat[i] if shm_large_stream_lat[i] else 1
-                tcp_sl = tcp_large_stream_lat[i] if tcp_large_stream_lat[i] else shm_sl
-                stream_speedups.append(tcp_sl / shm_sl if shm_sl else 1)
-                shm_rl = shm_large_rt_lat[i] if shm_large_rt_lat[i] else 1
-                tcp_rl = tcp_large_rt_lat[i] if tcp_large_rt_lat[i] else shm_rl
-                unary_speedups.append(tcp_rl / shm_rl if shm_rl else 1)
-
-            ax.bar(x - 0.15, stream_speedups, 0.3, label='Streaming', color='#cc3333', edgecolor='black', linewidth=0.5)
-            ax.bar(x + 0.15, unary_speedups, 0.3, label='Unary', color='#ff7777', edgecolor='black', linewidth=0.5)
-            ax.set_xlabel('Message Size')
-            ax.set_ylabel('Speedup Factor')
-            ax.set_title('SHM vs TCP: Stream & Unary Speedup\n(higher is better)', fontweight='bold')
-            ax.set_xticks(x); ax.set_xticklabels(labels)
-            ax.legend(loc='upper right', fontsize=8)
+        ax = fig.add_subplot(gs[row, 2])
+        sp = m.speedup_series(workload, payloads, conc)
+        if _any_value(sp):
+            grouped_bars(ax, labels, sp, fontsize=8)
+            ax.set_xlabel('Payload Size')
+            ax.set_ylabel(f'Latency speedup vs {transport_label(BASELINE)} (x)')
+            ax.set_title(f'{tag} — Speedup over {transport_label(BASELINE)}\n'
+                         f'(higher is better)', fontweight='bold')
+            ax.set_xticklabels(labels, rotation=45, ha='right')
             ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
+            ax.legend(loc='upper right', fontsize=8)
+        else:
+            _no_data(ax, f'{tag} — Speedup over {transport_label(BASELINE)}')
+
+    # ============================================================
+    # ROW 3: tail latency
+    # ============================================================
+    for col, workload in enumerate(("unary", "streaming")):
+        ax = fig.add_subplot(gs[2, col])
+        p99 = m.transport_series(workload, payloads, conc, "p99")
+        if _any_value(p99):
+            grouped_bars(ax, labels, p99, fontsize=8)
+            ax.set_xlabel('Payload Size')
+            ax.set_ylabel('Latency p99 (µs)')
+            ax.set_title(f'{workload.upper()} — Tail Latency p99 (c={conc})\n'
+                         f'(lower is better)', fontweight='bold')
+            ax.set_xticklabels(labels, rotation=45, ha='right')
+            ax.legend(loc='upper left', fontsize=8)
+            _log_if_wide(ax, p99)
+        else:
+            _no_data(ax, f'{workload.upper()} — Tail Latency p99')
+
+    # p99/p50 jitter ratio for streaming
+    ax = fig.add_subplot(gs[2, 2])
+    jitter = []
+    for t in m.transports:
+        vals = []
+        for p in payloads:
+            p50 = m.value("streaming", t, p, conc, "p50")
+            p99 = m.value("streaming", t, p, conc, "p99")
+            vals.append(p99 / p50 if p50 and p99 else None)
+        jitter.append((t, vals))
+    if _any_value(jitter):
+        grouped_bars(ax, labels, jitter, fontsize=8)
+        ax.set_xlabel('Payload Size')
+        ax.set_ylabel('p99 / p50')
+        ax.set_title(f'STREAMING — Tail Inflation p99/p50 (c={conc})\n'
+                     f'(lower is better)', fontweight='bold')
+        ax.set_xticklabels(labels, rotation=45, ha='right')
+        ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
+        ax.legend(loc='upper left', fontsize=8)
     else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('SHM vs TCP Speedup')
+        _no_data(ax, 'STREAMING — Tail Inflation p99/p50')
 
     # ============================================================
-    # ROW 6: Peak Performance Summary
+    # ROW 4: concurrency scaling at the reference payload
     # ============================================================
-    shm_tp = data["shm_stream_throughput"]
-    tcp_tp = data["tcp_stream_throughput"]
-    shm_lat = data["shm_stream_latency"]
-    tcp_lat = data["tcp_stream_latency"]
+    conc_levels = m.concurrency
+    conc_labels = [f'c={c}' for c in conc_levels]
 
-    # Peak Throughput by Transport
-    ax = fig.add_subplot(gs[5, 0])
-    if _has_numeric(shm_tp) and _has_numeric(tcp_tp):
-        transports = ['SHM', 'TCP']
-        peak_tp = [max(_filter_numeric(shm_tp)), max(_filter_numeric(tcp_tp))]
-        bar_colors = [colors['shm'], colors['tcp']]
-        bars = ax.bar(transports, peak_tp, color=bar_colors, edgecolor='black', linewidth=0.5)
+    ax = fig.add_subplot(gs[3, 0])
+    lat_c = [(t, m.conc_series("unary", t, ref_payload, conc_levels, "p50"))
+             for t in m.transports]
+    if _any_value(lat_c):
+        grouped_bars(ax, conc_labels, lat_c, fontsize=8)
+        ax.set_xlabel('Concurrency')
+        ax.set_ylabel('Latency p50 (µs)')
+        ax.set_title(f'UNARY — Latency vs Concurrency @ {ref_label}\n'
+                     f'(lower is better)', fontweight='bold')
+        ax.legend(loc='upper left', fontsize=8)
+        _log_if_wide(ax, lat_c)
+    else:
+        _no_data(ax, 'UNARY — Latency vs Concurrency')
+
+    ax = fig.add_subplot(gs[3, 1])
+    tp_c = [(t, m.conc_series("streaming", t, ref_payload, conc_levels,
+                              "throughput_mb_per_s"))
+            for t in m.transports]
+    if _any_value(tp_c):
+        grouped_bars(ax, conc_labels, tp_c, fontsize=8)
+        ax.set_xlabel('Concurrency')
         ax.set_ylabel('Throughput (MB/s)')
-        ax.set_title('Peak Throughput (Streaming)\n(higher is better)', fontweight='bold')
-        for bar, val in zip(bars, peak_tp):
+        ax.set_title(f'STREAMING — Throughput vs Concurrency @ {ref_label}\n'
+                     f'(higher is better)', fontweight='bold')
+        ax.legend(loc='upper left', fontsize=8)
+        _log_if_wide(ax, tp_c)
+    else:
+        _no_data(ax, 'STREAMING — Throughput vs Concurrency')
+
+    ax = fig.add_subplot(gs[3, 2])
+    sp_c = []
+    for t in m.transports:
+        if t == BASELINE:
+            continue
+        sp_c.append((t, [m.latency_speedup("streaming", t, ref_payload, c)
+                         for c in conc_levels]))
+    if _any_value(sp_c):
+        grouped_bars(ax, conc_labels, sp_c, fontsize=8)
+        ax.set_xlabel('Concurrency')
+        ax.set_ylabel(f'Latency speedup vs {transport_label(BASELINE)} (x)')
+        ax.set_title(f'STREAMING — Speedup over {transport_label(BASELINE)} '
+                     f'@ {ref_label}\n(higher is better)', fontweight='bold')
+        ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
+        ax.legend(loc='upper right', fontsize=8)
+    else:
+        _no_data(ax, f'STREAMING — Speedup over {transport_label(BASELINE)}')
+
+    # ============================================================
+    # ROW 5: CPU / memory efficiency
+    # ============================================================
+    for col, workload in enumerate(("unary", "streaming")):
+        ax = fig.add_subplot(gs[4, col])
+        cpu = m.transport_series(workload, payloads, conc, "cpu_us_per_op")
+        if _any_value(cpu):
+            grouped_bars(ax, labels, cpu, fontsize=8)
+            ax.set_xlabel('Payload Size')
+            ax.set_ylabel('CPU (µs/op)')
+            ax.set_title(f'{workload.upper()} — CPU Cost (c={conc})\n'
+                         f'(lower is better)', fontweight='bold')
+            ax.set_xticklabels(labels, rotation=45, ha='right')
+            ax.legend(loc='upper left', fontsize=8)
+            _log_if_wide(ax, cpu)
+        else:
+            _no_data(ax, f'{workload.upper()} — CPU Cost')
+
+    ax = fig.add_subplot(gs[4, 2])
+    rss = m.transport_series("streaming", payloads, conc, "rss_peak_mb")
+    if _any_value(rss):
+        grouped_bars(ax, labels, rss, fontsize=8)
+        ax.set_xlabel('Payload Size')
+        ax.set_ylabel('Peak RSS (MB)')
+        ax.set_title(f'STREAMING — Peak RSS (c={conc})\n(lower is better)',
+                     fontweight='bold')
+        ax.set_xticklabels(labels, rotation=45, ha='right')
+        ax.legend(loc='upper left', fontsize=8)
+    else:
+        _no_data(ax, 'STREAMING — Peak RSS')
+
+    # ============================================================
+    # ROW 6: peak / floor summary per transport
+    # ============================================================
+    ax = fig.add_subplot(gs[5, 0])
+    peaks = [(t, m.extremum(t, "throughput_mb_per_s")) for t in m.transports]
+    peaks = [(t, v) for t, v in peaks if v is not None]
+    if peaks:
+        bars = ax.bar([transport_label(t) for t, _v in peaks], [v for _t, v in peaks],
+                      color=[transport_color(t) for t, _v in peaks],
+                      edgecolor='black', linewidth=0.5)
+        ax.set_ylabel('Throughput (MB/s)')
+        ax.set_title('Peak Throughput (all cells)\n(higher is better)', fontweight='bold')
+        for bar, (_t, val) in zip(bars, peaks):
             label = f'{val / 1000:.1f} GB/s' if val >= 1000 else f'{val:.0f} MB/s'
             ax.annotate(label, xy=(bar.get_x() + bar.get_width() / 2, val),
-                       xytext=(0, 3), textcoords='offset points', ha='center', fontsize=9, fontweight='bold')
-
-    # Minimum Latency by Transport
-    ax = fig.add_subplot(gs[5, 1])
-    if _has_numeric(shm_lat) and _has_numeric(tcp_lat):
-        transports = ['SHM', 'TCP']
-        min_lat = [min(_filter_numeric(shm_lat)), min(_filter_numeric(tcp_lat))]
-        bar_colors = [colors['shm'], colors['tcp']]
-        bars = ax.bar(transports, min_lat, color=bar_colors, edgecolor='black', linewidth=0.5)
-        ax.set_ylabel('Latency (ns)')
-        ax.set_title('Minimum Latency (1B)\n(lower is better)', fontweight='bold')
-        for bar, val in zip(bars, min_lat):
-            label = f'{val / 1000:.1f} \u00b5s' if val >= 1000 else f'{val:.0f} ns'
-            ax.annotate(label, xy=(bar.get_x() + bar.get_width() / 2, val),
-                       xytext=(0, 3), textcoords='offset points', ha='center', fontsize=9, fontweight='bold')
-
-    # Overall Speedup Summary
-    ax = fig.add_subplot(gs[5, 2])
-    shm_rt = data["shm_rt_latency"]
-    tcp_rt = data["tcp_rt_latency"]
-    if (_has_numeric(shm_lat) and _has_numeric(tcp_lat)
-            and _has_numeric(shm_rt) and _has_numeric(tcp_rt)):
-        categories = ['Unary\n(1KB)', 'Stream\n(1MB)', 'Large Stream\n(4MB)', 'Large Unary\n(4MB)']
-        speedups_tcp = []
-
-        # Unary 1KB (index 1 in rt_sizes)
-        u_shm = _safe_number(shm_rt, 1)
-        u_tcp = _safe_number(tcp_rt, 1)
-        speedups_tcp.append(u_tcp / u_shm if u_shm and u_tcp else 0)
-
-        # Stream 1MB (last index in small sizes)
-        s_shm = _safe_number(shm_lat, len(shm_lat) - 1)
-        s_tcp = _safe_number(tcp_lat, len(tcp_lat) - 1)
-        speedups_tcp.append(s_tcp / s_shm if s_shm and s_tcp else 0)
-
-        # Large Stream 4MB (index 2 in large_sizes)
-        ls_shm = _safe_number(shm_large_stream_lat, 2)
-        ls_tcp = _safe_number(tcp_large_stream_lat, 2)
-        speedups_tcp.append(ls_tcp / ls_shm if ls_shm and ls_tcp else 0)
-
-        # Large Unary 4MB (index 2 in large_sizes)
-        lu_shm = _safe_number(shm_large_rt_lat, 2)
-        lu_tcp = _safe_number(tcp_large_rt_lat, 2)
-        speedups_tcp.append(lu_tcp / lu_shm if lu_shm and lu_tcp else 0)
-
-        if any(v > 0 for v in speedups_tcp):
-            x_summ = np.arange(len(categories))
-            bars = ax.bar(x_summ, speedups_tcp, 0.5, label='vs TCP', color=colors['tcp'],
-                         edgecolor='black', linewidth=0.5)
-            ax.set_ylabel('Speedup Factor')
-            ax.set_title('SHM Performance Advantage\n(higher is better)', fontweight='bold')
-            ax.set_xticks(x_summ); ax.set_xticklabels(categories)
-            ax.legend(loc='upper right', fontsize=8)
-            ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
-            for i, s in enumerate(speedups_tcp):
-                if s > 0:
-                    ax.annotate(f'{s:.1f}x', xy=(i, s), xytext=(0, 3),
-                               textcoords='offset points', ha='center', fontsize=8, fontweight='bold')
-        else:
-            ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-            ax.set_title('SHM Performance Advantage')
+                        xytext=(0, 3), textcoords='offset points',
+                        ha='center', fontsize=9, fontweight='bold')
     else:
-        ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
-        ax.set_title('SHM Performance Advantage')
+        _no_data(ax, 'Peak Throughput')
+
+    ax = fig.add_subplot(gs[5, 1])
+    floors = [(t, m.extremum(t, "p50", how=min)) for t in m.transports]
+    floors = [(t, v) for t, v in floors if v is not None]
+    if floors:
+        bars = ax.bar([transport_label(t) for t, _v in floors], [v for _t, v in floors],
+                      color=[transport_color(t) for t, _v in floors],
+                      edgecolor='black', linewidth=0.5)
+        ax.set_ylabel('Latency p50 (µs)')
+        ax.set_title('Minimum p50 Latency (all cells)\n(lower is better)',
+                     fontweight='bold')
+        for bar, (_t, val) in zip(bars, floors):
+            ax.annotate(f'{val:.2f} µs', xy=(bar.get_x() + bar.get_width() / 2, val),
+                        xytext=(0, 3), textcoords='offset points',
+                        ha='center', fontsize=9, fontweight='bold')
+    else:
+        _no_data(ax, 'Minimum p50 Latency')
+
+    # Advantage over the UDS baseline across the workload/scale corners that
+    # were actually measured -- every category is labelled with its real
+    # payload, never a hard-coded index.
+    ax = fig.add_subplot(gs[5, 2])
+    corners = []
+    largest = m.payloads[-1] if m.payloads else None
+    peak_conc = m.peak_concurrency()
+    for workload in ("unary", "streaming"):
+        if ref_payload is not None:
+            corners.append((f'{workload[:6].capitalize()}\n{ref_label} c={conc}',
+                            workload, ref_payload, conc))
+        if largest is not None and largest != ref_payload:
+            corners.append((f'{workload[:6].capitalize()}\n{format_size(largest)} c={conc}',
+                            workload, largest, conc))
+        if peak_conc is not None and peak_conc != conc and ref_payload is not None:
+            corners.append((f'{workload[:6].capitalize()}\n{ref_label} c={peak_conc}',
+                            workload, ref_payload, peak_conc))
+
+    adv = []
+    for t in m.transports:
+        if t == BASELINE:
+            continue
+        adv.append((t, [m.latency_speedup(w, t, p, c) for _lab, w, p, c in corners]))
+    if corners and _any_value(adv):
+        grouped_bars(ax, [lab for lab, _w, _p, _c in corners], adv, fontsize=8)
+        ax.set_ylabel(f'Latency speedup vs {transport_label(BASELINE)} (x)')
+        ax.set_title(f'Performance Advantage over {transport_label(BASELINE)}\n'
+                     f'(higher is better)', fontweight='bold')
+        ax.axhline(y=1, color='gray', linestyle='--', alpha=0.5)
+        ax.legend(loc='upper right', fontsize=8)
+    else:
+        _no_data(ax, f'Performance Advantage over {transport_label(BASELINE)}')
 
     # ============================================================
-    # ROW 7: Text Summary
+    # ROW 7: text summary
     # ============================================================
     ax = fig.add_subplot(gs[6, :])
     ax.axis('off')
 
-    cpu_full = data.get("cpu", "")
-    summary_lines = [
-        "\u2550" * 120,
-        "BENCHMARK SUMMARY  -  Streaming vs Unary RPC across all payload sizes",
-        "\u2550" * 120,
+    sep = "═" * 118
+    lines = [
+        sep,
+        f"BENCHMARK SUMMARY  -  gRFC G3 matrix, {transport_label(BASELINE)} baseline "
+        f"(latency ratios are {BASELINE}/transport; >1 means the transport wins)",
+        sep,
         "",
     ]
+    for workload in (m.workloads or []):
+        for p in payloads:
+            cells = [(t, m.value(workload, t, p, conc, "p50"),
+                      m.value(workload, t, p, conc, "throughput_mb_per_s"))
+                     for t in m.transports]
+            cells = [c for c in cells if c[1] is not None or c[2] is not None]
+            if not cells:
+                continue
+            parts = []
+            for t, lat, tp in cells:
+                lat_s = f'{lat:.2f}us' if lat is not None else 'n/a'
+                tp_s = f'{tp:.0f}MB/s' if tp is not None else 'n/a'
+                parts.append(f'{transport_label(t)} {lat_s}/{tp_s}')
+            sp = m.latency_speedup(workload, 'shm', p, conc)
+            sp_s = f'   SHM vs UDS: {sp:.2f}x' if sp is not None else ''
+            lines.append(f"{workload.upper():<10} {format_size(p):>6} (c={conc}):  "
+                         + "   ".join(parts) + sp_s)
+    if len(lines) == 4:
+        lines.append("No measured cells.")
+    if m.skipped:
+        lines += ["", f"SKIPPED ({len(m.skipped)}): "
+                      + "; ".join(str(s) for s in m.skipped[:3])
+                      + (" ..." if len(m.skipped) > 3 else "")]
+    lines += ["", f"{m.subtitle()}", sep]
 
-    shm_rt = data["shm_rt_latency"]
-    tcp_rt = data["tcp_rt_latency"]
-    shm_lat = data["shm_stream_latency"]
-    tcp_lat = data["tcp_stream_latency"]
-
-    if shm_rt and tcp_rt and shm_rt[1] and tcp_rt[1]:
-        unary_speedup = tcp_rt[1] / shm_rt[1]
-        summary_lines.append(
-            f"UNARY RPC (1KB):         SHM: {shm_rt[1]:.0f} ns    TCP: {tcp_rt[1]:.0f} ns    "
-            f"Speedup: {unary_speedup:.1f}x vs TCP")
-
-    if shm_lat and tcp_lat and shm_lat[1] and tcp_lat[1]:
-        stream_speedup = tcp_lat[1] / shm_lat[1]
-        summary_lines.append(
-            f"STREAMING (1KB):         SHM: {shm_lat[1]:.0f} ns    TCP: {tcp_lat[1]:.0f} ns    "
-            f"Speedup: {stream_speedup:.1f}x vs TCP")
-
-    if valid_stream_idx and 2 in valid_stream_idx:
-        shm_v = shm_large_stream_tp[2] / 1000
-        tcp_v = (tcp_large_stream_tp[2] or 0) / 1000
-        summary_lines.append(
-            f"STREAMING (4MB):         SHM: {shm_v:.2f} GB/s    TCP: {tcp_v:.2f} GB/s")
-
-    if valid_rt_idx and 2 in valid_rt_idx:
-        shm_v = shm_large_rt_tp[2] / 1000
-        tcp_v = (tcp_large_rt_tp[2] or 0) / 1000
-        summary_lines.append(
-            f"UNARY RPC (4MB):         SHM: {shm_v:.2f} GB/s    TCP: {tcp_v:.2f} GB/s")
-
-    summary_lines.extend(["", f"CPU: {cpu_full}    Runtime: {runtime}    Ring Buffer: 64 MiB", "\u2550" * 120])
-
-    summary_text = "\n".join(summary_lines)
-    ax.text(0.5, 0.5, summary_text, transform=ax.transAxes, fontsize=10,
+    ax.text(0.5, 0.5, "\n".join(lines), transform=ax.transAxes, fontsize=9,
             verticalalignment='center', horizontalalignment='center',
             fontfamily='monospace',
             bbox=dict(boxstyle='round', facecolor='#f0f0f0', edgecolor='gray', alpha=0.8))
 
-    # Save
-    consolidated_file = OUT_DIR / "benchmark_consolidated.png"
+    consolidated_file = out_dir / "benchmark_consolidated.png"
     plt.savefig(consolidated_file, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close()
     print(f"Created: {consolidated_file}")
@@ -1050,9 +1027,21 @@ def generate_consolidated_plot(data: dict):
     return consolidated_file
 
 
-def generate_cross_platform_plots(win_results: dict, lin_results: dict):
-    """Generate cross-platform comparison plots (Windows vs Linux)."""
-    compare_dir = OUT_ROOT / "comparison"
+# =========================================================================
+# Cross-platform comparison
+# =========================================================================
+
+PLATFORM_STYLES = ['-', '--', ':', '-.']
+
+
+def generate_cross_platform_plots(matrices: list, out_dir: Path = None):
+    """Compare the same matrix measured on several platforms/arms.
+
+    *matrices* is [(label, Matrix)]. Series are generated from the transports
+    actually present in each file -- colour encodes the transport, line style
+    encodes the platform, so a 2- or 4-transport run needs no code change.
+    """
+    compare_dir = out_dir or (OUT_ROOT / "comparison")
     compare_dir.mkdir(parents=True, exist_ok=True)
 
     plt.style.use('default')
@@ -1064,245 +1053,231 @@ def generate_cross_platform_plots(win_results: dict, lin_results: dict):
         'font.size': 10,
     })
 
-    all_sizes = [0, 1, 1024, 4096, 16384, 65536, 262144, 524288, 1048576, 2097152, 4194304]
-    all_labels = [format_size(s) for s in all_sizes]
-
-    def _lookup(results):
-        u, s = {}, {}
-        for e in results.get("unary", []):
-            u[(e["transport"], e["size_bytes"])] = e
-        for e in results.get("streaming", []):
-            s[(e["transport"], e["size_bytes"])] = e
-        return u, s
-
-    win_u, win_s = _lookup(win_results)
-    lin_u, lin_s = _lookup(lin_results)
-
-    def _lat(lookup, transport, size):
-        e = lookup.get((transport, size))
-        return e["avg_latency_us"] if e else None
-
-    def _tp(lookup, transport, size):
-        e = lookup.get((transport, size))
-        return e["throughput_mb_per_s"] if e else None
-
-    win_cpu = win_results.get("cpu", "Windows")[:45]
-    lin_cpu = lin_results.get("cpu", "Linux")[:45]
+    all_payloads = sorted({p for _lab, m in matrices for p in m.payloads})
+    all_labels = [format_size(p) for p in all_payloads]
+    workloads = []
+    for _lab, m in matrices:
+        for w in m.workloads:
+            if w not in workloads:
+                workloads.append(w)
 
     # ================================================================
-    # Plot 1: SHM/TCP Ratio comparison (bar chart)
+    # Plot 1: SHM speedup over the UDS baseline, per platform
     # ================================================================
-    for rpc_type, type_label, u_win, u_lin in [
-        ("unary", "Unary Ping-Pong", win_u, lin_u),
-        ("streaming", "Streaming Ping-Pong", win_s, lin_s),
-    ]:
-        win_ratios, lin_ratios = [], []
-        valid_labels = []
-        for i, s in enumerate(all_sizes):
-            wt = _lat(u_win, "tcp", s)
-            ws = _lat(u_win, "shm", s)
-            lt = _lat(u_lin, "tcp", s)
-            ls = _lat(u_lin, "shm", s)
-            if wt and ws and lt and ls:
-                win_ratios.append(ws / wt)
-                lin_ratios.append(ls / lt)
-                valid_labels.append(all_labels[i])
+    for workload in workloads:
+        series = []
+        for label, m in matrices:
+            conc = m.ref_concurrency()
+            series.append((label,
+                           [m.latency_speedup(workload, 'shm', p, conc)
+                            for p in all_payloads]))
 
-        if not valid_labels:
+        if not any(v is not None for _l, vals in series for v in vals):
             continue
 
         fig, ax = plt.subplots(figsize=(14, 6))
-        x = np.arange(len(valid_labels))
-        w = 0.35
-        ax.bar(x - w/2, win_ratios, w, label=f'Windows ({win_cpu[:25]})',
-               color='#4472C4', edgecolor='black', linewidth=0.5)
-        ax.bar(x + w/2, lin_ratios, w, label=f'Linux ({lin_cpu[:25]})',
-               color='#70AD47', edgecolor='black', linewidth=0.5)
-        ax.axhline(y=1.0, color='#e74c3c', linestyle='--', linewidth=1.5, alpha=0.8, label='Break-even (1.0)')
+        x = np.arange(len(all_labels))
+        n = len(series)
+        w = 0.8 / n
+        for i, (label, vals) in enumerate(series):
+            offset = (i - (n - 1) / 2) * w
+            ax.bar(x + offset, [np.nan if v is None else v for v in vals], w,
+                   label=label, color=FALLBACK_COLORS[i % len(FALLBACK_COLORS)],
+                   edgecolor='black', linewidth=0.5)
+            for j, v in enumerate(vals):
+                if v is not None:
+                    ax.annotate(f'{v:.2f}', xy=(x[j] + offset, v), xytext=(0, 3),
+                                textcoords='offset points', ha='center', fontsize=8,
+                                fontweight='bold')
+        for j in range(len(all_labels)):
+            if all(vals[j] is None for _l, vals in series):
+                ax.annotate('No data', xy=(x[j], 0.03), xycoords=('data', 'axes fraction'),
+                            ha='center', va='bottom', fontsize=7,
+                            color='#888888', rotation=90)
+
+        ax.axhline(y=1.0, color='#e74c3c', linestyle='--', linewidth=1.5, alpha=0.8,
+                   label='Break-even (1.0)')
         ax.set_xlabel('Payload Size', fontsize=12)
-        ax.set_ylabel('SHM / TCP Ratio (lower = SHM wins)', fontsize=12)
-        ax.set_title(f'{type_label}: SHM/TCP Latency Ratio\nWindows vs Linux', fontsize=14, fontweight='bold')
-        ax.set_xticks(x); ax.set_xticklabels(valid_labels)
+        ax.set_ylabel(f'SHM speedup vs {transport_label(BASELINE)} (x, higher = SHM wins)',
+                      fontsize=12)
+        ax.set_title(f'{workload.capitalize()}: SHM Latency Speedup over '
+                     f'{transport_label(BASELINE)}', fontsize=14, fontweight='bold')
+        ax.set_xlim(-0.5, len(all_labels) - 0.5)
+        ax.margins(y=0.15)  # headroom so the value labels clear the legend
+        ax.set_xticks(x)
+        ax.set_xticklabels(all_labels)
         ax.legend(loc='upper right')
 
-        for i, (wr, lr) in enumerate(zip(win_ratios, lin_ratios)):
-            ax.annotate(f'{wr:.2f}', xy=(i - w/2, wr), xytext=(0, 3),
-                       textcoords='offset points', ha='center', fontsize=8, color='#4472C4', fontweight='bold')
-            ax.annotate(f'{lr:.2f}', xy=(i + w/2, lr), xytext=(0, 3),
-                       textcoords='offset points', ha='center', fontsize=8, color='#70AD47', fontweight='bold')
-
         plt.tight_layout()
-        fname = compare_dir / f"{rpc_type}_ratio.png"
+        fname = compare_dir / f"{workload}_speedup.png"
         plt.savefig(fname, dpi=150, bbox_inches='tight', facecolor='white')
         plt.close()
         print(f"Created: {fname}")
 
     # ================================================================
-    # Plot 2: Latency comparison (4-line log-scale)
+    # Plots 2 & 3: latency / throughput lines, one series per
+    #              (platform, transport) pair present in the data
     # ================================================================
-    colors4 = {
-        'Win TCP': '#4472C4', 'Win SHM': '#C0504D',
-        'Lin TCP': '#70AD47', 'Lin SHM': '#ED7D31',
-    }
-    styles4 = {
-        'Win TCP': '-', 'Win SHM': '-',
-        'Lin TCP': '--', 'Lin SHM': '--',
-    }
+    for metric, unit, fname_suffix, marker in (
+            ("p50", "Latency p50 (µs, log scale)", "latency", 'o'),
+            ("throughput_mb_per_s", "Throughput (MB/s, log scale)", "throughput", 's')):
+        for workload in workloads:
+            fig, ax = plt.subplots(figsize=(14, 7))
+            plotted = False
+            for pi, (label, m) in enumerate(matrices):
+                conc = m.ref_concurrency()
+                style = PLATFORM_STYLES[pi % len(PLATFORM_STYLES)]
+                for transport in m.transports:
+                    xs, ys = [], []
+                    for i, p in enumerate(all_payloads):
+                        v = m.value(workload, transport, p, conc, metric)
+                        if v is not None and v > 0:
+                            xs.append(i)
+                            ys.append(v)
+                    if xs:
+                        plotted = True
+                        ax.plot(xs, ys, marker=marker, markersize=5,
+                                color=transport_color(transport), linestyle=style,
+                                linewidth=2,
+                                label=f'{label} {transport_label(transport)}')
 
-    for rpc_type, type_label, w_lk, l_lk in [
-        ("unary", "Unary Ping-Pong", win_u, lin_u),
-        ("streaming", "Streaming Ping-Pong", win_s, lin_s),
-    ]:
-        fig, ax = plt.subplots(figsize=(14, 7))
-        for series_name, lookup, transport in [
-            ('Win TCP', w_lk, 'tcp'), ('Win SHM', w_lk, 'shm'),
-            ('Lin TCP', l_lk, 'tcp'), ('Lin SHM', l_lk, 'shm'),
-        ]:
-            vals, labels = [], []
-            for i, s in enumerate(all_sizes):
-                v = _lat(lookup, transport, s)
-                if v and v > 0:
-                    vals.append(v)
-                    labels.append(i)
-            if vals:
-                ax.plot(labels, vals, marker='o', markersize=5,
-                       color=colors4[series_name], linestyle=styles4[series_name],
-                       linewidth=2, label=series_name)
+            if not plotted:
+                plt.close()
+                continue
 
-        ax.set_yscale('log')
-        ax.set_xlabel('Payload Size', fontsize=12)
-        ax.set_ylabel('Latency (µs, log scale)', fontsize=12)
-        ax.set_title(f'{type_label}: Latency Comparison\nWindows vs Linux (log scale)',
-                    fontsize=14, fontweight='bold')
-        ax.set_xticks(range(len(all_labels)))
-        ax.set_xticklabels(all_labels, fontsize=9)
-        ax.legend(loc='upper left', fontsize=10)
-        ax.grid(True, alpha=0.3)
+            ax.set_yscale('log')
+            ax.set_xlabel('Payload Size', fontsize=12)
+            ax.set_ylabel(unit, fontsize=12)
+            ax.set_title(f'{workload.capitalize()}: {fname_suffix.capitalize()} '
+                         f'Comparison (log scale)', fontsize=14, fontweight='bold')
+            ax.set_xticks(range(len(all_labels)))
+            ax.set_xticklabels(all_labels, fontsize=9)
+            ax.legend(loc='upper left', fontsize=9)
+            ax.grid(True, alpha=0.3)
 
-        plt.tight_layout()
-        fname = compare_dir / f"{rpc_type}_latency.png"
-        plt.savefig(fname, dpi=150, bbox_inches='tight', facecolor='white')
-        plt.close()
-        print(f"Created: {fname}")
-
-    # ================================================================
-    # Plot 3: Throughput comparison (4-line)
-    # ================================================================
-    for rpc_type, type_label, w_lk, l_lk in [
-        ("unary", "Unary Ping-Pong", win_u, lin_u),
-        ("streaming", "Streaming Ping-Pong", win_s, lin_s),
-    ]:
-        fig, ax = plt.subplots(figsize=(14, 7))
-        for series_name, lookup, transport in [
-            ('Win TCP', w_lk, 'tcp'), ('Win SHM', w_lk, 'shm'),
-            ('Lin TCP', l_lk, 'tcp'), ('Lin SHM', l_lk, 'shm'),
-        ]:
-            vals, labels = [], []
-            for i, s in enumerate(all_sizes):
-                v = _tp(lookup, transport, s)
-                if v and v > 0:
-                    vals.append(v)
-                    labels.append(i)
-            if vals:
-                ax.plot(labels, vals, marker='s', markersize=5,
-                       color=colors4[series_name], linestyle=styles4[series_name],
-                       linewidth=2, label=series_name)
-
-        ax.set_yscale('log')
-        ax.set_xlabel('Payload Size', fontsize=12)
-        ax.set_ylabel('Throughput (MB/s, log scale)', fontsize=12)
-        ax.set_title(f'{type_label}: Throughput Comparison\nWindows vs Linux (log scale)',
-                    fontsize=14, fontweight='bold')
-        ax.set_xticks(range(len(all_labels)))
-        ax.set_xticklabels(all_labels, fontsize=9)
-        ax.legend(loc='upper left', fontsize=10)
-        ax.grid(True, alpha=0.3)
-
-        plt.tight_layout()
-        fname = compare_dir / f"{rpc_type}_throughput.png"
-        plt.savefig(fname, dpi=150, bbox_inches='tight', facecolor='white')
-        plt.close()
-        print(f"Created: {fname}")
+            plt.tight_layout()
+            fname = compare_dir / f"{workload}_{fname_suffix}.png"
+            plt.savefig(fname, dpi=150, bbox_inches='tight', facecolor='white')
+            plt.close()
+            print(f"Created: {fname}")
 
     print(f"\nAll cross-platform plots saved to: {compare_dir}")
 
 
+def _matrix_label(path: Path, m: Matrix) -> str:
+    """Short series label: OS + arm, falling back to the containing dir."""
+    bits = [m.os_label if m.os_label != '?' else path.parent.name]
+    if m.arm != '?':
+        bits.append(m.arm)
+    return '/'.join(bits)
+
+
+# =========================================================================
+# Entry point
+# =========================================================================
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Run .NET gRPC benchmarks (SHM vs TCP) and generate plots',
+        description='Run the .NET gRFC G3 benchmark matrix (SHM vs UDS baseline, '
+                    'TCP supplementary) and generate plots',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python benchmark_runner.py              # Use cached results or run if none
-  python benchmark_runner.py --run        # Force rerun benchmarks
-  python benchmark_runner.py --plot-only  # Only plot, fail if no cached data
-  python benchmark_runner.py --compare    # Cross-platform comparison (win vs lin)
+  python benchmark_runner.py                       # Use cached results or run if none
+  python benchmark_runner.py --run                 # Force rerun the matrix (tuned arm)
+  python benchmark_runner.py --run --fair          # Run the fair arm
+  python benchmark_runner.py --plot-only           # Only plot, fail if no cached data
+  python benchmark_runner.py --results out/linux/fair/results.json --plot-only
+  python benchmark_runner.py --compare out/windows/results.json out/linux/results.json
         """
     )
     parser.add_argument('--run', action='store_true',
-                       help='Force rerun benchmarks even if cached results exist')
+                        help='Force rerun the benchmark matrix even if cached results exist')
     parser.add_argument('--plot-only', action='store_true',
-                       help='Only generate plots, fail if no cached results')
-    parser.add_argument('--compare', action='store_true',
-                       help='Generate cross-platform comparison plots (Windows vs Linux)')
+                        help='Only generate plots, fail if no cached results')
+    parser.add_argument('--compare', nargs='*', metavar='RESULTS',
+                        help='Cross-platform comparison plots; defaults to '
+                             'out/windows/results.json + out/linux/results.json')
+    parser.add_argument('--results', metavar='PATH', default=str(RESULTS_FILE),
+                        help=f'results.json to read/write (default: {RESULTS_FILE})')
+
+    run_opts = parser.add_argument_group('matrix run options (used with --run)')
+    run_opts.add_argument('--fair', action='store_true',
+                          help='Run the fair arm (ringbench --fair); default is tuned')
+    run_opts.add_argument('--transports', metavar='CSV',
+                          help='Transports to measure, e.g. shm,uds,tcp')
+    run_opts.add_argument('--workloads', metavar='CSV',
+                          help='Workloads to measure, e.g. unary,streaming')
+    run_opts.add_argument('--payloads', metavar='CSV',
+                          help='Payload sizes in bytes, e.g. 1,1024,65536')
+    run_opts.add_argument('--concurrency', metavar='CSV',
+                          help='Concurrency levels, e.g. 1,8,64')
+    run_opts.add_argument('--warmup-s', metavar='SEC', help='Warmup seconds per cell')
+    run_opts.add_argument('--duration-s', metavar='SEC', help='Measured seconds per cell')
+    run_opts.add_argument('--reps', metavar='N', help='Repetitions per cell')
+    run_opts.add_argument('--timeout', type=int, default=DEFAULT_RUN_TIMEOUT_S,
+                          metavar='SEC',
+                          help=f'Subprocess timeout in seconds, 0 to disable '
+                               f'(default: {DEFAULT_RUN_TIMEOUT_S})')
 
     args = parser.parse_args()
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    results_file = Path(args.results)
+    out_dir = results_file.parent
 
     # Cross-platform comparison mode
-    if args.compare:
-        win_file = OUT_ROOT / "windows" / "results.json"
-        lin_file = OUT_ROOT / "linux" / "results.json"
-        if not win_file.exists() or not lin_file.exists():
-            print(f"ERROR: Need both {win_file} and {lin_file}")
-            sys.exit(1)
-        with open(win_file) as f:
-            win_results = json.load(f)
-        with open(lin_file) as f:
-            lin_results = json.load(f)
-        print(f"Windows: {win_results.get('cpu', '?')}")
-        print(f"Linux:   {lin_results.get('cpu', '?')}")
-        generate_cross_platform_plots(win_results, lin_results)
+    if args.compare is not None:
+        paths = [Path(p) for p in args.compare] or [
+            OUT_ROOT / "windows" / "results.json",
+            OUT_ROOT / "linux" / "results.json",
+        ]
+        matrices = []
+        for p in paths:
+            if not p.exists():
+                print(f"ERROR: Missing results file: {p}")
+                sys.exit(1)
+            m = load_matrix(p)
+            if m is None:
+                sys.exit(1)
+            matrices.append((_matrix_label(p, m), m))
+        generate_cross_platform_plots(matrices)
         return 0
 
-    results = None
-
     if args.run:
-        results = run_ringbench()
-        if not results:
+        m = run_ringbench(args, results_file)
+        if m is None:
             print("ERROR: Benchmark run failed")
             sys.exit(1)
     elif args.plot_only:
-        results = load_results()
-        if not results:
-            print("ERROR: No cached results found. Run with --run first.")
+        m = load_matrix(results_file)
+        if m is None:
+            print(f"ERROR: No usable results at {results_file}. Run with --run first.")
             sys.exit(1)
     else:
-        results = load_results()
-        if not results:
+        m = load_matrix(results_file)
+        if m is None:
             print("No cached results found, running benchmarks...")
-            results = run_ringbench()
-            if not results:
+            m = run_ringbench(args, results_file)
+            if m is None:
                 print("ERROR: Benchmark run failed")
                 sys.exit(1)
 
-    if not results.get("unary") and not results.get("streaming"):
-        print("WARNING: No benchmark data found; plots will contain placeholders only.")
+    if not m.cells:
+        print("WARNING: results.json contains no runs; plots will say 'No data'.")
+    if not m.has_baseline():
+        print(f"WARNING: no '{BASELINE}' rows found -- the gRFC G3 baseline is "
+              f"missing, so speedup panels will be empty. Re-run with "
+              f"--transports shm,{BASELINE}[,tcp].")
 
-    # Extract data and generate plots
-    data = extract_data(results)
-    plot_files = generate_plots(data)
-
-    # Generate consolidated plot
-    consolidated_file = generate_consolidated_plot(data)
+    plot_files = generate_plots(m, out_dir)
+    consolidated_file = generate_consolidated_plot(m, out_dir)
 
     print("\n" + "=" * 70)
     print("BENCHMARK PLOTS GENERATED")
     print("=" * 70)
     for f in plot_files:
         print(f"  {f}")
-    print(f"  {consolidated_file}  \u2190 CONSOLIDATED (all data)")
+    print(f"  {consolidated_file}  <-- CONSOLIDATED (all data)")
     print(f"\nConsolidated plot: {consolidated_file}")
 
     return 0

@@ -51,6 +51,10 @@ string? onlySizes = null;
 bool runConcurrent = false;
 int[] concurrentLevels = new[] { 10, 100, 1000 };
 int[] concurrentSizes = new[] { 64, 4096, 65536, 262144, 1048576 };
+// --matrix: gRFC G3 contract sweep (see Matrix.cs). Mutually exclusive with
+// the legacy unary/streaming/concurrent sweep below.
+bool matrixMode = false;
+var matrixOptions = new MatrixOptions();
 // Static field so static local functions can access it.
 // Controlled by --no-single-stream CLI flag.
 ShmBenchConfig.SingleStream = true;
@@ -188,7 +192,37 @@ for (int i = 0; i < args.Length; i++)
         concurrentSizes = args[++i].Split(',').Select(s => int.Parse(s.Trim(), CultureInfo.InvariantCulture)).ToArray();
     if (args[i] == "--inline-rx")
         ShmBenchConfig.InlineReceive = true;
+
+    // ---- gRFC G3 contract matrix (Matrix.cs) ----
+    if (args[i] == "--matrix")
+        matrixMode = true;
+    if (args[i] == "--matrix-transports")
+        matrixOptions.Transports = SplitCsv(args[++i]);
+    if (args[i] == "--matrix-workloads")
+        matrixOptions.Workloads = SplitCsv(args[++i]);
+    if (args[i] == "--matrix-payloads")
+        matrixOptions.Payloads = SplitCsvInt(args[++i]);
+    if (args[i] == "--matrix-concurrency")
+        matrixOptions.Concurrency = SplitCsvInt(args[++i]);
+    if (args[i] == "--matrix-warmup-s")
+        matrixOptions.WarmupSeconds = double.Parse(args[++i], CultureInfo.InvariantCulture);
+    if (args[i] == "--matrix-duration-s")
+        matrixOptions.DurationSeconds = double.Parse(args[++i], CultureInfo.InvariantCulture);
+    if (args[i] == "--matrix-reps")
+        matrixOptions.Repetitions = int.Parse(args[++i], CultureInfo.InvariantCulture);
+    if (args[i] == "--matrix-out")
+        matrixOptions.OutPath = args[++i];
+    if (args[i] == "--matrix-commit")
+        matrixOptions.CommitOverride = args[++i];
 }
+
+static string[] SplitCsv(string s) =>
+    s.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+     .Select(x => x.ToLowerInvariant()).ToArray();
+
+static int[] SplitCsvInt(string s) =>
+    s.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+     .Select(x => int.Parse(x, CultureInfo.InvariantCulture)).ToArray();
 
 if (serverMode)
 {
@@ -210,6 +244,22 @@ Directory.CreateDirectory(outDir);
 var cleaned = Segment.TryRemoveSegmentsByPrefix("bench_shm_");
 if (cleaned > 0)
     Console.WriteLine($"Cleaned {cleaned} stale SHM segment(s) from previous runs.");
+
+// --matrix: run the gRFC G3 contract sweep instead of the legacy sweep.
+// Segment hygiene is inherited from the env factories (each StartShmEnv /
+// dispose pair removes both `<name>` and `<name>_ctl`), plus the
+// TryRemoveSegmentsByPrefix sweep above.
+if (matrixMode)
+{
+    await MatrixRunner.RunAsync(matrixOptions, async transport => transport switch
+    {
+        "tcp" => await StartTcpEnv(),
+        "uds" => await StartUdsEnv(),
+        "shm" => await StartShmEnv(),
+        _ => throw new ArgumentException($"Unknown transport '{transport}'"),
+    });
+    return;
+}
 
 // Benchmark sizes
 int[] sizes = { 0, 1, 1024, 4096, 16384, 65536, 262144, 524288, 1048576, 2097152, 4194304,
