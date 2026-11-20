@@ -185,26 +185,43 @@ static class MatrixRunner
 
         foreach (var transport in opt.Transports)
         {
-            BenchEnv? env = null;
-            try
-            {
-                env = await startEnv(transport).ConfigureAwait(false);
-                Console.WriteLine($"--- transport={transport} ---");
+            Console.WriteLine($"--- transport={transport} ---");
 
-                foreach (var workload in opt.Workloads)
-                foreach (var payload in opt.Payloads)
-                foreach (var conc in opt.Concurrency)
+            foreach (var workload in opt.Workloads)
+            foreach (var payload in opt.Payloads)
+            foreach (var conc in opt.Concurrency)
+            {
+                string cellId = $"{transport}/{workload}/{payload}B/c{conc}";
+                var samples = new List<CellSample>();
+
+                // One fresh client/server process pair per cell.
+                //
+                // Payloads at and above 85 KB land on the Large Object Heap,
+                // which Server GC collects only on gen2 and never compacts by
+                // default. On a 64 GB machine nothing creates the memory
+                // pressure that would force that collection, so a single
+                // long-lived process accumulates tens of GB of dead LOH
+                // buffers: two full-matrix attempts were OOM killed, the
+                // second at 43 GB RSS by the 256 KiB cells. The server runs in
+                // its own process, so collecting in the client alone cannot
+                // fix it - the pair has to be recycled.
+                //
+                // This also makes rss_peak_mb a per-cell number instead of the
+                // running high-water mark of every cell measured before it.
+                ReclaimHeap();
+                BenchEnv? env = null;
+                try
                 {
-                    string cellId = $"{transport}/{workload}/{payload}B/c{conc}";
-                    var samples = new List<CellSample>();
+                    env = await startEnv(transport).ConfigureAwait(false);
 
                     for (int rep = 0; rep < opt.Repetitions; rep++)
                     {
                         // A hung cell must not kill a multi-hour matrix run.
                         // Budget generously (3x nominal + 120 s) so only a
-                        // genuine stall trips it, then tear the env down and
-                        // rebuild it: a timed-out cell may have left streams
-                        // or flow-control state wedged.
+                        // genuine stall trips it. The remaining repetitions of
+                        // this cell are abandoned; the finally below disposes
+                        // the process pair, so the next cell starts clean
+                        // regardless of what the stall left wedged.
                         var budget = TimeSpan.FromSeconds(
                             (opt.WarmupSeconds + opt.DurationSeconds) * 3 + 120);
                         using var cts = new CancellationTokenSource(budget);
@@ -226,29 +243,23 @@ static class MatrixRunner
                                 : ex.GetType().Name + ": " + ex.Message;
                             Console.WriteLine($"  {cellId} rep{rep + 1}: FAILED ({why})");
                             skipped.Add($"{cellId} rep{rep + 1}: {why}");
-
-                            // Rebuild the env before continuing.
-                            try { if (env != null) await env.DisposeAsync().ConfigureAwait(false); }
-                            catch { /* best effort */ }
-                            env = null;
-                            await Task.Delay(500).ConfigureAwait(false);
-                            env = await startEnv(transport).ConfigureAwait(false);
                             break; // abandon remaining reps for this cell
                         }
                     }
 
-                    if (samples.Count > 0)
-                        runs.Add(BuildRun(workload, transport, payload, conc, opt, samples));
-                    Checkpoint();
                 }
-            }
-            finally
-            {
-                if (env != null)
+                finally
                 {
-                    try { await env.DisposeAsync().ConfigureAwait(false); }
-                    catch (Exception ex) { Console.WriteLine($"  env dispose failed: {ex.Message}"); }
+                    if (env != null)
+                    {
+                        try { await env.DisposeAsync().ConfigureAwait(false); }
+                        catch (Exception ex) { Console.WriteLine($"  env dispose failed: {ex.Message}"); }
+                    }
                 }
+
+                if (samples.Count > 0)
+                    runs.Add(BuildRun(workload, transport, payload, conc, opt, samples));
+                Checkpoint();
             }
         }
 
@@ -261,6 +272,20 @@ static class MatrixRunner
         Console.WriteLine($"Wrote {runs.Count} cells to {Path.GetFullPath(opt.OutPath)}");
         if (skipped.Count > 0)
             Console.WriteLine($"{skipped.Count} cell-repetition(s) failed; see \"skipped\" in results.json");
+    }
+
+    /// <summary>
+    /// Forces a blocking, compacting gen2 collection and returns the freed
+    /// pages to the OS. Called only between cells, never inside a measured
+    /// window, so it cannot flatter or penalise any transport.
+    /// </summary>
+    static void ReclaimHeap()
+    {
+        System.Runtime.GCSettings.LargeObjectHeapCompactionMode =
+            System.Runtime.GCLargeObjectHeapCompactionMode.CompactOnce;
+        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        GC.WaitForPendingFinalizers();
+        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
     }
 
     static void WriteResults(Dictionary<string, object?> meta, string outPath)
