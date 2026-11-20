@@ -1824,16 +1824,20 @@ static class ShmBenchConfig
 
 static class PayloadCache
 {
-    private static readonly Dictionary<int, byte[]> Cache = new();
-    public static byte[] GetOrCreate(int size)
-    {
-        if (!Cache.TryGetValue(size, out var bytes))
-        {
-            bytes = new byte[size];
-            Cache[size] = bytes;
-        }
-        return bytes;
-    }
+    // Concurrent, because the server handler hits this from one thread per
+    // in-flight RPC. A plain Dictionary raced on the first insert per payload
+    // size - every matrix cell starts a fresh server process with an empty
+    // cache, so the first N concurrent requests all tried to insert the same
+    // key at once. That surfaced as the server throwing
+    // "Operations that change non-concurrent collections must have exclusive
+    // access", reported to the client as an Internal RpcException, which
+    // killed whole benchmark cells.
+    //
+    // Only availability was affected, never the measurements: GetOrCreate
+    // always returns a correctly sized buffer even when the race is lost.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte[]> Cache = new();
+    public static byte[] GetOrCreate(int size) =>
+        Cache.GetOrAdd(size, static s => new byte[s]);
 }
 
 // ============================================================================
