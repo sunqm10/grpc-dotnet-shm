@@ -214,6 +214,8 @@ for (int i = 0; i < args.Length; i++)
         matrixOptions.OutPath = args[++i];
     if (args[i] == "--matrix-commit")
         matrixOptions.CommitOverride = args[++i];
+    if (args[i] == "--matrix-resume")
+        matrixOptions.Resume = true;
 }
 
 static string[] SplitCsv(string s) =>

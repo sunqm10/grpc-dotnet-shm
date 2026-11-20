@@ -145,6 +145,12 @@ sealed class MatrixOptions
     public int Repetitions = 3;
     public string OutPath = "results.json";
     public string? CommitOverride;
+    /// <summary>
+    /// Keep the cells already present in <see cref="OutPath"/> and measure only
+    /// what is missing. Lets a multi-hour matrix survive an interruption
+    /// without redoing hours of completed work.
+    /// </summary>
+    public bool Resume;
 }
 
 static class MatrixRunner
@@ -165,6 +171,51 @@ static class MatrixRunner
         var meta = BuildMetadata(opt);
         var runs = new List<Dictionary<string, object?>>();
         var skipped = new List<string>();
+
+        // --matrix-resume: adopt whatever a previous run already measured.
+        // Cells are keyed exactly as the contract identifies them.
+        var done = new HashSet<string>(StringComparer.Ordinal);
+        if (opt.Resume && File.Exists(opt.OutPath))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(File.ReadAllText(opt.OutPath));
+                var root = doc.RootElement;
+                string? prevCommit = root.TryGetProperty("commit", out var c) ? c.GetString() : null;
+                if (prevCommit != null && prevCommit != (string?)meta["commit"])
+                {
+                    Console.WriteLine($"NOTE: resuming a file measured at {prevCommit[..12]}, " +
+                                      $"now running {((string?)meta["commit"])![..12]}. " +
+                                      "Carried-over cells keep their original commit via measured_at_commit.");
+                }
+                foreach (var r in root.GetProperty("runs").EnumerateArray())
+                {
+                    var dict = JsonSerializer.Deserialize<Dictionary<string, object?>>(r.GetRawText())!;
+                    // Stamp provenance so a mixed file never misrepresents
+                    // which build produced which number.
+                    if (prevCommit != null && prevCommit != (string?)meta["commit"] &&
+                        !dict.ContainsKey("measured_at_commit"))
+                    {
+                        dict["measured_at_commit"] = prevCommit;
+                    }
+                    runs.Add(dict);
+                    done.Add($"{r.GetProperty("transport").GetString()}/" +
+                             $"{r.GetProperty("workload").GetString()}/" +
+                             $"{r.GetProperty("payload_bytes").GetInt32()}B/" +
+                             $"c{r.GetProperty("concurrency").GetInt32()}");
+                }
+                if (root.TryGetProperty("skipped", out var sk))
+                    foreach (var s in sk.EnumerateArray())
+                        if (s.GetString() is { } str) skipped.Add(str);
+                Console.WriteLine($"Resuming: {done.Count} cell(s) already measured, will be kept.");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Could not resume from {opt.OutPath}: {ex.Message}");
+                Console.WriteLine("Refusing to silently start over - fix or remove the file.");
+                return;
+            }
+        }
 
         // Checkpoint after every cell. A full matrix is hours long, and an
         // interruption (OOM reaper, Ctrl-C, reboot) must not discard everything
@@ -192,6 +243,11 @@ static class MatrixRunner
             foreach (var conc in opt.Concurrency)
             {
                 string cellId = $"{transport}/{workload}/{payload}B/c{conc}";
+                if (done.Contains(cellId))
+                {
+                    Console.WriteLine($"  {cellId}: already measured, skipping");
+                    continue;
+                }
                 var samples = new List<CellSample>();
 
                 // One fresh client/server process pair per cell.
@@ -214,6 +270,28 @@ static class MatrixRunner
                 {
                     env = await startEnv(transport).ConfigureAwait(false);
 
+                    // Streaming opens its streams ONCE for the whole cell.
+                    //
+                    // Opening a fresh set per repetition made rep2 fail with
+                    // "max concurrent streams exceeded" on EVERY shm streaming
+                    // c64 cell: closing a stream client-side does not release
+                    // the server-side slot synchronously, so 64 new streams
+                    // plus 64 still draining exceeded the 100-stream default.
+                    // That cost those cells two of their three repetitions.
+                    //
+                    // Reusing the streams also matches what the workload is
+                    // meant to measure - steady-state ping-pong, not stream
+                    // establishment. Per-repetition warmup and measurement
+                    // windows are unchanged.
+                    List<Grpc.Core.AsyncDuplexStreamingCall<SimpleRequest, SimpleResponse>>? calls = null;
+                    if (string.Equals(workload, "streaming", StringComparison.Ordinal))
+                    {
+                        calls = new List<Grpc.Core.AsyncDuplexStreamingCall<SimpleRequest, SimpleResponse>>();
+                        for (int i = 0; i < conc; i++) calls.Add(env.Client.StreamingCall());
+                    }
+
+                    try
+                    {
                     for (int rep = 0; rep < opt.Repetitions; rep++)
                     {
                         // A hung cell must not kill a multi-hour matrix run.
@@ -229,7 +307,7 @@ static class MatrixRunner
                         {
                             var s = await MeasureCellAsync(
                                 env, workload, payload, conc,
-                                opt.WarmupSeconds, opt.DurationSeconds, cts.Token)
+                                opt.WarmupSeconds, opt.DurationSeconds, calls, cts.Token)
                                 .ConfigureAwait(false);
                             samples.Add(s);
                             Console.WriteLine(
@@ -246,7 +324,20 @@ static class MatrixRunner
                             break; // abandon remaining reps for this cell
                         }
                     }
-
+                    }
+                    finally
+                    {
+                        if (calls != null)
+                        {
+                            foreach (var c in calls)
+                            {
+                                try { await c.RequestStream.CompleteAsync().ConfigureAwait(false); }
+                                catch { /* best effort */ }
+                                try { c.Dispose(); }
+                                catch { /* best effort */ }
+                            }
+                        }
+                    }
                 }
                 finally
                 {
@@ -304,9 +395,17 @@ static class MatrixRunner
     // Cell measurement
     // ------------------------------------------------------------------
 
+    /// <param name="calls">
+    /// For the streaming workload, the streams to measure on. They are owned by
+    /// the caller and span every repetition of the cell - see the note at the
+    /// call site about server-side stream slots not being released
+    /// synchronously. Null for unary.
+    /// </param>
     static async Task<CellSample> MeasureCellAsync(
         BenchEnv env, string workload, int payloadBytes, int concurrency,
-        double warmupS, double durationS, CancellationToken ct)
+        double warmupS, double durationS,
+        List<Grpc.Core.AsyncDuplexStreamingCall<SimpleRequest, SimpleResponse>>? calls,
+        CancellationToken ct)
     {
         var client = env.Client;
         var req = new SimpleRequest
@@ -337,37 +436,23 @@ static class MatrixRunner
 
         if (string.Equals(workload, "streaming", StringComparison.Ordinal))
         {
-            // Streams are opened once and span warmup + measurement so the
-            // measured phase never pays stream-establishment cost.
-            var calls = new List<Grpc.Core.AsyncDuplexStreamingCall<SimpleRequest, SimpleResponse>>();
-            try
-            {
-                for (int i = 0; i < concurrency; i++) calls.Add(client.StreamingCall());
+            ArgumentNullException.ThrowIfNull(calls);
 
-                await RunStreamingPhaseAsync(calls, req, warmupS, record: false, ct)
-                    .ConfigureAwait(false);
+            // The caller owns these streams and keeps them open across every
+            // repetition; this method must not close them.
+            await RunStreamingPhaseAsync(calls, req, warmupS, record: false, ct)
+                .ConfigureAwait(false);
 
-                double cpuBefore = CaptureCpuUs(env.ServerProcess);
-                rss.Start();
-                var sw = Stopwatch.StartNew();
-                var states = await RunStreamingPhaseAsync(calls, req, durationS, record: true, ct)
-                    .ConfigureAwait(false);
-                sw.Stop();
-                rss.Stop();
-                double cpuAfter = CaptureCpuUs(env.ServerProcess);
+            double cpuBefore = CaptureCpuUs(env.ServerProcess);
+            rss.Start();
+            var sw = Stopwatch.StartNew();
+            var states = await RunStreamingPhaseAsync(calls, req, durationS, record: true, ct)
+                .ConfigureAwait(false);
+            sw.Stop();
+            rss.Stop();
+            double cpuAfter = CaptureCpuUs(env.ServerProcess);
 
-                return Summarize(states, sw.Elapsed, payloadBytes, cpuAfter - cpuBefore, rss.PeakMb);
-            }
-            finally
-            {
-                foreach (var c in calls)
-                {
-                    try { await c.RequestStream.CompleteAsync().ConfigureAwait(false); }
-                    catch { /* best effort */ }
-                    try { c.Dispose(); }
-                    catch { /* best effort */ }
-                }
-            }
+            return Summarize(states, sw.Elapsed, payloadBytes, cpuAfter - cpuBefore, rss.PeakMb);
         }
 
         throw new ArgumentException($"Unknown workload '{workload}'", nameof(workload));
@@ -391,15 +476,24 @@ static class MatrixRunner
                 {
                     ct.ThrowIfCancellationRequested();
                     long t0 = NowTicks();
-                    using var call = client.UnaryCallAsync(req);
-                    await call.ResponseAsync.ConfigureAwait(false);
+                    // The token has to reach the call itself. Awaiting a
+                    // token-less ResponseAsync is not interruptible, so a call
+                    // that never completes used to hang the worker forever and
+                    // the cell budget never fired - one such hang stalled a
+                    // full matrix run for half an hour before it was noticed.
+                    using var call = client.UnaryCallAsync(req, cancellationToken: ct);
+                    await call.ResponseAsync.WaitAsync(ct).ConfigureAwait(false);
                     long t1 = NowTicks();
                     if (record) st.Hist.Record(TicksToNs(t1 - t0));
                     st.Ops++;
                 }
             }, ct);
         }
-        await Task.WhenAll(tasks).ConfigureAwait(false);
+        // Belt and braces: even if some worker still manages to block
+        // uninterruptibly, the phase gives up when the cell budget expires
+        // instead of stalling the whole matrix. The abandoned workers die with
+        // the channel when the caller disposes the per-cell process pair.
+        await Task.WhenAll(tasks).WaitAsync(ct).ConfigureAwait(false);
         return states;
     }
 
@@ -423,7 +517,9 @@ static class MatrixRunner
                 {
                     ct.ThrowIfCancellationRequested();
                     long t0 = NowTicks();
-                    await call.RequestStream.WriteAsync(req).ConfigureAwait(false);
+                    // WriteAsync has no token overload here, so WaitAsync is
+                    // what makes the write interruptible; MoveNext takes ct.
+                    await call.RequestStream.WriteAsync(req).WaitAsync(ct).ConfigureAwait(false);
                     if (!await call.ResponseStream.MoveNext(ct).ConfigureAwait(false))
                         throw new InvalidOperationException("stream ended early");
                     long t1 = NowTicks();
@@ -432,7 +528,11 @@ static class MatrixRunner
                 }
             }, ct);
         }
-        await Task.WhenAll(tasks).ConfigureAwait(false);
+        // Belt and braces: even if some worker still manages to block
+        // uninterruptibly, the phase gives up when the cell budget expires
+        // instead of stalling the whole matrix. The abandoned workers die with
+        // the channel when the caller disposes the per-cell process pair.
+        await Task.WhenAll(tasks).WaitAsync(ct).ConfigureAwait(false);
         return states;
     }
 
