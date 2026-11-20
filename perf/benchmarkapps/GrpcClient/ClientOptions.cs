@@ -25,6 +25,7 @@ public class ClientOptions
     public Uri? Url { get; set; }
     public string? UdsFileName { get; set; }
     public string? NamedPipeName { get; set; }
+    public string? ShmSegmentName { get; set; }
     public int Connections { get; set; }
     public int Warmup { get; set; }
     public int Duration { get; set; }

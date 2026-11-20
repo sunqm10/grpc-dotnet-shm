@@ -1,7 +1,10 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework Condition="'$(NetFxFramework)'!='true'">net9.0</TargetFramework>
+    <!-- net10.0 (upstream is net9.0): Grpc.Net.SharedMemory is net10.0-only, and
+         a net9.0 project cannot reference it. Raising the TFM here is the least
+         invasive fix - the alternative is multi-targeting the transport library. -->
+    <TargetFramework Condition="'$(NetFxFramework)'!='true'">net10.0</TargetFramework>
     <TargetFramework Condition="'$(NetFxFramework)'=='true'">net462</TargetFramework>
     <OutputType>Exe</OutputType>
     <DefineConstants Condition="'$(EnableGrpcWeb)' == 'true'">$(DefineConstants);GRPC_WEB</DefineConstants>
@@ -46,6 +49,10 @@
   <!-- TODO: Workaround https://github.com/dotnet/sdk/issues/28169. Remove when fixed. -->
   <ItemGroup Condition="'$(PublishAot)'!='true'">
     <ProjectReference Include="..\..\..\src\Grpc.Net.Client\Grpc.Net.Client.csproj" />
+    <!-- Provides the client-side ShmControlHandler. Not referenced under net462,
+         which the shared memory transport does not support. -->
+    <ProjectReference Include="..\..\..\src\Grpc.Net.SharedMemory\Grpc.Net.SharedMemory.csproj"
+                      Condition="'$(NetFxFramework)'!='true'" />
   </ItemGroup>
   <ItemGroup Condition="'$(PublishAot)'=='true'">
     <PackageReference Include="Grpc.Net.Client" />

@@ -79,6 +79,7 @@ class Program
         };
         var udsFileNameOption = new Option<string>("--udsFileName") { Description = "The Unix Domain Socket file name" };
         var namedPipeNameOption = new Option<string>("--namedPipeName") { Description = "The Named Pipe name" };
+        var shmSegmentNameOption = new Option<string>("--shmSegmentName") { Description = "The shared memory segment base name" };
         var connectionsOption = new Option<int>("--connections", ["-c"]) { DefaultValueFactory = (r) => 1, Description = "Total number of connections to keep open" };
         var warmupOption = new Option<int>("--warmup", ["-w"]) { DefaultValueFactory = (r) => 5, Description = "Duration of the warmup in seconds" };
         var durationOption = new Option<int>("--duration", ["-d"]) { DefaultValueFactory = (r) => 10, Description = "Duration of the test in seconds" };
@@ -99,6 +100,7 @@ class Program
         rootCommand.Add(urlOption);
         rootCommand.Add(udsFileNameOption);
         rootCommand.Add(namedPipeNameOption);
+        rootCommand.Add(shmSegmentNameOption);
         rootCommand.Add(connectionsOption);
         rootCommand.Add(warmupOption);
         rootCommand.Add(durationOption);
@@ -121,6 +123,7 @@ class Program
             _options.Url = context.GetValue(urlOption);
             _options.UdsFileName = context.GetValue(udsFileNameOption);
             _options.NamedPipeName = context.GetValue(namedPipeNameOption);
+            _options.ShmSegmentName = context.GetValue(shmSegmentNameOption);
             _options.Connections = context.GetValue(connectionsOption);
             _options.Warmup = context.GetValue(warmupOption);
             _options.Duration = context.GetValue(durationOption);
@@ -509,6 +512,20 @@ class Program
         {
             return CreateWinHttpHandler();
         }
+
+#if NET10_0_OR_GREATER
+        if (!string.IsNullOrEmpty(_options.ShmSegmentName))
+        {
+            // ShmControlHandler derives from HttpMessageHandler, not
+            // DelegatingHandler: it maps HttpRequestMessage straight onto shared
+            // memory frames and never produces a Stream. So, unlike UDS and named
+            // pipes below, it cannot be expressed as a SocketsHttpHandler
+            // ConnectCallback - there is no connection for SocketsHttpHandler to
+            // drive HTTP/2 over. It is terminal and must be returned here, before
+            // the SocketsHttpHandler is constructed.
+            return new Grpc.Net.SharedMemory.ShmControlHandler(_options.ShmSegmentName!);
+        }
+#endif
 
 #if NET9_0_OR_GREATER
         var httpClientHandler = new SocketsHttpHandler();

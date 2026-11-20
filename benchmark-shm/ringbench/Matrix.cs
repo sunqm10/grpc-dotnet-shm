@@ -166,6 +166,18 @@ static class MatrixRunner
         var runs = new List<Dictionary<string, object?>>();
         var skipped = new List<string>();
 
+        // Checkpoint after every cell. A full matrix is hours long, and an
+        // interruption (OOM reaper, Ctrl-C, reboot) must not discard everything
+        // measured so far. Writing is atomic-ish via a temp file + move so a kill
+        // mid-write cannot leave a truncated results.json behind.
+        void Checkpoint()
+        {
+            meta["runs"] = runs;
+            if (skipped.Count > 0) meta["skipped"] = skipped;
+            meta["complete"] = false;
+            WriteResults(meta, opt.OutPath);
+        }
+
         Console.WriteLine($"=== gRFC G3 matrix ({meta["arm"]} arm) ===");
         Console.WriteLine($"commit={meta["commit"]} dirty={meta["dirty"]} os={meta["os"]} cores={meta["cores"]}");
         Console.WriteLine($"warmup={opt.WarmupSeconds}s duration={opt.DurationSeconds}s reps={opt.Repetitions}");
@@ -227,6 +239,7 @@ static class MatrixRunner
 
                     if (samples.Count > 0)
                         runs.Add(BuildRun(workload, transport, payload, conc, opt, samples));
+                    Checkpoint();
                 }
             }
             finally
@@ -241,16 +254,25 @@ static class MatrixRunner
 
         meta["runs"] = runs;
         if (skipped.Count > 0) meta["skipped"] = skipped;
-
-        var dir = Path.GetDirectoryName(Path.GetFullPath(opt.OutPath));
-        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-        var json = JsonSerializer.Serialize(meta, new JsonSerializerOptions { WriteIndented = true });
-        File.WriteAllText(opt.OutPath, json);
+        meta["complete"] = true;
+        WriteResults(meta, opt.OutPath);
 
         Console.WriteLine();
         Console.WriteLine($"Wrote {runs.Count} cells to {Path.GetFullPath(opt.OutPath)}");
         if (skipped.Count > 0)
             Console.WriteLine($"{skipped.Count} cell-repetition(s) failed; see \"skipped\" in results.json");
+    }
+
+    static void WriteResults(Dictionary<string, object?> meta, string outPath)
+    {
+        var full = Path.GetFullPath(outPath);
+        var dir = Path.GetDirectoryName(full);
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
+        var json = JsonSerializer.Serialize(meta, new JsonSerializerOptions { WriteIndented = true });
+        var tmp = full + ".tmp";
+        File.WriteAllText(tmp, json);
+        File.Move(tmp, full, overwrite: true);
     }
 
     // ------------------------------------------------------------------

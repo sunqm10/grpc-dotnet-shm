@@ -20,6 +20,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.Runtime;
 using Common;
+using Grpc.Testing;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.AspNetCore.Server.Kestrel.Https;
 
@@ -29,7 +30,79 @@ public class Program
 {
     public static void Main(string[] args)
     {
+        // --shmSegmentName selects the shared memory transport. It bypasses the
+        // generic host and Kestrel entirely: ShmGrpcServer is a standalone
+        // listener, so going through ConfigureKestrel would only add a stray TCP
+        // listener alongside it. Service methods are mapped by hand because
+        // MapGrpcService routes through ASP.NET Core endpoints, which the shared
+        // memory server does not use.
+        var shmSegmentName = GetShmSegmentName(args);
+        if (!string.IsNullOrEmpty(shmSegmentName))
+        {
+            RunSharedMemoryServerAsync(shmSegmentName!).GetAwaiter().GetResult();
+            return;
+        }
+
         CreateHostBuilder(args).Build().Run();
+    }
+
+    private static string? GetShmSegmentName(string[] args)
+    {
+        for (var i = 0; i < args.Length; i++)
+        {
+            if (string.Equals(args[i], "--shmSegmentName", StringComparison.OrdinalIgnoreCase) &&
+                i + 1 < args.Length)
+            {
+                return args[i + 1];
+            }
+        }
+        return null;
+    }
+
+    private static async Task RunSharedMemoryServerAsync(string segmentName)
+    {
+        // Both the data segment and its control segment must be removed, before
+        // and after: leaving "<name>_ctl" behind leaks it.
+        Grpc.Net.SharedMemory.Segment.TryRemoveSegment(segmentName);
+        Grpc.Net.SharedMemory.Segment.TryRemoveSegment(segmentName + "_ctl");
+
+        var service = new BenchmarkServiceImpl();
+        await using var server = new Grpc.Net.SharedMemory.ShmGrpcServer(segmentName);
+
+        const string prefix = "/grpc.testing.BenchmarkService/";
+        server
+            .MapUnary<SimpleRequest, SimpleResponse>(
+                prefix + "UnaryCall",
+                (request, context) => service.UnaryCall(request, context))
+            .MapDuplexStreaming<SimpleRequest, SimpleResponse>(
+                prefix + "StreamingCall",
+                (requestStream, responseStream, context) => service.StreamingCall(requestStream, responseStream, context))
+            .MapClientStreaming<SimpleRequest, SimpleResponse>(
+                prefix + "StreamingFromClient",
+                (requestStream, context) => service.StreamingFromClient(requestStream, context))
+            .MapServerStreaming<SimpleRequest, SimpleResponse>(
+                prefix + "StreamingFromServer",
+                (request, responseStream, context) => service.StreamingFromServer(request, responseStream, context))
+            .MapDuplexStreaming<SimpleRequest, SimpleResponse>(
+                prefix + "StreamingBothWays",
+                (requestStream, responseStream, context) => service.StreamingBothWays(requestStream, responseStream, context));
+
+        using var shutdown = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; shutdown.Cancel(); };
+
+        try
+        {
+            await server.RunAsync(shutdown.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected on Ctrl-C.
+        }
+        finally
+        {
+            Grpc.Net.SharedMemory.Segment.TryRemoveSegment(segmentName);
+            Grpc.Net.SharedMemory.Segment.TryRemoveSegment(segmentName + "_ctl");
+        }
     }
 
     [UnconditionalSuppressMessage("AotAnalysis", "IL3050:RequiresDynamicCode",

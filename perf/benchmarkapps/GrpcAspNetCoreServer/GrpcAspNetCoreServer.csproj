@@ -42,6 +42,10 @@
   <ItemGroup Condition="'$(PublishAot)'!='true'">
     <ProjectReference Include="..\..\..\src\Grpc.AspNetCore.Server\Grpc.AspNetCore.Server.csproj" />
     <ProjectReference Include="..\..\..\src\Grpc.AspNetCore.Web\Grpc.AspNetCore.Web.csproj" />
+    <!-- Provides the standalone ShmGrpcServer used by the shmSegmentName mode.
+         Grpc.AspNetCore.Server.SharedMemory is deliberately NOT referenced: the
+         shared memory server does not run on Kestrel. -->
+    <ProjectReference Include="..\..\..\src\Grpc.Net.SharedMemory\Grpc.Net.SharedMemory.csproj" />
   </ItemGroup>
   <ItemGroup Condition="'$(PublishAot)'=='true'">
     <PackageReference Include="Grpc.AspNetCore.Server" />
