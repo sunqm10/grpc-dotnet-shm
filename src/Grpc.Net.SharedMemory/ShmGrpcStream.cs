@@ -733,6 +733,21 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     internal void ReserveSendQuotaOrBlock(int n, Action? drainBeforeWait, CancellationToken cancellationToken)
     {
         if (n <= 0) return;
+        // A reservation larger than the initial window can never be granted:
+        // the peer only emits WINDOW_UPDATE after consuming bytes it has
+        // received, and we block before sending any. Waiting would hang
+        // forever with no exception and no deadline, so fail loudly instead.
+        // Callers must chunk to the window (see ShmFrameWriter's
+        // windowCeiling clamp); reaching this throw means a path still does
+        // not, which is a bug worth surfacing rather than hiding in a stall.
+        if (n > ShmConstants.InitialWindowSize)
+        {
+            throw new InvalidOperationException(
+                $"Send of {n} bytes exceeds the per-stream flow-control window " +
+                $"({ShmConstants.InitialWindowSize} bytes) and could never be granted. " +
+                "The message must be split across DATA frames no larger than the window " +
+                "(RFC 9113 §6.9.1), or SHM_INITIAL_WINDOW must be raised.");
+        }
         // Fast path: both quotas readily available (round-10 DEFER-1
         // upgraded this to reserve both stream + conn atomically).
         if (TryReserveSendQuotaWithConn(n)) return;
@@ -1405,6 +1420,15 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
             {
                 try
                 {
+                    // Drain anything already queued for THIS stream first.
+                    // The gate above re-samples ActiveStreamCount independently
+                    // of the Message send site, so the two can disagree: the
+                    // Message saw >1 active stream and went to the queue, then
+                    // the count dropped and HALFCLOSE takes this inline path.
+                    // Writing it straight to the ring would land the stream
+                    // terminator ahead of its own Message, and the server
+                    // reports "No request message received".
+                    writer.DrainQueuedBeforeInlineWrite(StreamId);
                     FrameProtocol.WriteHalfClose(_connection.TxRing, StreamId, default);
                     // Wake-coalescing close: if SendRequestHeadersAsync
                     // opened an inline batch (unary path), close it now
