@@ -1106,7 +1106,7 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
         // would reach the ring before the queued empty MESSAGE
         // (race observed at probe time on Intel Linux).
         if (_shmStream.Connection.SingleStreamMode
-            && _shmStream.Connection.ActiveStreamCount <= 1
+            && _shmStream.SoleStreamAtCreation
             && message is Google.Protobuf.IMessage protoMsg)
         {
             var writer = _shmStream.Connection.FrameWriter;
@@ -1444,7 +1444,7 @@ internal sealed class ShmGrpcRequestStream : Stream, Grpc.Net.Client.IDirectMess
             // - ≤ ringCapacity: TryPauseWriterLoop or ExecuteInline
             //   (handler writes ring directly or via WriterLoop callback)
             // - > ringCapacity: falls through to queued SendMessageZeroCopyAsync
-            if (_stream.Connection.SingleStreamMode && _stream.Connection.ActiveStreamCount <= 1)
+            if (_stream.Connection.SingleStreamMode && _stream.SoleStreamAtCreation)
             {
                 var writer = _stream.Connection.FrameWriter;
                 if (writer != null)

@@ -516,7 +516,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             var _responseSize = ((IMessage)response).CalculateSize();
             var _sc = cfg.Compression?.ShouldCompress(_responseSize) == true
                 && cfg.Compression.GetSendCompressor()?.IsIdentity == false;
-            if (!_sc && stream.Connection.SingleStreamMode && stream.Connection.ActiveStreamCount <= 1)
+            if (!_sc && stream.Connection.SingleStreamMode && stream.SoleStreamAtCreation)
             {
                 var size = _responseSize;
                 if (cfg.MaxSendMessageSize > 0 && cfg.MaxSendMessageSize < int.MaxValue && size > cfg.MaxSendMessageSize)
@@ -686,7 +686,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             }
 
             // In singleStreamMode, inline trailers to avoid queue overhead.
-            if (singleStream && stream.Connection.ActiveStreamCount <= 1)
+            if (singleStream && stream.SoleStreamAtCreation)
             {
                 var fw = stream.Connection.FrameWriter!;
                 if (fw.TryPauseWriterLoop())
@@ -733,7 +733,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             var _responseSize2 = ((IMessage)response).CalculateSize();
             var _sc2 = cfg.Compression?.ShouldCompress(_responseSize2) == true
                 && cfg.Compression.GetSendCompressor()?.IsIdentity == false;
-            if (!_sc2 && singleStream && stream.Connection.ActiveStreamCount <= 1)
+            if (!_sc2 && singleStream && stream.SoleStreamAtCreation)
             {
                 var size = _responseSize2;
                 if (cfg.MaxSendMessageSize > 0 && cfg.MaxSendMessageSize < int.MaxValue && size > cfg.MaxSendMessageSize)
@@ -880,7 +880,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             }
 
             // In singleStreamMode, inline trailers to avoid queue overhead.
-            if (singleStream && stream.Connection.ActiveStreamCount <= 1)
+            if (singleStream && stream.SoleStreamAtCreation)
             {
                 var fw = stream.Connection.FrameWriter!;
                 if (fw.TryPauseWriterLoop())
@@ -1985,7 +1985,7 @@ public sealed class ShmGrpcServer : IAsyncDisposable
             var _msgSize = message.CalculateSize();
             var _sc3 = _compression?.ShouldCompress(_msgSize) == true
                 && _compression.GetSendCompressor()?.IsIdentity == false;
-            if (!_sc3 && _directRingWrite && _stream.Connection.ActiveStreamCount <= 1)
+            if (!_sc3 && _directRingWrite && _stream.SoleStreamAtCreation)
             {
                 var size = _msgSize;
                 if (_maxSendMessageSize > 0 && _maxSendMessageSize < int.MaxValue && size > _maxSendMessageSize)
