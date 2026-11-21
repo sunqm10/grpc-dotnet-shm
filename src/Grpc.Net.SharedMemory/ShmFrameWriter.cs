@@ -2043,6 +2043,30 @@ internal sealed class ShmFrameWriter : IDisposable
         if (ShmConstants.FairMaxFramePayload < chunkSize)
             chunkSize = ShmConstants.FairMaxFramePayload;
 
+        // No single reservation may exceed the per-stream send window.
+        //
+        // The window starts at ShmConstants.InitialWindowSize and only grows
+        // when the peer emits WINDOW_UPDATE, which it only does after it has
+        // received and consumed bytes from us. So a reservation larger than
+        // the initial window can never be satisfied: we block before writing
+        // anything, the peer therefore receives nothing, consumes nothing and
+        // never grants credit. That is a permanent, silent hang on the first
+        // such RPC - no exception, no deadline, at concurrency 1.
+        //
+        // RFC 9113 section 6.9.1 requires a sender to split a message into
+        // DATA frames no larger than the available window; both the
+        // single-frame and the chunked path have to honour that ceiling.
+        // Only applies when flow control is active (fairStream != null).
+        if (fairStream != null)
+        {
+            var windowCeiling = ShmConstants.InitialWindowSize;
+            if (windowCeiling > 0)
+            {
+                if (singleFrameThreshold > windowCeiling) singleFrameThreshold = windowCeiling;
+                if (chunkSize > windowCeiling) chunkSize = windowCeiling;
+            }
+        }
+
         // The MESSAGE frame payload includes a 5-byte gRPC length-prefix
         // header (compression flag + big-endian uint32 length) followed by
         // the protobuf bytes. This is required for cross-language interop.
@@ -2453,6 +2477,14 @@ internal sealed class ShmFrameWriter : IDisposable
     /// foreign WINDOW_UPDATE that only the reader Thread can deliver).
     /// 0 means "no current stream" (drain everything as before).</para>
     /// </summary>
+    /// <summary>
+    /// Drains queued frames before an inline ring write for
+    /// <paramref name="streamId"/>, so the inline frame cannot overtake
+    /// anything already queued for the same stream.
+    /// </summary>
+    internal void DrainQueuedBeforeInlineWrite(uint streamId) =>
+        DrainAllQueued(currentStreamId: streamId);
+
     private void DrainAllQueued(uint currentStreamId = 0)
     {
         // Drain control frames first (WindowUpdate, Ping, Pong) — these
@@ -2505,6 +2537,11 @@ internal sealed class ShmFrameWriter : IDisposable
         bool onReader = ShmReaderThreadContext.IsOnReaderThread
             || _simulateOnReaderThread;
         bool deferredAny = false;
+        // Streams whose Message was pushed back this pass. Every later entry
+        // for such a stream must be pushed back too, or a terminator would
+        // overtake the Message it is supposed to follow (see the else branch).
+        // Allocated only when a deferral actually happens.
+        HashSet<uint>? deferredStreams = null;
 
         // We use a snapshot count to avoid re-processing entries we just
         // re-enqueued (the deferred entries land back at the queue tail).
@@ -2531,6 +2568,7 @@ internal sealed class ShmFrameWriter : IDisposable
                 {
                     _queue.Enqueue(entry);
                     deferredAny = true;
+                    (deferredStreams ??= new HashSet<uint>()).Add(entry.StreamId);
                     continue;
                 }
                 var isLast = (entry.Flags & MessageFlags.More) == 0;
@@ -2548,6 +2586,20 @@ internal sealed class ShmFrameWriter : IDisposable
                 // Headers / Trailers / HalfClose / Reset etc. — no
                 // per-stream DATA quota debit. Safe on reader Thread;
                 // REQUIRED there for ordering invariants.
+                //
+                // Except when this stream's Message was deferred above: writing
+                // its terminator now would put TRAILERS (or HALFCLOSE) on the
+                // wire ahead of the Message it closes. The peer then sees a
+                // stream end with no payload and reports it as
+                // "Failed to deserialize response message." on the client or
+                // "No request message received" on the server. Per-stream FIFO
+                // has to hold for every frame type, not just Message.
+                if (deferredStreams != null && deferredStreams.Contains(entry.StreamId))
+                {
+                    _queue.Enqueue(entry);
+                    deferredAny = true;
+                    continue;
+                }
                 WriteFrameEntryToRing(in entry);
             }
 

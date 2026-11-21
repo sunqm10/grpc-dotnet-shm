@@ -119,6 +119,26 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     // Fair caps, and only then can a sync-pull stall the reader
     // waiting on a chunk only the reader can deliver).
     internal readonly bool _bypassStriper;
+
+    /// <summary>
+    /// Whether this stream was the only active one on the connection when it
+    /// was created. Latched for the stream's lifetime, exactly like
+    /// <see cref="_bypassStriper"/> does for the receive side, and for the
+    /// same reason: every frame of a stream must take the same route.
+    /// </summary>
+    /// <remarks>
+    /// The send path used to re-read <c>Connection.ActiveStreamCount</c> at
+    /// each of eight separate inline-vs-queued decision points. Because the
+    /// count moves as other RPCs start and finish, two sites could disagree
+    /// about the SAME stream: a MESSAGE would see >1 and go to the writer
+    /// queue, then the count would drop and the following HALFCLOSE or
+    /// TRAILERS would take the inline path straight to the ring, overtaking
+    /// the MESSAGE it was supposed to follow. The peer then saw a stream
+    /// terminate with no payload and reported it as "No request message
+    /// received" (server) or "Failed to deserialize response message."
+    /// (client). Latching the snapshot removes that whole class.
+    /// </remarks>
+    internal readonly bool SoleStreamAtCreation;
     private readonly CancellationTokenSource _disposeCts;
     // Round-9 PR-I: lazy-allocate the call-cancellation CTS. The CLIENT-
     // side stream never reads CancellationToken (only the server-side
@@ -392,8 +412,11 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         // ActiveStreamCount=2) and route through the striper — that's
         // fine, the two streams don't interfere because each has its
         // own _inboundFrames Channel<T>.
-        _bypassStriper = connection.UseReceiveStriper
-            && connection.ActiveStreamCount <= 1;
+        // One snapshot, shared by the receive-side striper decision and every
+        // send-side inline/queued decision, so both sides of this stream agree
+        // for its whole lifetime.
+        SoleStreamAtCreation = connection.ActiveStreamCount <= 1;
+        _bypassStriper = connection.UseReceiveStriper && SoleStreamAtCreation;
         // Inline continuations: enables `AllowSynchronousContinuations=true`
         // on the per-stream inbound channel. When enabled, the user's
         // awaiter continuation runs synchronously on whatever Thread
@@ -733,6 +756,21 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
     internal void ReserveSendQuotaOrBlock(int n, Action? drainBeforeWait, CancellationToken cancellationToken)
     {
         if (n <= 0) return;
+        // A reservation larger than the initial window can never be granted:
+        // the peer only emits WINDOW_UPDATE after consuming bytes it has
+        // received, and we block before sending any. Waiting would hang
+        // forever with no exception and no deadline, so fail loudly instead.
+        // Callers must chunk to the window (see ShmFrameWriter's
+        // windowCeiling clamp); reaching this throw means a path still does
+        // not, which is a bug worth surfacing rather than hiding in a stall.
+        if (n > ShmConstants.InitialWindowSize)
+        {
+            throw new InvalidOperationException(
+                $"Send of {n} bytes exceeds the per-stream flow-control window " +
+                $"({ShmConstants.InitialWindowSize} bytes) and could never be granted. " +
+                "The message must be split across DATA frames no larger than the window " +
+                "(RFC 9113 §6.9.1), or SHM_INITIAL_WINDOW must be raised.");
+        }
         // Fast path: both quotas readily available (round-10 DEFER-1
         // upgraded this to reserve both stream + conn atomically).
         if (TryReserveSendQuotaWithConn(n)) return;
@@ -854,7 +892,7 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         //   * TryPauseWriterLoop fails (WriterLoop busy or another inline
         //     writer holds the CAS); the queued path is correct (single
         //     writer = WriterLoop) and Just Slower.
-        if (_connection.SingleStreamMode && _connection.ActiveStreamCount <= 1)
+        if (_connection.SingleStreamMode && SoleStreamAtCreation)
         {
             var writer = _connection.FrameWriter;
             if (writer != null && writer.TryPauseWriterLoop())
@@ -1398,13 +1436,22 @@ public sealed class ShmGrpcStream : IDisposable, IAsyncDisposable
         //    iteration (~30ns), so pause completes within a few µs.
         // 3. ExecuteInline would allocate a lambda closure + two kernel signals,
         //    adding ~2-5µs overhead per unary call that dominates small payloads.
-        if (_connection.SingleStreamMode && _connection.ActiveStreamCount <= 1)
+        if (_connection.SingleStreamMode && SoleStreamAtCreation)
         {
             var writer = _connection.FrameWriter;
             if (writer != null && writer.TryPauseWriterLoop())
             {
                 try
                 {
+                    // Drain anything already queued for THIS stream first.
+                    // The gate above re-samples ActiveStreamCount independently
+                    // of the Message send site, so the two can disagree: the
+                    // Message saw >1 active stream and went to the queue, then
+                    // the count dropped and HALFCLOSE takes this inline path.
+                    // Writing it straight to the ring would land the stream
+                    // terminator ahead of its own Message, and the server
+                    // reports "No request message received".
+                    writer.DrainQueuedBeforeInlineWrite(StreamId);
                     FrameProtocol.WriteHalfClose(_connection.TxRing, StreamId, default);
                     // Wake-coalescing close: if SendRequestHeadersAsync
                     // opened an inline batch (unary path), close it now
